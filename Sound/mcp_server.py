@@ -19,16 +19,21 @@ sys.path.insert(0, HERE)
 from mcp.server.fastmcp import FastMCP
 import asr
 
-mcp = FastMCP("sound-asr")
+mcp = FastMCP(
+    "sound-asr",
+    host=os.getenv("SOUND_MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("SOUND_MCP_PORT", "8766")),
+    log_level="INFO",
+)
 
 
 @mcp.tool()
 def transcribe_file(path: str, language: str = "auto") -> str:
     """转写本地音频文件(wav/mp3/flac/m4a/ogg 等)。
     path: 音频文件绝对路径; language: auto/zh/en/ja/ko/yue。
-    返回识别文本(含情绪/事件标签的原始输出与清洗后的纯文本)。"""
+    只返回清洗后的纯文本，避免调用方把协议标签或调试前缀当作用户输入。"""
     r = asr.transcribe_file(path, language=language)
-    return f"文本: {r['text']}\n原始(含标签): {r['raw']}"
+    return r["text"]
 
 
 @mcp.tool()
@@ -37,8 +42,9 @@ def record_and_transcribe(duration: float = 5.0, language: str = "auto") -> str:
     duration: 录音秒数; language: auto/zh/en/ja/ko/yue。
     返回识别文本。"""
     r = asr.record_and_transcribe(duration=duration, language=language)
-    return f"文本: {r['text']}\n原始(含标签): {r['raw']}"
+    return r["text"]
 
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.getenv("SOUND_MCP_TRANSPORT", "stdio").strip().lower()
+    mcp.run(transport="streamable-http" if transport in {"http", "streamable-http"} else "stdio")

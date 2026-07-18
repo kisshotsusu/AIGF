@@ -50,7 +50,10 @@ class HomeAgent:
         self.active_process_lock = threading.Lock()
         self.vision_service_process: subprocess.Popen | None = None
         self.vision_service_lock = threading.Lock()
+        self.sound_service_process: subprocess.Popen | None = None
+        self.sound_service_lock = threading.Lock()
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
+        threading.Thread(target=self.ensure_sound_service, daemon=True, name="sound-mcp-autostart").start()
         self.character_name = "小助手"
         self.refresh_identity()
 
@@ -214,6 +217,70 @@ class HomeAgent:
     def ensure_vision_service(self, wait_until_ready: bool = False) -> bool:
         with self.vision_service_lock:
             return self._ensure_vision_service_unlocked(wait_until_ready)
+
+    def ensure_sound_service(self, wait_until_ready: bool = False) -> bool:
+        """Keep the local SenseVoice HTTP MCP alive; model loading remains lazy."""
+        cfg = self.config.get("stt", {})
+        if cfg.get("mode") != "sound_mcp" or not cfg.get("auto_start", True): return False
+        host = str(cfg.get("mcp_host", "127.0.0.1")); port = int(cfg.get("mcp_port", 8766))
+
+        def ready() -> bool:
+            try:
+                with socket.create_connection((host, port), timeout=0.5): return True
+            except OSError: return False
+
+        with self.sound_service_lock:
+            if ready(): return True
+            if not self.sound_service_process or self.sound_service_process.poll() is not None:
+                python = ROOT / ".venv" / "Scripts" / "python.exe"
+                server = ROOT / "Sound" / "mcp_server.py"
+                if not python.exists() or not server.exists(): return False
+                log_dir = ROOT / "Sound" / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
+                log = (log_dir / "sound-mcp.log").open("a", encoding="utf-8")
+                env = os.environ.copy(); env.update({
+                    "SOUND_MCP_TRANSPORT": "http", "SOUND_MCP_HOST": host, "SOUND_MCP_PORT": str(port),
+                    "SENSEVOICE_MODEL": str(ROOT / "Sound" / "models" / "SenseVoiceSmall"),
+                    "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                })
+                flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == "nt" else 0
+                self.sound_service_process = subprocess.Popen(
+                    [str(python), str(server)], cwd=str(server.parent), env=env,
+                    stdout=log, stderr=log, creationflags=flags,
+                )
+                self.log_event("sound_service_started", pid=self.sound_service_process.pid, port=port)
+            if not wait_until_ready: return True
+            deadline = time.monotonic() + float(cfg.get("startup_timeout_seconds", 30))
+            while time.monotonic() < deadline:
+                if ready(): return True
+                if self.sound_service_process.poll() is not None: return False
+                time.sleep(0.5)
+            return False
+
+    async def _sound_mcp_transcribe(self, wav_path: Path) -> str:
+        if not await asyncio.to_thread(self.ensure_sound_service, True):
+            raise RuntimeError("SenseVoice 语音识别服务启动失败，请检查 Sound/logs/sound-mcp.log")
+        cfg = self.config.get("stt", {})
+        helper = ROOT / "Vision" / "mcp_call.py"
+        url = str(cfg.get("mcp_url") or "http://127.0.0.1:8766/mcp")
+        arguments = json.dumps({"path": str(wav_path), "language": str(cfg.get("language", "auto"))}, ensure_ascii=False)
+        client_env = os.environ.copy()
+        client_env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+        proc = await asyncio.create_subprocess_exec(
+            str(ROOT / ".venv" / "Scripts" / "python.exe"), str(helper), url, "transcribe_file", arguments,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, env=client_env,
+        )
+        out, err = await proc.communicate()
+        lines = out.decode("utf-8", "replace").strip().splitlines()
+        try: payload = json.loads(lines[-1]) if lines else {}
+        except json.JSONDecodeError: payload = {}
+        if proc.returncode or not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or err.decode("utf-8", "replace")[-800:] or "SenseVoice MCP 调用失败")
+        result = str(payload.get("text", ""))
+        match = re.search(r"(?:^|\n)文本:\s*(.*?)(?:\n原始|$)", result, re.S)
+        text = (match.group(1) if match else result).strip()
+        if not text: raise RuntimeError("SenseVoice 没有识别出文本")
+        return text
 
     def _ensure_vision_service_unlocked(self, wait_until_ready: bool = False) -> bool:
         cfg = self.config.get("vision_mcp", {})
@@ -1080,6 +1147,8 @@ class HomeAgent:
 
     async def transcribe(self, wav_path: Path) -> str:
         cfg = self.config["stt"]; mode = cfg.get("mode", "api")
+        if mode == "sound_mcp":
+            return await self._sound_mcp_transcribe(wav_path)
         if mode == "faster_whisper":
             python = Path(cfg.get("local_python", "")); model = str(cfg.get("local_model", ""))
             if not python.exists() or not model: raise RuntimeError("请在 HomeAgent/config.yaml 设置 stt.local_python 和本地模型目录")

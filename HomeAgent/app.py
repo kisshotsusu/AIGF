@@ -320,8 +320,10 @@ class DesktopPet:
 
     def _set_transcription(self, text):
         self.input.delete("1.0", "end"); self.input.insert("1.0", text)
-        if self.agent.config["microphone"].get("auto_send_after_transcription"):
-            self.send()
+        # Voice input is a submit action: once recognition succeeds, send it.
+        # Keeping recognized text stranded in the editor made the voice button
+        # appear broken when stale settings overwrote the preference flag.
+        self.send()
 
     def _agent_log_files(self):
         files = []
@@ -423,7 +425,7 @@ class DesktopPet:
         for offset, (key, label) in enumerate(labels, start=3):
             ttk.Label(frame, text=label).grid(row=offset, column=0, sticky="w", padx=(0, 12), pady=5)
             if key == "mode":
-                widget = ttk.Combobox(frame, values=["api", "faster_whisper"], state="readonly", width=45); widget.set(stt.get(key, "api"))
+                widget = ttk.Combobox(frame, values=["sound_mcp", "api", "faster_whisper"], state="readonly", width=45); widget.set(stt.get(key, "sound_mcp"))
             else:
                 widget = ttk.Entry(frame, width=48, show="•" if key == "api_key" else "")
                 value = os.getenv(stt.get("api_key_env", "STT_API_KEY"), "") if key == "api_key" else stt.get(key, "")

@@ -4,6 +4,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import ctypes
+import threading
+import traceback
 import uuid
 import webbrowser
 from datetime import datetime
@@ -39,19 +43,72 @@ DOCUMENTS = {
 
 class CharacterManager:
     def __init__(self):
+        self._mutex = None
+        if os.name == "nt":
+            try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                try: ctypes.windll.user32.SetProcessDPIAware()
+                except Exception: pass
+            self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\AI-Live-Character-Manager")
+            if ctypes.windll.kernel32.GetLastError() == 183:
+                ctypes.windll.user32.MessageBoxW(None, "角色管理器已经在运行。", "AI 角色管理器", 0x40)
+                raise SystemExit(0)
+        self.startup_warnings = []
         WORKSPACE.mkdir(parents=True, exist_ok=True); IMAGES.mkdir(parents=True, exist_ok=True); MEMORY.mkdir(parents=True, exist_ok=True)
         self.cleanup_audio()
-        self.config = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
-        self.identity = yaml.safe_load(IDENTITY.read_text(encoding="utf-8")) if IDENTITY.exists() else {}
+        self.config = self._load_yaml(CONFIG, {})
+        self.identity = self._load_yaml(IDENTITY, {}) if IDENTITY.exists() else {}
         self.manifest = self._load_manifest()
-        self.root = tk.Tk(); self.root.title("AI 角色工作台"); self.root.geometry("1080x760"); self.root.minsize(880, 650)
+        self.root = tk.Tk(); self.root.title("AI 角色工作台"); self.root.geometry("1180x820"); self.root.minsize(920, 680)
         self.root.configure(bg="#edf3f1")
+        self.root.report_callback_exception = self._report_callback_exception
         self._style(); self._build()
         self.root.after(30_000, self._periodic_audio_cleanup)
+        if self.startup_warnings: self.root.after(300, self._show_startup_warnings)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
+    def _load_yaml(self, path: Path, fallback):
+        try: return yaml.safe_load(path.read_text(encoding="utf-8")) or fallback
+        except (OSError, yaml.YAMLError, UnicodeError) as exc:
+            backup = path.with_name(f"{path.name}.broken-{datetime.now():%Y%m%d-%H%M%S}")
+            try: shutil.copy2(path, backup)
+            except OSError: backup = None
+            self.startup_warnings.append(f"{path.name} 读取失败：{exc}" + (f"\n已备份到 {backup}" if backup else ""))
+            return fallback.copy() if isinstance(fallback, dict) else fallback
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content); handle.flush(); os.fsync(handle.fileno())
+        temporary.replace(path)
+
+    @classmethod
+    def _atomic_write_yaml(cls, path: Path, value):
+        cls._atomic_write_text(path, yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
+
+    @classmethod
+    def _atomic_write_json(cls, path: Path, value):
+        cls._atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+    def _report_callback_exception(self, exc_type, exc, tb):
+        log_dir = ROOT / "CharacterManager" / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
+        detail = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            with (log_dir / "character-manager-errors.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"\n[{datetime.now().isoformat(timespec='seconds')}]\n{detail}")
+        except OSError: pass
+        self.set_status(f"操作失败：{exc}", error=True)
+        messagebox.showerror("操作失败", f"{exc}\n\n详细信息已写入日志。", parent=self.root)
+
+    def _show_startup_warnings(self):
+        self.set_status("部分配置读取失败，已使用安全默认值", error=True)
+        messagebox.showwarning("配置恢复", "\n\n".join(self.startup_warnings), parent=self.root)
+
     def _periodic_audio_cleanup(self):
-        self.cleanup_audio()
+        try: self.cleanup_audio()
+        except Exception as exc: self.set_status(f"音频清理已跳过：{exc}", error=True)
         try: self.root.after(30_000, self._periodic_audio_cleanup)
         except tk.TclError: pass
 
@@ -61,8 +118,15 @@ class CharacterManager:
         extensions = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
         if not directory.exists():
             return 0
-        files = [path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in extensions]
-        files.sort(key=lambda path: (path.stat().st_mtime_ns, path.name.lower()), reverse=True)
+        files = []
+        for path in directory.iterdir():
+            try:
+                if path.is_file() and path.suffix.lower() in extensions: files.append(path)
+            except OSError: continue
+        def modified(path):
+            try: return path.stat().st_mtime_ns
+            except OSError: return 0
+        files.sort(key=lambda path: (modified(path), path.name.lower()), reverse=True)
         deleted = 0
         for path in files[max(0, keep):]:
             try:
@@ -94,14 +158,14 @@ class CharacterManager:
     def _style(self):
         style = ttk.Style(); style.theme_use("clam")
         self._style_images = []
-        self.colors = {"surface": "#ffffff", "surface2": "#f7f7f8", "container": "#e5e7eb", "primary": "#4b5563", "primary_dark": "#1f2937", "coral": "#6b7280", "orange": "#d1d5db", "on_primary": "#ffffff", "text": "#111827", "muted": "#6b7280", "outline": "#d1d5db"}
+        self.colors = {"surface": "#f6f9f9", "surface2": "#ffffff", "container": "#e4f2ef", "primary": "#16766f", "primary_dark": "#105c57", "coral": "#d97863", "orange": "#f0b36a", "on_primary": "#ffffff", "text": "#172326", "muted": "#718083", "outline": "#dce7e5"}
         c = self.colors; self.root.configure(bg=c["surface"])
         style.configure("TFrame", background=c["surface"]); style.configure("Card.TFrame", background=c["surface2"], relief="solid", borderwidth=1)
         style.configure("TButton", padding=(14, 9), borderwidth=1, shiftrelief=0, font=("Microsoft YaHei UI", 9, "bold"), background=c["container"], foreground=c["text"], bordercolor=c["outline"])
         style.map("TButton", background=[("active", c["container"]), ("pressed", "#bcd8d2")])
         style.configure("TLabel", background=c["surface"], foreground=c["text"], font=("Microsoft YaHei UI", 10))
         style.configure("Card.TLabel", background=c["surface2"], foreground=c["text"], font=("Microsoft YaHei UI", 10))
-        style.configure("Title.TLabel", background=c["surface"], foreground=c["text"], font=("Georgia", 21, "bold"))
+        style.configure("Title.TLabel", background=c["surface"], foreground=c["text"], font=("Microsoft YaHei UI", 20, "bold"))
         style.configure("TEntry", padding=8, fieldbackground="#ffffff", bordercolor=c["outline"], lightcolor=c["outline"], darkcolor=c["outline"])
         style.configure("TCombobox", padding=7, fieldbackground="#ffffff")
         style.configure("TNotebook", background=c["surface"], borderwidth=0); style.configure("TNotebook.Tab", padding=(18, 11), borderwidth=0, font=("Microsoft YaHei UI", 10), background=c["surface2"], foreground=c["muted"])
@@ -109,7 +173,7 @@ class CharacterManager:
         style.configure("Treeview", rowheight=36, borderwidth=0, font=("Microsoft YaHei UI", 9), background="#ffffff", fieldbackground="#ffffff", foreground=c["text"])
         style.configure("Treeview.Heading", padding=8, borderwidth=0, font=("Microsoft YaHei UI", 9, "bold"), background=c["surface2"], foreground=c["primary"])
         style.configure("Accent.TButton", background=c["primary"], foreground=c["on_primary"], shiftrelief=0, font=("Microsoft YaHei UI", 9, "bold"))
-        style.map("Accent.TButton", background=[("active", "#374151"), ("pressed", c["primary_dark"])])
+        style.map("Accent.TButton", background=[("active", "#126861"), ("pressed", c["primary_dark"])])
         style.configure("TCheckbutton", background=c["surface2"], foreground=c["text"], font=("Microsoft YaHei UI", 9))
 
         # clam 默认是硬直角；以下底图使用九宫格拉伸，控件放大后仍保持圆角。
@@ -117,7 +181,7 @@ class CharacterManager:
         button_hover = self._rounded_asset("#d1d5db", "#9ca3af", 10, 34)
         button_down = self._rounded_asset("#cbd0d7", "#9ca3af", 10, 34)
         accent = self._rounded_asset(c["primary"], c["primary"], 10, 34)
-        accent_hover = self._rounded_asset("#374151", "#374151", 10, 34)
+        accent_hover = self._rounded_asset("#126861", "#126861", 10, 34)
         accent_down = self._rounded_asset(c["primary_dark"], c["primary_dark"], 10, 34)
         entry = self._rounded_asset("#faf9f5", "#d7d4cc", 9, 32)
         card = self._rounded_asset(c["surface2"], c["outline"], 14, 42)
@@ -141,22 +205,42 @@ class CharacterManager:
 
     def _build(self):
         c = self.colors
-        head = tk.Frame(self.root, bg=c["surface"], padx=26, pady=20); head.pack(fill="x")
-        tk.Label(head, text="角", width=3, bg=c["container"], fg=c["primary_dark"], font=("Microsoft YaHei UI", 15, "bold")).pack(side="left", padx=(0, 12), ipady=5)
+        head = tk.Frame(self.root, bg=c["surface"], padx=26, pady=16); head.pack(fill="x")
+        tk.Label(head, text="角", width=3, bg=c["primary"], fg="white", font=("Microsoft YaHei UI", 15, "bold")).pack(side="left", padx=(0, 12), ipady=5)
         ttk.Label(head, text="AI 角色管理器", style="Title.TLabel").pack(side="left")
-        tk.Label(head, text="CHARACTER STUDIO\n角色 · 人格 · 记忆 · 能力", justify="right", bg=c["surface"], fg=c["muted"], font=("Microsoft YaHei UI", 9)).pack(side="right")
+        tk.Label(head, text="CHARACTER STUDIO\n角色 · 人格 · 记忆 · 能力", justify="right", bg=c["surface"], fg=c["primary"], font=("Microsoft YaHei UI", 9)).pack(side="right")
         tk.Frame(self.root, bg=c["outline"], height=1).pack(fill="x")
-        tabs = self.tabs = ttk.Notebook(self.root); tabs.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        identity_tab = ttk.Frame(tabs, padding=18); memory_tab = ttk.Frame(tabs, padding=18); docs_tab = ttk.Frame(tabs, padding=18)
+        footer = tk.Frame(self.root, bg=c["surface2"], height=34); footer.pack(fill="x", side="bottom"); footer.pack_propagate(False)
+        self.status_dot = tk.Label(footer, text="●", bg=c["surface2"], fg=c["primary"], font=("Microsoft YaHei UI", 9)); self.status_dot.pack(side="left", padx=(22, 7))
+        self.status_var = tk.StringVar(value="就绪 · 所有关键配置采用安全写入")
+        tk.Label(footer, textvariable=self.status_var, bg=c["surface2"], fg=c["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left")
+        tk.Label(footer, text=str(WORKSPACE), bg=c["surface2"], fg=c["muted"], font=("Consolas", 8)).pack(side="right", padx=20)
+        tabs = self.tabs = ttk.Notebook(self.root); tabs.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        identity_page, identity_tab = self._scrollable_page(tabs); memory_tab = ttk.Frame(tabs, padding=18); docs_tab = ttk.Frame(tabs, padding=18)
         model_tab = ttk.Frame(tabs, padding=18); voice_tab = ttk.Frame(tabs, padding=18)
         image_tab = ttk.Frame(tabs, padding=18); api_tab = ttk.Frame(tabs, padding=18); tools_tab = ttk.Frame(tabs, padding=18)
-        tabs.add(identity_tab, text="角色身份"); tabs.add(memory_tab, text="共享记忆"); tabs.add(docs_tab, text="人格与规则")
-        tabs.add(model_tab, text="模型与 API"); tabs.add(voice_tab, text="语音服务")
-        tabs.add(tools_tab, text="工具与维护"); tabs.add(image_tab, text="角色形象"); tabs.add(api_tab, text="图片 API")
+        tabs.add(identity_page, text="身份"); tabs.add(memory_tab, text="记忆"); tabs.add(docs_tab, text="人格规则")
+        tabs.add(model_tab, text="模型 API"); tabs.add(voice_tab, text="语音")
+        tabs.add(tools_tab, text="工具维护"); tabs.add(image_tab, text="形象"); tabs.add(api_tab, text="图片 API")
         self._build_identity(identity_tab); self._build_memory(memory_tab); self._build_documents(docs_tab)
         self._build_model_api(model_tab); self._build_voice(voice_tab)
         self._build_tools_maintenance(tools_tab)
         self._build_images(image_tab); self._build_api(api_tab)
+        tabs.bind("<<NotebookTabChanged>>", lambda _event: self.set_status(f"正在编辑：{tabs.tab(tabs.select(), 'text')}"))
+
+    def _scrollable_page(self, parent):
+        outer = ttk.Frame(parent); canvas = tk.Canvas(outer, bg=self.colors["surface"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview); canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y"); canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas, padding=18); window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        canvas.bind("<MouseWheel>", lambda event: canvas.yview_scroll(-1 if event.delta > 0 else 1, "units"))
+        return outer, inner
+
+    def set_status(self, text: str, error: bool = False):
+        if hasattr(self, "status_var"): self.status_var.set(str(text))
+        if hasattr(self, "status_dot"): self.status_dot.configure(fg=self.colors["coral"] if error else self.colors["primary"])
 
     def _build_identity(self, tab):
         char = self.identity.get("character", {}); user = self.identity.get("user", {})
@@ -241,7 +325,7 @@ class CharacterManager:
 
     def save_memory_strategy(self):
         # 保存前重新读取，避免角色工作台覆盖直播控制台刚刚修改的其他配置。
-        latest = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
+        latest = self._load_yaml(CONFIG, {})
         fields = self.memory_rule_fields; cfg = latest.setdefault("memory_write", {})
         cfg.update({
             "mode": fields["mode"].get(),
@@ -252,7 +336,7 @@ class CharacterManager:
             "always_keywords": [x.strip() for x in fields["always_keywords"].get().replace("，", ",").split(",") if x.strip()],
             "ignore_keywords": [x.strip() for x in fields["ignore_keywords"].get().replace("，", ",").split(",") if x.strip()],
         })
-        CONFIG.write_text(yaml.safe_dump(latest, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        self._atomic_write_yaml(CONFIG, latest)
         self.config = latest
         messagebox.showinfo("策略已保存", "直播助手和家庭桌宠将在下次启动时共同使用新的记忆规则。")
 
@@ -399,7 +483,7 @@ class CharacterManager:
         path = item["_file"]; lines = path.read_text(encoding="utf-8").splitlines()
         if replacement is None: lines.pop(item["_index"])
         else: lines[item["_index"]] = json.dumps(replacement, ensure_ascii=False)
-        path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        self._atomic_write_text(path, ("\n".join(lines) + "\n") if lines else "")
 
     def delete_selected_memory(self):
         item = self.selected_memory()
@@ -431,7 +515,7 @@ class CharacterManager:
             except tk.TclError: pass
             self._doc_save_job = None
         path = DOCUMENTS[self.active_document]
-        path.write_text(self.doc_editor.get("1.0", "end").strip() + "\n", encoding="utf-8")
+        self._atomic_write_text(path, self.doc_editor.get("1.0", "end").strip() + "\n")
         self._document_dirty = False
         self.doc_save_state.configure(text=f"已保存 · {datetime.now():%H:%M:%S}", foreground="#4a826d")
         if notify: messagebox.showinfo("保存成功", f"{self.active_document}已保存，下一次模型回复时生效。")
@@ -478,7 +562,7 @@ class CharacterManager:
         ttk.Button(tab, text="保存模型与 API", style="Accent.TButton", command=self.save_model_api).pack(anchor="e", pady=(12, 0))
 
     def save_model_api(self):
-        latest = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}; llm = latest.setdefault("llm", {}); providers = llm.setdefault("providers", {})
+        latest = self._load_yaml(CONFIG, {}); llm = latest.setdefault("llm", {}); providers = llm.setdefault("providers", {})
         try:
             tuning = {name: {"temperature": float(fields[0].get()), "max_tokens": int(fields[1].get())} for name, fields in self.llm_tuning_fields.items()}
             if any(not 0 <= values["temperature"] <= 2 or values["max_tokens"] < 1 for values in tuning.values()): raise ValueError
@@ -497,12 +581,12 @@ class CharacterManager:
             stored = self._read_env().get(key_env, "")
             label = self.provider_status_labels.get(name)
             if label: label.configure(text=f"已保存 · ***{stored[-4:]}" if stored else "未设置", foreground="#4a826d" if stored else self.colors["muted"])
-        CONFIG.write_text(yaml.safe_dump(latest, allow_unicode=True, sort_keys=False), encoding="utf-8"); self.config = latest
+        self._atomic_write_yaml(CONFIG, latest); self.config = latest
         detail = f"\n本次更新密钥：{', '.join(changed_keys)}" if changed_keys else "\nAPI Key 输入框留空，已保留现有密钥。"
         messagebox.showinfo("保存成功", "模型与 API 配置已保存并校验。" + detail + "\n重启正在运行的助手后生效。")
 
     def _build_voice(self, tab):
-        tts = self.config.setdefault("tts", {}); serve = yaml.safe_load(HOME_AGENT_CONFIG.read_text(encoding="utf-8")) if HOME_AGENT_CONFIG.exists() else {}; stt = serve.setdefault("stt", {})
+        tts = self.config.setdefault("tts", {}); serve = self._load_yaml(HOME_AGENT_CONFIG, {}) if HOME_AGENT_CONFIG.exists() else {}; stt = serve.setdefault("stt", {})
         ttk.Button(tab, text="保存语音配置", style="Accent.TButton", command=self.save_voice).pack(side="bottom", anchor="e", pady=(12, 0))
         body = ttk.Frame(tab); body.pack(fill="both", expand=True)
         left = ttk.Frame(body, style="Card.TFrame", padding=16); left.pack(side="left", fill="both", expand=True, padx=(0, 8))
@@ -526,19 +610,19 @@ class CharacterManager:
         right.columnconfigure(1, weight=1)
 
     def save_voice(self):
-        latest = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}; tts = latest.setdefault("tts", {})
+        latest = self._load_yaml(CONFIG, {}); tts = latest.setdefault("tts", {})
         for key, var in self.tts_vars.items(): tts[key] = var.get()
         for key, widget in self.tts_fields.items():
             value = widget.get().strip(); tts[key] = int(value or 0) if key == "startup_timeout_seconds" else value
-        CONFIG.write_text(yaml.safe_dump(latest, allow_unicode=True, sort_keys=False), encoding="utf-8"); self.config = latest
-        serve = yaml.safe_load(HOME_AGENT_CONFIG.read_text(encoding="utf-8")) if HOME_AGENT_CONFIG.exists() else {}; stt = serve.setdefault("stt", {})
+        self._atomic_write_yaml(CONFIG, latest); self.config = latest
+        serve = self._load_yaml(HOME_AGENT_CONFIG, {}) if HOME_AGENT_CONFIG.exists() else {}; stt = serve.setdefault("stt", {})
         for key, widget in self.stt_fields.items(): stt[key] = widget.get().strip()
-        stt.setdefault("api_key_env", "STT_API_KEY"); HOME_AGENT_CONFIG.write_text(yaml.safe_dump(serve, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        stt.setdefault("api_key_env", "STT_API_KEY"); self._atomic_write_yaml(HOME_AGENT_CONFIG, serve)
         if self.stt_key.get().strip(): self._save_env(stt["api_key_env"], self.stt_key.get().strip()); self.stt_key.delete(0, "end")
         messagebox.showinfo("保存成功", "语音回复和语音识别配置已保存。")
 
     def _build_tools_maintenance(self, tab):
-        home = yaml.safe_load(HOME_AGENT_CONFIG.read_text(encoding="utf-8")) if HOME_AGENT_CONFIG.exists() else {}
+        home = self._load_yaml(HOME_AGENT_CONFIG, {}) if HOME_AGENT_CONFIG.exists() else {}
         self.gui_vision_enabled = tk.BooleanVar(value=home.get("vision_mcp", {}).get("gui_enabled", False))
         vision_card = ttk.Frame(tab, style="Card.TFrame", padding=14); vision_card.pack(fill="x", pady=(0, 12))
         ttk.Label(vision_card, text="图像 GUI 识别", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
@@ -635,31 +719,39 @@ class CharacterManager:
         return {}
 
     def save_tools_maintenance(self):
-        home = yaml.safe_load(HOME_AGENT_CONFIG.read_text(encoding="utf-8")) if HOME_AGENT_CONFIG.exists() else {}
+        home = self._load_yaml(HOME_AGENT_CONFIG, {}) if HOME_AGENT_CONFIG.exists() else {}
         applications = {str(self.software_tree.item(i, "values")[0]): str(self.software_tree.item(i, "values")[1]) for i in self.software_tree.get_children()}
         home.setdefault("computer_control", {})["applications"] = applications
         maintenance = home.setdefault("context_maintenance", {}); maintenance["enabled"] = self.maintenance_vars["home_enabled"].get(); maintenance["time"] = self.home_cleanup_time.get().strip() or "03:00"
         vision = home.setdefault("vision_mcp", {}); gui_enabled = self.maintenance_vars["gui_vision_enabled"].get()
         vision["enabled"] = True; vision["gui_enabled"] = gui_enabled; vision["preload_model"] = gui_enabled
-        HOME_AGENT_CONFIG.write_text(yaml.safe_dump(home, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        latest = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}; cleanup = latest.setdefault("context_cleanup", {})
+        self._atomic_write_yaml(HOME_AGENT_CONFIG, home)
+        latest = self._load_yaml(CONFIG, {}); cleanup = latest.setdefault("context_cleanup", {})
         try: minutes = max(10, int(self.live_context_minutes.get()))
         except ValueError: return messagebox.showerror("配置错误", "直播上下文保留分钟数必须是整数。")
         cleanup.update({"live_enabled": self.maintenance_vars["live_enabled"].get(), "live_max_age_minutes": minutes, "check_interval_seconds": 60})
-        CONFIG.write_text(yaml.safe_dump(latest, allow_unicode=True, sort_keys=False), encoding="utf-8"); self.config = latest
+        self._atomic_write_yaml(CONFIG, latest); self.config = latest
         servers = {}
         for item in self.mcp_tree.get_children():
             name, kind, target = map(str, self.mcp_tree.item(item, "values"))
             if kind == "http": servers[name] = {"url": target, "disabled": False}
             else:
                 parts = target.split(); servers[name] = {"command": parts[0] if parts else "", "args": parts[1:], "disabled": False}
-        MCP_CONFIG.write_text(yaml.safe_dump({"mcpServers": servers}, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        WORKBUDDY_MCP.parent.mkdir(parents=True, exist_ok=True); WORKBUDDY_MCP.write_text(json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        sync_errors = self._sync_codex_mcp(servers, self.initial_mcp_names - set(servers)); self.initial_mcp_names = set(servers)
-        if not gui_enabled: self._stop_vision_service()
-        message = "软件映射、MCP 和上下文清理设置已保存。重启对应助手后生效。"
-        if sync_errors: message += "\n\nCodex MCP 同步提示：\n" + "\n".join(sync_errors[:5])
-        messagebox.showinfo("保存成功", message)
+        self._atomic_write_yaml(MCP_CONFIG, {"mcpServers": servers})
+        WORKBUDDY_MCP.parent.mkdir(parents=True, exist_ok=True); self._atomic_write_json(WORKBUDDY_MCP, {"mcpServers": servers})
+        removed = self.initial_mcp_names - set(servers); self.initial_mcp_names = set(servers)
+        self.set_status("配置已安全保存，正在后台同步 Codex MCP…")
+        def worker():
+            sync_errors = self._sync_codex_mcp(servers, removed)
+            if not gui_enabled: self._stop_vision_service()
+            def finish():
+                message = "软件映射、MCP 和上下文清理设置已保存。重启对应助手后生效。"
+                if sync_errors: message += "\n\nCodex MCP 同步提示：\n" + "\n".join(sync_errors[:5])
+                self.set_status("工具与维护设置已保存" if not sync_errors else "设置已保存，部分 MCP 同步失败", error=bool(sync_errors))
+                messagebox.showinfo("保存完成", message, parent=self.root)
+            try: self.root.after(0, finish)
+            except tk.TclError: pass
+        threading.Thread(target=worker, daemon=True, name="character-manager-mcp-sync").start()
 
     @staticmethod
     def _stop_vision_service():
@@ -727,7 +819,7 @@ class CharacterManager:
         except (OSError, json.JSONDecodeError): return {"primary": None, "images": []}
 
     def _save_manifest(self):
-        MANIFEST.write_text(json.dumps(self.manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._atomic_write_json(MANIFEST, self.manifest)
 
     def save_identity(self, notify=True):
         f = self.identity_fields
@@ -735,8 +827,8 @@ class CharacterManager:
         aliases = [x.strip() for x in f["user_aliases"].get().replace("，", ",").split(",") if x.strip()]
         data = {"character": {k: f[k].get().strip() for k in ("name", "identity", "gender", "visual_age", "personality", "relationship_to_user", "user_title")},
                 "user": {"id": "owner", "name": f["user_name"].get().strip() or "主人", "aliases": aliases, "live_usernames": live_names}, "notes": self.notes.get("1.0", "end").strip()}
-        IDENTITY.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        PROFILE.write_text(self.profile.get("1.0", "end").strip() + "\n", encoding="utf-8")
+        self._atomic_write_yaml(IDENTITY, data)
+        self._atomic_write_text(PROFILE, self.profile.get("1.0", "end").strip() + "\n")
         self.identity = data
         if hasattr(self, "identity_save_state"):
             self.identity_save_state.configure(text=f"已保存 · {datetime.now():%H:%M:%S}", foreground="#4a826d")
@@ -806,7 +898,7 @@ class CharacterManager:
         cfg = self.config.setdefault("image_generation", {})
         for key, widget in self.api_fields.items(): cfg[key] = widget.get().strip()
         cfg.setdefault("api_key_env", "IMAGE_API_KEY")
-        CONFIG.write_text(yaml.safe_dump(self.config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        self._atomic_write_yaml(CONFIG, self.config)
         key = self.image_key.get().strip()
         if key: self._save_env("IMAGE_API_KEY", key); self.image_key.delete(0, "end")
         messagebox.showinfo("保存成功", "图片 API 配置已保存。")
@@ -817,7 +909,7 @@ class CharacterManager:
         for i, line in enumerate(lines):
             if line.startswith(key + "="): lines[i] = f"{key}={value}"; break
         else: lines.append(f"{key}={value}")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        CharacterManager._atomic_write_text(path, "\n".join(lines) + "\n")
 
     @staticmethod
     def _read_env():
@@ -830,10 +922,17 @@ class CharacterManager:
 
     def close(self):
         try:
+            if getattr(self, "_doc_save_job", None):
+                try: self.root.after_cancel(self._doc_save_job)
+                except tk.TclError: pass
             self.save_document(False)
             self.save_identity(False)
         except Exception as exc:
             if not messagebox.askyesno("保存失败", f"关闭前保存角色身份或规则失败：\n{exc}\n\n仍然关闭吗？"): return
+        if self._mutex:
+            try: ctypes.windll.kernel32.CloseHandle(self._mutex)
+            except Exception: pass
+            self._mutex = None
         self.root.destroy()
 
     def run(self): self.root.mainloop()

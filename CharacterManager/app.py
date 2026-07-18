@@ -539,6 +539,11 @@ class CharacterManager:
 
     def _build_tools_maintenance(self, tab):
         home = yaml.safe_load(HOME_AGENT_CONFIG.read_text(encoding="utf-8")) if HOME_AGENT_CONFIG.exists() else {}
+        self.gui_vision_enabled = tk.BooleanVar(value=home.get("vision_mcp", {}).get("gui_enabled", False))
+        vision_card = ttk.Frame(tab, style="Card.TFrame", padding=14); vision_card.pack(fill="x", pady=(0, 12))
+        ttk.Label(vision_card, text="图像 GUI 识别", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
+        ttk.Checkbutton(vision_card, text="启用 GUI-Actor 图像识别（会占用显存）", variable=self.gui_vision_enabled).pack(side="left", padx=20)
+        ttk.Label(vision_card, text="关闭时网页使用 DOM/文本 Agent；保存后立即释放视觉模型显存", style="Card.TLabel", foreground=self.colors["muted"]).pack(side="left")
         top = ttk.Frame(tab); top.pack(fill="both", expand=True)
         software = ttk.Frame(top, style="Card.TFrame", padding=14); software.pack(side="left", fill="both", expand=True, padx=(0, 7))
         mcp = ttk.Frame(top, style="Card.TFrame", padding=14); mcp.pack(side="right", fill="both", expand=True, padx=(7, 0))
@@ -581,6 +586,7 @@ class CharacterManager:
         self.maintenance_vars = {
             "home_enabled": tk.BooleanVar(value=home_cleanup.get("enabled", True)),
             "live_enabled": tk.BooleanVar(value=root_cleanup.get("live_enabled", True)),
+            "gui_vision_enabled": self.gui_vision_enabled,
         }
         ttk.Checkbutton(maintenance, text="启用家庭上下文每日压缩", variable=self.maintenance_vars["home_enabled"]).grid(row=1, column=0, sticky="w", pady=(12, 5))
         ttk.Label(maintenance, text="家庭压缩时间", style="Card.TLabel").grid(row=1, column=1, sticky="e", padx=(15, 5))
@@ -633,6 +639,8 @@ class CharacterManager:
         applications = {str(self.software_tree.item(i, "values")[0]): str(self.software_tree.item(i, "values")[1]) for i in self.software_tree.get_children()}
         home.setdefault("computer_control", {})["applications"] = applications
         maintenance = home.setdefault("context_maintenance", {}); maintenance["enabled"] = self.maintenance_vars["home_enabled"].get(); maintenance["time"] = self.home_cleanup_time.get().strip() or "03:00"
+        vision = home.setdefault("vision_mcp", {}); gui_enabled = self.maintenance_vars["gui_vision_enabled"].get()
+        vision["enabled"] = True; vision["gui_enabled"] = gui_enabled; vision["preload_model"] = gui_enabled
         HOME_AGENT_CONFIG.write_text(yaml.safe_dump(home, allow_unicode=True, sort_keys=False), encoding="utf-8")
         latest = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}; cleanup = latest.setdefault("context_cleanup", {})
         try: minutes = max(10, int(self.live_context_minutes.get()))
@@ -648,9 +656,20 @@ class CharacterManager:
         MCP_CONFIG.write_text(yaml.safe_dump({"mcpServers": servers}, allow_unicode=True, sort_keys=False), encoding="utf-8")
         WORKBUDDY_MCP.parent.mkdir(parents=True, exist_ok=True); WORKBUDDY_MCP.write_text(json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         sync_errors = self._sync_codex_mcp(servers, self.initial_mcp_names - set(servers)); self.initial_mcp_names = set(servers)
+        if not gui_enabled: self._stop_vision_service()
         message = "软件映射、MCP 和上下文清理设置已保存。重启对应助手后生效。"
         if sync_errors: message += "\n\nCodex MCP 同步提示：\n" + "\n".join(sync_errors[:5])
         messagebox.showinfo("保存成功", message)
+
+    @staticmethod
+    def _stop_vision_service():
+        """Stop the current model-hosting process so CUDA memory is released immediately."""
+        try:
+            query = "(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue).OwningProcess"
+            found = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
+            pid = found.stdout.strip().splitlines()[0].strip() if found.stdout.strip() else ""
+            if pid.isdigit(): subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW, timeout=8)
+        except Exception: pass
 
     @staticmethod
     def _sync_codex_mcp(servers, removed=()):

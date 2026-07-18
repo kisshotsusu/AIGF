@@ -20,17 +20,25 @@ GUI Web Agent - MCP Server
 """
 import io
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from mcp.server.fastmcp import FastMCP, Image as MCPImage
 import agent
 
 mcp = FastMCP("vision-gui", host=os.getenv("VISION_MCP_HOST", "127.0.0.1"), port=int(os.getenv("VISION_MCP_PORT", "8765")), log_level="INFO")
+_web_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-web")
+
+
+async def _web_call(function, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_web_executor, lambda: function(*args))
 
 
 @mcp.tool()
-def navigate(url: str) -> str:
+async def navigate(url: str) -> str:
     """打开一个网页 URL。返回最终跳转后的地址。"""
-    return agent.navigate(url)
+    return await _web_call(agent.navigate, url)
 
 
 @mcp.tool()
@@ -64,9 +72,39 @@ def screenshot() -> MCPImage:
 
 
 @mcp.tool()
-def get_url() -> str:
+async def get_url() -> str:
     """返回当前浏览器所在的网址。"""
-    return agent.get_url()
+    return await _web_call(agent.get_url)
+
+
+@mcp.tool()
+async def web_read(max_chars: int = 12000) -> str:
+    """直接读取当前网页正文、链接、按钮和输入框，不进行图像识别。"""
+    return str(await _web_call(agent.web_read, max_chars))
+
+
+@mcp.tool()
+async def web_click_text(text: str, exact: bool = False) -> str:
+    """按网页中可见文字点击链接或按钮，不进行图像识别。"""
+    return str(await _web_call(agent.web_click_text, text, exact))
+
+
+@mcp.tool()
+async def web_fill(field: str, text: str, submit: bool = False) -> str:
+    """按 placeholder、label 或 name 找到网页输入框并填写，可选回车提交。"""
+    return str(await _web_call(agent.web_fill, field, text, submit))
+
+
+@mcp.tool()
+async def web_press(key: str) -> str:
+    """向当前网页发送按键，例如 Enter、Escape、Control+L。"""
+    return str(await _web_call(agent.web_press, key))
+
+
+@mcp.tool()
+async def web_play_media() -> str:
+    """直接播放当前网页中的第一个 video/audio 元素，不进行图像识别。"""
+    return str(await _web_call(agent.web_play_media))
 
 
 @mcp.tool()

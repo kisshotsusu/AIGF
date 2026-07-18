@@ -25,6 +25,10 @@ class LiveAssistant:
         self.log = logging.getLogger("ai_live")
         self.context: deque[dict[str, Any]] = deque(maxlen=cfg["reply"].get("max_context_messages", 12))
         self.last_context_cleanup = 0.0
+        self.context_state_file = self.root / "state" / "live-context.json"
+        self.context_control_file = self.root / "state" / "live-context-control.json"
+        self.last_context_control_token = ""
+        self._load_live_context_state()
         self.welcomed: dict[str, float] = {}
         self.last_reply: dict[str, float] = {}
         self.send_lock = asyncio.Lock()
@@ -135,6 +139,22 @@ class LiveAssistant:
 
     def _append_live_context(self, role: str, content: str) -> None:
         self.context.append({"role": role, "content": content, "_created_at": time.time()})
+        self._save_live_context_state()
+
+    def _load_live_context_state(self) -> None:
+        if not self.context_state_file.exists(): return
+        try: rows = json.loads(self.context_state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError): return
+        if isinstance(rows, list):
+            self.context.clear(); self.context.extend(item for item in rows if isinstance(item, dict))
+
+    def _save_live_context_state(self) -> None:
+        try:
+            self.context_state_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.context_state_file.with_suffix(".tmp")
+            temporary.write_text(json.dumps(list(self.context), ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.context_state_file)
+        except OSError: pass
 
     def _cleanup_live_context(self, force: bool = False) -> int:
         cfg = self.cfg.get("context_cleanup", {})
@@ -147,13 +167,28 @@ class LiveAssistant:
         kept = [item for item in self.context if float(item.get("_created_at", now)) >= cutoff]
         self.context.clear(); self.context.extend(kept)
         removed = before - len(self.context)
+        if removed: self._save_live_context_state()
         if removed: self.log.info("已清理 %s 条超过保留时长的直播模型上下文", removed)
         return removed
 
     async def _context_cleanup_loop(self) -> None:
         while True:
-            await asyncio.sleep(max(10, int(self.cfg.get("context_cleanup", {}).get("check_interval_seconds", 60))))
-            self._cleanup_live_context(force=True)
+            await asyncio.sleep(1)
+            self._apply_context_control()
+            self._cleanup_live_context(force=False)
+
+    def _apply_context_control(self) -> int:
+        if not self.context_control_file.exists(): return 0
+        try: request = json.loads(self.context_control_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError): return 0
+        token = str(request.get("token", ""))
+        if not token or token == self.last_context_control_token or request.get("action") != "clear": return 0
+        removed = len(self.context); self.context.clear(); self._save_live_context_state(); self.last_context_control_token = token
+        request.update({"status": "completed", "completed_at": datetime.now().isoformat(timespec="seconds"), "removed_messages": max(removed, int(request.get("removed_messages", 0) or 0))})
+        try: self.context_control_file.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError: pass
+        self.log.info("收到外部请求：已清空直播模型上下文，共 %s 条", removed)
+        return removed
 
     async def _maybe_remember(self, user: str, message: str, reply: str) -> None:
         cfg = self.cfg.get("memory_write", {})

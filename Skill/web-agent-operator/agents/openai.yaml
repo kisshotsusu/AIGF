@@ -1,0 +1,6 @@
+interface:
+  display_name: "网页 Agent 操作"
+  short_description: "分步读取网页、执行操作并验证最终状态直到任务真正完成"
+  default_prompt: "Use $web-agent-operator to complete this webpage task step by step and verify the final state."
+policy:
+  allow_implicit_invocation: true

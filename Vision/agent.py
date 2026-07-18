@@ -191,6 +191,62 @@ def get_url() -> str:
     return ensure_browser().url
 
 
+def web_read(max_chars: int = 12000):
+    """Read DOM text and interactive element metadata without image inference."""
+    page = ensure_browser()
+    data = page.evaluate("""() => ({
+      title: document.title,
+      url: location.href,
+      text: (document.body?.innerText || '').slice(0, 30000),
+      links: [...document.querySelectorAll('a')].slice(0, 150).map((e, i) => ({i, text:(e.innerText||e.getAttribute('aria-label')||'').trim().slice(0,160), href:e.href})),
+      buttons: [...document.querySelectorAll('button,[role=button]')].slice(0,100).map((e, i) => ({i, text:(e.innerText||e.getAttribute('aria-label')||e.title||'').trim().slice(0,160)})),
+      inputs: [...document.querySelectorAll('input,textarea,[contenteditable=true]')].slice(0,80).map((e, i) => ({i, type:e.type||'', name:e.name||'', placeholder:e.placeholder||'', aria:e.getAttribute('aria-label')||''}))
+    })""")
+    data["text"] = str(data.get("text", ""))[:max(1000, min(int(max_chars), 30000))]
+    return data
+
+
+def web_click_text(text: str, exact: bool = False):
+    page = ensure_browser(); locator = page.get_by_text(text, exact=exact)
+    count = locator.count()
+    if not count: return {"clicked": False, "reason": "text not found", "text": text}
+    locator.first.click(timeout=10000)
+    page.wait_for_timeout(500)
+    return {"clicked": True, "text": text, "matches": count, "url": page.url}
+
+
+def web_fill(field: str, text: str, submit: bool = False):
+    page = ensure_browser(); candidates = [
+        page.get_by_placeholder(field, exact=False), page.get_by_label(field, exact=False),
+        page.locator(f'input[name="{field}"], textarea[name="{field}"]'),
+    ]
+    locator = next((item.first for item in candidates if item.count()), None)
+    if locator is None:
+        locator = page.locator("input:not([type=hidden]), textarea, [contenteditable=true]").first
+    if not locator.count(): return {"filled": False, "reason": "input not found", "field": field}
+    locator.fill(text); locator.press("Enter") if submit else None
+    page.wait_for_timeout(500)
+    return {"filled": True, "field": field, "text_length": len(text), "submitted": submit, "url": page.url}
+
+
+def web_press(key: str):
+    page = ensure_browser(); page.keyboard.press(key); page.wait_for_timeout(300)
+    return {"pressed": key, "url": page.url}
+
+
+def web_play_media():
+    """Start the first HTML media element without visual grounding."""
+    page = ensure_browser()
+    result = page.evaluate("""async () => {
+      const media = document.querySelector('video, audio');
+      if (!media) return {played:false, reason:'media element not found'};
+      media.muted = false;
+      try { await media.play(); return {played:!media.paused, currentTime:media.currentTime, duration:media.duration}; }
+      catch (e) { return {played:false, reason:String(e)}; }
+    }""")
+    return {**result, "url": page.url}
+
+
 def wait(ms: int = 1000):
     ensure_browser().wait_for_timeout(ms)
     return True

@@ -193,9 +193,23 @@ class HomeAgent:
 
     def _should_route_to_vision(self, text: str) -> bool:
         cfg = self.config.get("vision_mcp", {})
-        if not cfg.get("enabled", True) or not self._codex_config().get("enabled", False): return False
+        if not cfg.get("enabled", True) or not cfg.get("gui_enabled", True) or not self._codex_config().get("enabled", False): return False
         lowered = str(text).lower()
         return any(str(word).strip().lower() in lowered for word in cfg.get("trigger_keywords", []) if str(word).strip())
+
+    @staticmethod
+    def _is_multistep_web_request(text: str) -> bool:
+        """Recognize outcome-oriented web requests that must not degrade to open_url."""
+        value = str(text).lower()
+        site_hint = any(word in value for word in (
+            "网页", "网站", "浏览器", "http://", "https://", "b站", "bilibili", "哔哩哔哩",
+            "百度", "淘宝", "天猫", "京东", "知乎", "小红书", "微博", "抖音", "github",
+        ))
+        action_hint = any(word in value for word in (
+            "搜索", "搜一下", "搜一搜", "搜", "查找", "找一下", "找找", "找", "选择",
+            "点开", "点击", "播放", "购买", "加入购物车", "填写", "提交", "登录",
+        ))
+        return site_hint and action_hint
 
     def ensure_vision_service(self, wait_until_ready: bool = False) -> bool:
         with self.vision_service_lock:
@@ -290,7 +304,7 @@ class HomeAgent:
     @staticmethod
     def _visual_search_query(text: str) -> str:
         patterns = (
-            r"(?:找到|找一下|找|搜索|搜一下|搜|播放|听)\s*[《\"“]?([^《》\"”]+?)[》\"”]?(?:然后|并且|并|播放|的视频|$)",
+            r"(?:找找|找到|找一下|找|搜索|搜一下|搜|播放|听)\s*[《\"“]?([^《》\"”]+?)[》\"”]?(?:然后|并且|并|播放|的视频|$)",
             r"[《\"“]([^《》\"”]+)[》\"”]",
         )
         for pattern in patterns:
@@ -298,6 +312,7 @@ class HomeAgent:
             if match:
                 query = match.group(1).strip(" ，,。.!！?？")
                 query = re.sub(r"\s*(?:唱的|演唱的|的歌)\s*", " ", query).strip()
+                query = re.sub(r"\s+的\s*", " ", query).strip()
                 if query: return query[:80]
         return ""
 
@@ -305,7 +320,7 @@ class HomeAgent:
     def _is_direct_visual_media_request(text: str) -> bool:
         lowered = text.lower()
         target = any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站", "网易云", "cloudmusic"))
-        return target and any(x in text for x in ("搜", "播放", "视频", "听"))
+        return target and any(x in text for x in ("找", "搜", "播放", "视频", "听"))
 
     async def _run_direct_visual_media(self, text: str, status=None) -> dict[str, Any] | None:
         """Fast deterministic path for common Bilibili/CloudMusic search-and-play tasks."""
@@ -347,6 +362,41 @@ class HomeAgent:
             self.log_event("direct_vision_failed", query=query, error=str(exc))
             return {"error": str(exc)}
 
+    async def _run_direct_web_media(self, text: str, status=None) -> dict[str, Any] | None:
+        """Operate Bilibili through DOM/text only; never loads the GUI vision model."""
+        lowered = text.lower()
+        if not any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站")): return None
+        query = self._visual_search_query(text)
+        if not query: return {"error": "没有识别出要搜索的内容"}
+        if not await asyncio.to_thread(self.ensure_vision_service, True): return {"error": "网页工具服务未就绪"}
+        self.log_event("direct_web_started", target="bilibili", query=query)
+        try:
+            if status: status("网页 Agent 正在分步搜索、选择并验证…")
+            python = ROOT / ".venv" / "Scripts" / "python.exe"
+            script = ROOT / "Skill" / "web-agent-operator" / "scripts" / "web_agent.py"
+            timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
+            proc = await asyncio.create_subprocess_exec(str(python), str(script), "--site", "bilibili", "--query", query,
+                "--action", "play", "--timeout", str(timeout), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            with self.active_process_lock: self.active_process = proc
+            try: out, err = await proc.communicate()
+            finally:
+                with self.active_process_lock:
+                    if self.active_process is proc: self.active_process = None
+            events = []
+            for line in out.decode("utf-8", "replace").splitlines():
+                try: events.append(json.loads(line))
+                except json.JSONDecodeError: continue
+            for event in events: self.log_event("web_agent_step", **event)
+            completed = next((event for event in reversed(events) if event.get("event") == "completed"), None)
+            failed = next((event for event in reversed(events) if event.get("event") == "failed"), None)
+            if proc.returncode or not completed: return {"error": (failed or {}).get("error") or err.decode("utf-8", "replace")[-500:] or "网页 Agent 未验证完成状态"}
+            self.log_event("direct_web_completed", query=query, title=completed.get("title"), url=completed.get("url"))
+            return {"ok": True, "answer": f"找到啦，我已经在B站打开并播放 {completed.get('title') or query} 了。"}
+        except Exception as exc:
+            self.log_event("direct_web_failed", query=query, error=str(exc))
+            return {"error": str(exc)}
+
     async def _natural_visual_failure(self, request: str, reason: str) -> str:
         """Generate only failure wording through the character LLM; keep it short for TTS."""
         fallback = "这次没能顺利操作成功，我已经停下来了。你可以稍后再让我试一次。"
@@ -368,6 +418,24 @@ class HomeAgent:
             self.log_event("visual_failure_wording_failed", error=str(exc))
             return fallback
 
+    def _request_live_context_clear(self) -> dict[str, Any]:
+        state_dir = ROOT / "state"; state_dir.mkdir(parents=True, exist_ok=True)
+        context_path = state_dir / "live-context.json"
+        removed = 0
+        if context_path.exists():
+            try:
+                rows = json.loads(context_path.read_text(encoding="utf-8")); removed = len(rows) if isinstance(rows, list) else 0
+            except (OSError, json.JSONDecodeError): pass
+        temporary_context = context_path.with_suffix(".tmp")
+        temporary_context.write_text("[]\n", encoding="utf-8"); temporary_context.replace(context_path)
+        path = state_dir / "live-context-control.json"
+        token = f"{time.time_ns()}"
+        payload = {"action": "clear", "token": token, "requested_at": datetime.now().isoformat(timespec="seconds"), "source": "home-agent", "status": "storage_cleared", "removed_messages": removed}
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(path)
+        self.log_event("live_context_clear_requested", token=token)
+        return payload
+
     async def _run_codex_task(self, task: str, require_mcp: bool = False, status=None, preferred_mcp: str = "") -> dict[str, Any]:
         if self.cancel_event.is_set():
             raise asyncio.CancelledError
@@ -381,15 +449,18 @@ class HomeAgent:
         working_directory = Path(str(cfg.get("working_directory", ROOT))).expanduser().resolve()
         if not working_directory.is_dir():
             return {"error": f"Codex 工作目录不存在：{working_directory}"}
+        gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", False))
         prompt = (
             "你是家庭 AI 助手的执行代理。请使用可用的 CLI、文件和 MCP 工具完成任务，"
             "最后用简洁中文给出适合语音朗读的结果。不要输出密钥。\n\n"
             + ("本任务必须优先使用合适的 MCP 工具；若没有可用 MCP，请明确说明。\n\n" if require_mcp else "")
-            + (f"本任务是界面或电脑控制请求，必须首先使用 `{preferred_mcp}` MCP。"
-               "先用 list_windows 检测目标应用进程 PID 和窗口标题；目标是网页且尚未打开时，优先用 navigate 或系统 URL 直接启动。"
-               "找到窗口后必须用 activate_window 和 window_screenshot 只识别目标窗口，再用 window_click/window_type_text 操作，关键操作后再次截取目标窗口验证。"
-               "不要反复识别整张桌面，不要无目的等待；连续两次状态没有变化就报告失败并结束。"
-               "只有窗口工具明确不适用或失败时，才能回退到主屏幕工具或 CLI。\n\n" if preferred_mcp else "")
+            + (f"本任务必须首先使用 `{preferred_mcp}` MCP。"
+               + ("这是网页任务且图像 GUI 已关闭：必须遵循 E:\\Doc\\AI直播\\Skill\\web-agent-operator\\SKILL.md，"
+                  "只用 navigate/get_url/web_read/web_fill/web_click_text/web_press/web_play_media。"
+                  "打开首页只是阶段一，绝不是完成；必须继续搜索、读取结果、选择匹配项、执行目标动作，并读取最终页面验证。"
+                  "只有终态证据满足用户目标才能报告成功。\n\n" if not gui_enabled else
+                  "先用 list_windows 检测目标应用，再用目标窗口工具操作；每次关键操作后重新读取状态验证。\n\n")
+               if preferred_mcp else "")
             + f"角色与规则：\n{self.workspace.prompt_documents('home')}\n\n用户任务：{task}"
         )
         command = [*codex_command, "exec", "--json"]
@@ -488,9 +559,10 @@ class HomeAgent:
             tools += [
                 {"type": "function", "function": {"name": "codex_cli_task", "description": "调用 Codex CLI 完成复杂的本机命令、文件、编程或多步骤任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
                 {"type": "function", "function": {"name": "mcp_task", "description": "通过 Codex CLI 调用已配置的 MCP 服务完成任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
-                {"type": "function", "function": {"name": "vision_gui_task", "description": "优先调用 vision-gui 视觉 MCP，通过桌面截图识别并点击、输入、滚动或控制网页。遇到电脑界面操作时优先使用。", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
                 {"type": "function", "function": {"name": "list_mcp_servers", "description": "检查 Codex CLI 和已配置的 MCP 服务", "parameters": {"type": "object", "properties": {}}}},
             ]
+            if self.config.get("vision_mcp", {}).get("gui_enabled", False):
+                tools.append({"type": "function", "function": {"name": "vision_gui_task", "description": "调用 GUI 图像识别 MCP 操作桌面窗口", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}})
         if self.config.get("computer_control", {}).get("enabled", False):
             tools += [
                 {"type": "function", "function": {"name": "list_directory", "description": "列出允许目录中的文件和子目录", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
@@ -569,11 +641,21 @@ class HomeAgent:
         max_context = int(self.config["home"].get("max_context_messages", 30))
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
         self.log_event("user_message", message=text, history_messages=len(self.history))
+        normalized_clear = str(text).replace(" ", "")
+        if (any(word in normalized_clear for word in ("清理", "清空", "删除")) and "直播" in normalized_clear
+                and any(word in normalized_clear for word in ("上下文", "聊天记录", "对话记录", "近期对话"))):
+            request = self._request_live_context_clear()
+            removed = request.get("removed_messages", 0)
+            answer = f"好，直播场景的短期聊天上下文已经独立清空了，共移除{removed}条，长期记忆不会受影响。"
+            self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            async with aiohttp.ClientSession() as session:
+                if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status)
+            return answer
         normalized = str(text).lower().replace(" ", "")
         simple_bilibili_open = (
             ("打开" in normalized or "访问" in normalized) and
             ("bilibili" in normalized or "哔哩哔哩" in normalized or "b站" in normalized) and
-            not any(word in normalized for word in ("搜索", "播放", "点击", "登录", "发消息", "直播间", "视频"))
+            not any(word in normalized for word in ("找", "搜", "播放", "点击", "登录", "发消息", "直播间", "视频", "听"))
         )
         if simple_bilibili_open:
             if status: status("正在打开 Bilibili…")
@@ -588,32 +670,36 @@ class HomeAgent:
         if self._is_direct_visual_media_request(text):
             visual_query = self._visual_search_query(text)
             visual_target = "B站" if any(x in text.lower() for x in ("bilibili", "哔哩哔哩", "b站")) else "网易云"
+            gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", True))
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, f"好呀，我去{visual_target}帮你找找{visual_query or '想要的内容'}。", status)
             operation_timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
             try:
-                direct_visual = await asyncio.wait_for(self._run_direct_visual_media(text, status), timeout=operation_timeout)
+                operation = self._run_direct_visual_media(text, status) if gui_enabled else self._run_direct_web_media(text, status)
+                direct_visual = await asyncio.wait_for(operation, timeout=operation_timeout)
             except asyncio.TimeoutError:
                 self.stop_current_task()
                 direct_visual = {"error": f"超过{operation_timeout}秒仍未执行成功，操作已超时停止"}
                 self.log_event("direct_vision_total_timeout", limit_seconds=operation_timeout)
-            if direct_visual is None: direct_visual = {"error": "无法解析视觉操作目标"}
+            if direct_visual is None:
+                direct_visual = {"error": "图像 GUI 识别已禁用，而且该目标不是可直接读取的网页"}
             answer = (await self._natural_visual_failure(text, str(direct_visual["error"])) if direct_visual.get("error")
                       else str(direct_visual.get("answer", "好啦，已经帮你操作完成了。")))
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status)
             return answer
+        web_route = self._is_multistep_web_request(text)
         vision_route = self._should_route_to_vision(text)
-        if vision_route or self._should_route_to_codex(text):
-            route = "vision_mcp" if vision_route else "codex_cli"
+        if web_route or vision_route or self._should_route_to_codex(text):
+            route = "web_agent" if web_route else ("vision_mcp" if vision_route else "codex_cli")
             self.log_event("route_selected", route=route, reason="vision_priority" if vision_route else "trigger_mode_or_keyword")
-            preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui")) if vision_route else ""
-            if vision_route:
+            preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui")) if (web_route or vision_route) else ""
+            if web_route or vision_route:
                 async with aiohttp.ClientSession() as session:
                     if self.config["home"].get("auto_speak", True): await self._speak_home(session, "好呀，我来看一下屏幕，很快就好。", status)
-                operation_timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
+                operation_timeout = max(90 if web_route else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
                 try:
                     result = await asyncio.wait_for(self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred), timeout=operation_timeout)
                 except asyncio.TimeoutError:

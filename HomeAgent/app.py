@@ -155,15 +155,20 @@ class DesktopPet:
 
         bottom = tk.Frame(self.panel, bg="#f2efe8")
         bottom.pack(fill="both", expand=True, padx=9, pady=9)
-        buttons = tk.Frame(bottom, bg="#f2efe8", width=250)
+        buttons = tk.Frame(bottom, bg="#f2efe8", width=270)
         buttons.pack(side="right", fill="y", padx=(8, 0))
         buttons.pack_propagate(False)
         self.record_btn = ttk.Button(buttons, text="● 开始语音", command=self.toggle_record, width=12)
-        self.record_btn.pack(side="left", fill="y", padx=(0, 6))
-        self.send_btn = ttk.Button(buttons, text="发送", command=self.send, width=8)
+        self.record_btn.pack(side="left", fill="y")
+
+        # Keep the two task actions in one stable group. The voice button must
+        # not separate or squeeze them when Windows font scaling changes.
+        task_actions = tk.Frame(buttons, bg="#f2efe8")
+        task_actions.pack(side="right", fill="y")
+        self.send_btn = ttk.Button(task_actions, text="发送", command=self.send, width=8)
         self.send_btn.pack(side="left", fill="y")
-        self.stop_btn = ttk.Button(buttons, text="停止", command=self.stop_current_task, width=7, state="disabled")
-        self.stop_btn.pack(side="left", fill="y", padx=(6, 0))
+        self.stop_btn = ttk.Button(task_actions, text="停止", command=self.stop_current_task, width=7, state="disabled")
+        self.stop_btn.pack(side="left", fill="y", padx=(2, 0))
         self.input = tk.Text(bottom, height=2, wrap="word", relief="solid", bd=1, font=("Microsoft YaHei UI", 10), padx=6, pady=5)
         self.input.pack(side="left", fill="both", expand=True)
         self.input.bind("<Control-Return>", lambda _: self.send())
@@ -427,8 +432,8 @@ class DesktopPet:
 
         auto_var = tk.BooleanVar(value=bool(mic.get("auto_send_after_transcription", False)))
         top_var = tk.BooleanVar(value=bool(self.agent.config.get("desktop_pet", {}).get("always_on_top", True)))
-        ttk.Checkbutton(frame, text="识别完成后自动发送", variable=auto_var).grid(row=10, column=1, sticky="w", pady=(9, 2))
-        ttk.Checkbutton(frame, text="桌宠始终置顶", variable=top_var).grid(row=11, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="识别完成后自动发送", variable=auto_var, command=lambda: save()).grid(row=10, column=1, sticky="w", pady=(9, 2))
+        ttk.Checkbutton(frame, text="桌宠始终置顶", variable=top_var, command=lambda: save()).grid(row=11, column=1, sticky="w", pady=2)
 
         control = self.agent.config.get("computer_control", {})
         control_var = tk.BooleanVar(value=bool(control.get("enabled", True)))
@@ -436,17 +441,17 @@ class DesktopPet:
         confirm_var = tk.BooleanVar(value=bool(control.get("confirm_before_action", True)))
         confirm_launch_var = tk.BooleanVar(value=bool(control.get("confirm_launch_app", False)))
         ttk.Label(frame, text="电脑控制", font=("Microsoft YaHei UI", 11, "bold")).grid(row=12, column=0, columnspan=2, sticky="w", pady=(14, 5))
-        ttk.Checkbutton(frame, text="允许家庭 Agent 使用电脑工具", variable=control_var).grid(row=13, column=1, sticky="w", pady=2)
-        ttk.Checkbutton(frame, text="完整磁盘访问权限", variable=full_access_var).grid(row=14, column=1, sticky="w", pady=2)
-        ttk.Checkbutton(frame, text="打开文件和网页前请求确认", variable=confirm_var).grid(row=15, column=1, sticky="w", pady=2)
-        ttk.Checkbutton(frame, text="启动应用前请求确认", variable=confirm_launch_var).grid(row=16, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="允许家庭 Agent 使用电脑工具", variable=control_var, command=lambda: save()).grid(row=13, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="完整磁盘访问权限", variable=full_access_var, command=lambda: save()).grid(row=14, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="打开文件和网页前请求确认", variable=confirm_var, command=lambda: save()).grid(row=15, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="启动应用前请求确认", variable=confirm_launch_var, command=lambda: save()).grid(row=16, column=1, sticky="w", pady=2)
         ttk.Label(frame, text="限制目录（关闭完整权限时使用）").grid(row=17, column=0, sticky="w", padx=(0, 12), pady=5)
         roots_entry = ttk.Entry(frame, width=48); roots_entry.insert(0, "；".join(control.get("allowed_roots", []))); roots_entry.grid(row=17, column=1, sticky="ew", pady=5)
 
         codex = self.agent.config.get("codex_cli", {})
         codex_enabled_var = tk.BooleanVar(value=bool(codex.get("enabled", False)))
         ttk.Label(frame, text="Codex CLI 与 MCP", font=("Microsoft YaHei UI", 11, "bold")).grid(row=18, column=0, columnspan=2, sticky="w", pady=(14, 5))
-        ttk.Checkbutton(frame, text="启用 Codex CLI / MCP 工具", variable=codex_enabled_var).grid(row=19, column=1, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="启用 Codex CLI / MCP 工具", variable=codex_enabled_var, command=lambda: save()).grid(row=19, column=1, sticky="w", pady=2)
         codex_fields = {}
         codex_rows = [
             ("executable", "Codex 可执行文件"),
@@ -482,11 +487,24 @@ class DesktopPet:
 
         ttk.Button(frame, text="测试 CLI 与 MCP", command=test_codex).grid(row=26, column=1, sticky="w", pady=(7, 2))
 
+        save_timer = None
+        save_status = tk.StringVar(value="修改后自动保存")
+
         def save():
-            cfg = self.agent.config
+            nonlocal save_timer
+            save_timer = None
+            # Always start from the latest file. CharacterManager and other
+            # HomeAgent windows may have changed unrelated settings since this
+            # window was opened, so writing the startup snapshot can resurrect
+            # stale values.
+            try:
+                cfg = yaml.safe_load((HOME_AGENT / "config.yaml").read_text(encoding="utf-8")) or {}
+            except (OSError, yaml.YAMLError) as exc:
+                save_status.set(f"保存失败：{exc}")
+                return False
             if self.mic_devices and mic_box.current() >= 0:
                 cfg.setdefault("microphone", {})["device_id"] = self.mic_devices[mic_box.current()][0]
-            cfg["microphone"]["auto_send_after_transcription"] = auto_var.get()
+            cfg.setdefault("microphone", {})["auto_send_after_transcription"] = auto_var.get()
             for key in ("mode", "api_url", "model", "language", "local_python", "local_model"):
                 cfg.setdefault("stt", {})[key] = fields[key].get().strip()
             cfg.setdefault("desktop_pet", {})["always_on_top"] = top_var.get()
@@ -504,15 +522,55 @@ class DesktopPet:
             try:
                 cfg["codex_cli"]["timeout_seconds"] = max(10, int(codex_fields["timeout_seconds"].get().strip() or "600"))
             except ValueError:
-                return messagebox.showerror("配置错误", "任务超时秒数必须是整数。", parent=win)
+                save_status.set("尚未保存：任务超时秒数必须是整数")
+                return False
             cfg["codex_cli"].setdefault("skip_git_repo_check", True)
-            self._write_config_preserving_unknown(cfg)
-            self._save_env_value(cfg["stt"].get("api_key_env", "STT_API_KEY"), fields["api_key"].get().strip())
-            os.environ[cfg["stt"].get("api_key_env", "STT_API_KEY")] = fields["api_key"].get().strip()
+            try:
+                saved = self._write_config_preserving_unknown(cfg)
+                expected_confirm = bool(confirm_var.get())
+                actual_confirm = bool(saved.get("computer_control", {}).get("confirm_before_action", True))
+                if actual_confirm != expected_confirm:
+                    raise OSError("打开文件和网页前确认设置写入后校验不一致")
+                # Make the change effective immediately; no desktop-pet restart
+                # should be required for computer-control permission settings.
+                self.agent.config = saved
+                self._save_env_value(saved["stt"].get("api_key_env", "STT_API_KEY"), fields["api_key"].get().strip())
+                os.environ[saved["stt"].get("api_key_env", "STT_API_KEY")] = fields["api_key"].get().strip()
+            except (OSError, yaml.YAMLError) as exc:
+                save_status.set(f"保存失败：{exc}")
+                return False
             self.root.attributes("-topmost", top_var.get())
-            messagebox.showinfo("已保存", "语音设备和识别配置已保存。", parent=win); win.destroy()
+            save_status.set(f"已自动保存 · {datetime.now():%H:%M:%S}")
+            return True
 
-        ttk.Button(frame, text="保存设置", command=save).grid(row=27, column=1, sticky="e", pady=(14, 0))
+        def schedule_save(_event=None):
+            """Debounce text editing while keeping toggles truly immediate."""
+            nonlocal save_timer
+            if save_timer is not None:
+                win.after_cancel(save_timer)
+            save_status.set("正在编辑…")
+            save_timer = win.after(500, save)
+
+        mic_box.bind("<<ComboboxSelected>>", lambda _event: save())
+        for widget in fields.values():
+            widget.bind("<<ComboboxSelected>>", lambda _event: save())
+            widget.bind("<KeyRelease>", schedule_save)
+            widget.bind("<FocusOut>", lambda _event: save())
+        roots_entry.bind("<KeyRelease>", schedule_save)
+        roots_entry.bind("<FocusOut>", lambda _event: save())
+        for widget in codex_fields.values():
+            widget.bind("<<ComboboxSelected>>", lambda _event: save())
+            widget.bind("<KeyRelease>", schedule_save)
+            widget.bind("<FocusOut>", lambda _event: save())
+
+        def close_settings():
+            if save_timer is not None:
+                win.after_cancel(save_timer)
+            save()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close_settings)
+        ttk.Label(frame, textvariable=save_status, foreground="#287568").grid(row=27, column=0, columnspan=2, sticky="e", pady=(14, 0))
         frame.columnconfigure(1, weight=1)
 
     @staticmethod
@@ -537,13 +595,20 @@ class DesktopPet:
             current = {}
         for key, value in current.items():
             cfg.setdefault(key, value)
-        config_path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        # 视觉模式由角色管理器维护；旧桌宠进程不得用启动时的陈旧值覆盖它。
+        if "vision_mcp" in current:
+            cfg["vision_mcp"] = current["vision_mcp"]
+        temporary = config_path.with_suffix(".yaml.tmp")
+        temporary.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        temporary.replace(config_path)
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        return saved
 
     def close(self):
         self.closing = True
         cfg = self.agent.config
         cfg.setdefault("desktop_pet", {})["x"] = self.root.winfo_x(); cfg["desktop_pet"]["y"] = self.root.winfo_y()
-        self._write_config_preserving_unknown(cfg)
+        self.agent.config = self._write_config_preserving_unknown(cfg)
         if self.stream:
             try: self.stream.stop(); self.stream.close()
             except Exception: pass

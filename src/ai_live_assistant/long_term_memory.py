@@ -103,3 +103,43 @@ class LongTermMemoryStore:
 
     def count(self) -> int:
         with closing(self._connect()) as db: return int(db.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+
+    def migrate_legacy(self, memory_dir: str | Path) -> dict[str, int]:
+        """Idempotently copy high-value JSONL memories into SQLite."""
+        folder = Path(memory_dir)
+        result = {"scanned": 0, "stored": 0, "duplicates": 0, "skipped": 0}
+        if not folder.is_dir(): return result
+        category_map = {
+            "identity": "relationship", "event": "major_event", "conversation": "major_event",
+            "preference": "preference", "habit": "habit", "health": "health",
+            "emotion": "emotion", "relationship": "relationship", "agreement": "agreement",
+            "major_event": "major_event",
+        }
+        for path in sorted(folder.glob("*.jsonl")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try: item = json.loads(line)
+                except json.JSONDecodeError:
+                    result["skipped"] += 1; continue
+                result["scanned"] += 1
+                importance = int(item.get("importance", 0) or 0)
+                category = category_map.get(str(item.get("category") or item.get("type") or ""))
+                detail = str(item.get("original_message") or item.get("message") or item.get("content") or "").strip()
+                if importance < 70 or not category or not detail:
+                    result["skipped"] += 1; continue
+                summary = str(item.get("content") or detail).strip()[:20]
+                user_id = str(item.get("user_id") or item.get("user") or "owner")
+                user = str(item.get("user") or user_id)
+                tags = self._tags(item.get("tags") or [user, category, "长期记忆"])
+                while len(tags) < 3: tags.append(("重要信息", "历史记录", "用户记忆")[len(tags)])
+                try:
+                    record = self.store(
+                        tags=tags[:5], summary=summary, detail=detail, category=category,
+                        importance=importance, user_id=user_id, scene="home" if user_id == "owner" else "live",
+                        privacy=str(item.get("privacy") or ("private" if user_id == "owner" else "public")),
+                        source=f"legacy-migration:{item.get('source', 'workspace-memory')}",
+                    )
+                    key = "duplicates" if record.get("duplicate") else "stored"
+                    result[key] += 1
+                except (TypeError, ValueError, OSError):
+                    result["skipped"] += 1
+        return result

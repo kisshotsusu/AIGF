@@ -44,6 +44,7 @@ class HomeAgent:
         self.codex_thread_id: str | None = None
         self.task_store = TaskStore(ROOT / "Task")
         self.long_term_memory = LongTermMemoryStore(ROOT / "LongTermMemory")
+        migration = self.long_term_memory.migrate_legacy(self.workspace.root / self.workspace.cfg.get("memory_dir", "memory"))
         self.tts_execution_lock = threading.Lock()
         self.cancel_event = threading.Event()
         self.active_process = None
@@ -56,6 +57,7 @@ class HomeAgent:
         threading.Thread(target=self.ensure_sound_service, daemon=True, name="sound-mcp-autostart").start()
         self.character_name = "小助手"
         self.refresh_identity()
+        self.log_event("long_term_memory_migration", result=migration, total=self.long_term_memory.count())
 
     def begin_task(self) -> None:
         self.cancel_event.clear()
@@ -111,6 +113,21 @@ class HomeAgent:
             "\n\n【当前系统提示词】\n" + self._system_prompt() +
             "\n\n【短期对话上下文】\n" + json.dumps(self.history, ensure_ascii=False, indent=2, default=str)
         )
+
+    @staticmethod
+    def _is_memory_recall_request(text: str) -> bool:
+        value = str(text).replace(" ", "")
+        return any(word in value for word in ("记得吗", "还记得", "记不记得", "我之前", "以前的我", "过去的我", "我的生日", "我喜欢什么", "我讨厌什么"))
+
+    @staticmethod
+    def _memory_query_tags(text: str) -> list[str]:
+        value = str(text).replace(" ", "")
+        known = ("生日", "喜欢", "讨厌", "睡眠", "身体", "健康", "心情", "情绪", "习惯", "约定", "名字", "称呼", "家人", "工作", "学校")
+        tags = [word for word in known if word in value]
+        if not tags:
+            cleaned = re.sub(r"(你|还|是否|吗|呢|我|的|之前|以前|记得|记不记得|哪一天|什么)", "", value)
+            if cleaned: tags.append(cleaned[:12])
+        return tags or ["长期记忆"]
 
     def refresh_identity(self) -> str:
         path = self.workspace.root / self.project.get("workspace", {}).get("identity_file", "IDENTITY.yaml")
@@ -213,6 +230,16 @@ class HomeAgent:
             "点开", "点击", "播放", "购买", "加入购物车", "填写", "提交", "登录",
         ))
         return site_hint and action_hint
+
+    def _has_recent_web_context(self, text: str) -> bool:
+        """Carry the active website into short follow-up commands such as '搜这个并播放'."""
+        current = str(text).lower()
+        if not any(word in current for word in (
+            "搜索", "搜", "查找", "找", "选择", "点开", "点击", "播放", "购买", "加入购物车", "填写", "提交",
+        )):
+            return False
+        recent = "\n".join(str(item.get("content", "")) for item in self.history[-5:])
+        return self._is_multistep_web_request(f"{recent}\n{text}")
 
     def ensure_vision_service(self, wait_until_ready: bool = False) -> bool:
         with self.vision_service_lock:
@@ -442,8 +469,9 @@ class HomeAgent:
             python = ROOT / ".venv" / "Scripts" / "python.exe"
             script = ROOT / "Skill" / "web-agent-operator" / "scripts" / "web_agent.py"
             timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
+            action = "play" if any(word in text for word in ("播放", "听", "播一下")) else "open"
             proc = await asyncio.create_subprocess_exec(str(python), str(script), "--site", "bilibili", "--query", query,
-                "--action", "play", "--timeout", str(timeout), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                "--action", action, "--timeout", str(timeout), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             with self.active_process_lock: self.active_process = proc
             try: out, err = await proc.communicate()
@@ -459,7 +487,8 @@ class HomeAgent:
             failed = next((event for event in reversed(events) if event.get("event") == "failed"), None)
             if proc.returncode or not completed: return {"error": (failed or {}).get("error") or err.decode("utf-8", "replace")[-500:] or "网页 Agent 未验证完成状态"}
             self.log_event("direct_web_completed", query=query, title=completed.get("title"), url=completed.get("url"))
-            return {"ok": True, "answer": f"找到啦，我已经在B站打开并播放 {completed.get('title') or query} 了。"}
+            verb = "打开并播放" if action == "play" else "找到并打开"
+            return {"ok": True, "answer": f"找到啦，我已经在B站{verb} {completed.get('title') or query} 了。"}
         except Exception as exc:
             self.log_event("direct_web_failed", query=query, error=str(exc))
             return {"error": str(exc)}
@@ -626,6 +655,7 @@ class HomeAgent:
             tools += [
                 {"type": "function", "function": {"name": "codex_cli_task", "description": "调用 Codex CLI 完成复杂的本机命令、文件、编程或多步骤任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
                 {"type": "function", "function": {"name": "mcp_task", "description": "通过 Codex CLI 调用已配置的 MCP 服务完成任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
+                {"type": "function", "function": {"name": "web_agent_task", "description": "完成多步骤网页任务。只要请求包含搜索、查找、选择、点击、播放、填写或提交，就必须使用本工具，不能仅调用 open_url。", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
                 {"type": "function", "function": {"name": "list_mcp_servers", "description": "检查 Codex CLI 和已配置的 MCP 服务", "parameters": {"type": "object", "properties": {}}}},
             ]
             if self.config.get("vision_mcp", {}).get("gui_enabled", False):
@@ -635,7 +665,7 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "list_directory", "description": "列出允许目录中的文件和子目录", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
                 {"type": "function", "function": {"name": "read_text_file", "description": "读取允许目录中的文本文件，不能读取密钥文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
                 {"type": "function", "function": {"name": "open_path", "description": "经过用户确认后，用系统默认程序打开允许目录中的文件或文件夹", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
-                {"type": "function", "function": {"name": "open_url", "description": "经过用户确认后，在浏览器打开 HTTP 或 HTTPS 网页", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+                {"type": "function", "function": {"name": "open_url", "description": "仅用于目标就是打开某个网页的单步请求。若还要搜索、查找、点击、选择、播放、填写或提交，禁止使用本工具，必须调用 web_agent_task。", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
                 {"type": "function", "function": {"name": "launch_app", "description": "按软件目录映射启动应用或打开软件目录。完整权限模式下也可使用可执行文件绝对路径", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "已配置的软件名称、程序路径或目录路径"}, "arguments": {"type": "array", "items": {"type": "string"}}}, "required": ["name"]}}},
             ]
         return tools
@@ -708,6 +738,11 @@ class HomeAgent:
         max_context = int(self.config["home"].get("max_context_messages", 30))
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
         self.log_event("user_message", message=text, history_messages=len(self.history))
+        recalled_memories = []
+        if self._is_memory_recall_request(text):
+            query_tags = self._memory_query_tags(text)
+            recalled_memories = self.long_term_memory.retrieve(query_tags, limit=8, user_id="owner")
+            self.log_event("long_term_memory_retrieved", query_tags=query_tags, matches=len(recalled_memories), route="deterministic")
         normalized_clear = str(text).replace(" ", "")
         if (any(word in normalized_clear for word in ("清理", "清空", "删除")) and "直播" in normalized_clear
                 and any(word in normalized_clear for word in ("上下文", "聊天记录", "对话记录", "近期对话"))):
@@ -725,11 +760,12 @@ class HomeAgent:
             not any(word in normalized for word in ("找", "搜", "播放", "点击", "登录", "发消息", "直播间", "视频", "听"))
         )
         if simple_bilibili_open:
+            explicit_url = next(iter(re.findall(r"https?://[^\s，。]+", str(text), re.I)), "https://www.bilibili.com/")
             if status: status("正在打开 Bilibili…")
-            await asyncio.to_thread(webbrowser.open, "https://www.bilibili.com/")
-            answer = "已经为你打开 Bilibili。"
+            await asyncio.to_thread(webbrowser.open, explicit_url)
+            answer = "已经为你打开指定的 Bilibili 页面。" if explicit_url != "https://www.bilibili.com/" else "已经为你打开 Bilibili。"
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
-            self.log_event("direct_browser_open", url="https://www.bilibili.com/")
+            self.log_event("direct_browser_open", url=explicit_url)
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, answer, status)
@@ -757,11 +793,12 @@ class HomeAgent:
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status)
             return answer
-        web_route = self._is_multistep_web_request(text)
+        web_route = self._is_multistep_web_request(text) or self._has_recent_web_context(text)
         vision_route = self._should_route_to_vision(text)
         if web_route or vision_route or self._should_route_to_codex(text):
             route = "web_agent" if web_route else ("vision_mcp" if vision_route else "codex_cli")
-            self.log_event("route_selected", route=route, reason="vision_priority" if vision_route else "trigger_mode_or_keyword")
+            reason = "multi_step_web" if web_route else ("vision_priority" if vision_route else "trigger_mode_or_keyword")
+            self.log_event("route_selected", route=route, reason=reason)
             preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui")) if (web_route or vision_route) else ""
             if web_route or vision_route:
                 async with aiohttp.ClientSession() as session:
@@ -790,7 +827,12 @@ class HomeAgent:
             return answer
         self.log_event("route_selected", route="llm_tool_loop")
         provider, key = self._provider(); llm_cfg = self.project["llm"]
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}, *self.history]
+        memory_context = ""
+        if recalled_memories:
+            memory_context = "\n\n【已从SQLite长期记忆检索到的事实】\n" + json.dumps(recalled_memories, ensure_ascii=False) + "\n回答相关问题时只依据这些事实，不要虚构。"
+        elif self._is_memory_recall_request(text):
+            memory_context = "\n\n【SQLite长期记忆检索结果为空】不要声称记得具体事实；如实说明没有找到。"
+        messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt() + memory_context}, *self.history]
         url = provider["base_url"].rstrip("/") + "/chat/completions"
         timeout = aiohttp.ClientTimeout(total=llm_cfg.get("timeout_seconds", 45))
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -935,6 +977,11 @@ class HomeAgent:
             if proc.returncode: return {"error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
             try: return json.loads(out.decode("utf-8").splitlines()[-1])
             except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}
+        if name in {"web_agent_task", "web_agent_operator", "web-agent-operator"}:
+            task = str(args.get("task", "")).strip()
+            if not task: return {"error": "网页任务内容为空"}
+            preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui"))
+            return await self._run_codex_task(task, require_mcp=True, preferred_mcp=preferred)
         if name == "list_directory":
             path = self._allowed_path(args.get("path"));
             if not path.is_dir(): return {"error": "目录不存在"}
@@ -1112,7 +1159,7 @@ class HomeAgent:
         if ignored and not always: return
         if len(message.strip()) < int(cfg.get("min_message_length", 4)) and not always: return
         threshold = int(cfg.get("importance_threshold", 70))
-        result = {"importance": 50, "should_remember": False, "category": "", "summary": "", "tags": [], "detail": message}
+        result = {"importance": 90 if always else 50, "should_remember": always, "category": "", "summary": "", "tags": [], "detail": message}
         if cfg.get("analyze_with_llm", True):
             prompt = (
                 "你是严格的私人长期记忆筛选器。只有身体状况、明显情绪波动、重大事件、稳定偏好习惯、重要关系或明确约定值得存储。"
@@ -1129,9 +1176,17 @@ class HomeAgent:
                     if response.status < 400:
                         content = json.loads(raw)["choices"][0]["message"].get("content", ""); match = re.search(r"\{.*\}", content, re.S)
                         if match: result.update(json.loads(match.group(0)))
-            except Exception: pass
+            except Exception as exc:
+                self.log_event("long_term_memory_classifier_error", error=str(exc), message=message)
+        if always and not result.get("category"):
+            category = "major_event" if "生日" in message else ("preference" if any(x in message for x in ("喜欢", "讨厌")) else "agreement")
+            subject = "生日" if "生日" in message else ("偏好" if category == "preference" else "约定")
+            result.update({"importance": 90, "should_remember": True, "category": category,
+                           "tags": ["主人", subject, "明确记忆"], "summary": message.strip()[:20], "detail": message})
+        result["category"] = {"identity": "relationship", "event": "major_event"}.get(str(result.get("category", "")), result.get("category", ""))
         score = max(0, min(100, int(result.get("importance", 0))))
         should = bool(result.get("should_remember")) and score >= threshold
+        self.log_event("long_term_memory_classifier_decision", should_remember=should, importance=score, category=result.get("category"), tags=result.get("tags") or [])
         if not should: return
         try:
             record = self.long_term_memory.store(

@@ -35,7 +35,7 @@ from transformers import AutoProcessor  # noqa: E402
 from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer  # noqa: E402
 from gui_actor.inference import inference  # noqa: E402
 from gui_actor.constants import grounding_system_message  # noqa: E402
-from playwright.sync_api import sync_playwright  # noqa: E402
+from playwright.sync_api import Error as PlaywrightError, sync_playwright  # noqa: E402
 
 # ---- 配置 ----
 VIEWPORT = {"width": 1280, "height": 800}
@@ -78,8 +78,10 @@ _USER_AGENT = (
 
 def ensure_browser():
     global _pw, _browser, _page
-    if _page is not None:
+    if (_page is not None and not _page.is_closed()
+            and _browser is not None and _browser.is_connected()):
         return _page
+    reset_browser()
     _pw = sync_playwright().start()
     _browser = _pw.chromium.launch(
         headless=HEADLESS,
@@ -102,12 +104,38 @@ def ensure_browser():
     return _page
 
 
+def reset_browser():
+    """Dispose a stale Playwright session without affecting the MCP server."""
+    global _pw, _browser, _page
+    try:
+        if _page is not None and not _page.is_closed(): _page.context.close()
+    except Exception:
+        pass
+    try:
+        if _browser is not None and _browser.is_connected(): _browser.close()
+    except Exception:
+        pass
+    try:
+        if _pw is not None: _pw.stop()
+    except Exception:
+        pass
+    _page = None; _browser = None; _pw = None
+
+
 # ---------------- 公开 API ----------------
 def navigate(url: str) -> str:
-    page = ensure_browser()
-    page.goto(url, wait_until="load", timeout=60000)
-    page.wait_for_timeout(1500)
-    return page.url
+    last_error = None
+    for attempt in range(2):
+        try:
+            page = ensure_browser()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1500)
+            return page.url
+        except PlaywrightError as exc:
+            last_error = exc
+            reset_browser()
+            if attempt == 0: continue
+    raise RuntimeError(f"browser navigation failed after session recovery: {last_error}")
 
 
 def screenshot_pil() -> Image.Image:

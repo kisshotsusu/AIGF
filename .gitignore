@@ -46,5 +46,11 @@ audio/*.mp3
 # ---- Local memory dumps ----
 workspace/memory/*.jsonl
 
+# ---- Local scheduled-task storage (user-private) ----
+task/
+
+# ---- Long-term memory storage (user-private) ----
+LongTermMemory/
+
 # ---- Downloaded model weights (large binaries) ----
 **/models/

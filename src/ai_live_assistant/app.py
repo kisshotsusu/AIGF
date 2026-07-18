@@ -17,6 +17,7 @@ from .config import secret_from_env
 from .llm import LLMClient
 from .tts import TTSClient
 from .workspace import Workspace
+from .long_term_memory import LongTermMemoryStore
 
 
 class LiveAssistant:
@@ -56,6 +57,8 @@ class LiveAssistant:
             self.llm = LLMClient(session, self.cfg["llm"])
             self.tts = TTSClient(session, self.cfg["tts"], self.root / "audio")
             self.workspace = Workspace(self.root, self.cfg["workspace"])
+            self.long_term_memory = LongTermMemoryStore(self.root / "LongTermMemory")
+            self.long_term_memory.migrate_legacy(self.workspace.root / self.workspace.cfg.get("memory_dir", "memory"))
             self.bili = bili
             self.log.info(
                 "正在连接 B站直播间 %s（dry_run=%s, send_danmaku=%s）",
@@ -250,6 +253,17 @@ class LiveAssistant:
             "source_username": user, "content": summary, "importance": score,
             "source": "auto-important", "original_message": message,
         })
+        allowed = {"preference", "relationship", "agreement"}
+        sqlite_category = category if category in allowed else "major_event"
+        tags = [memory_user, sqlite_category, "直播记忆"]
+        try:
+            self.long_term_memory.store(
+                tags=tags, summary=summary[:20], detail=message, category=sqlite_category,
+                importance=score, user_id=identity["id"], scene="live",
+                privacy="private" if identity["is_owner"] else "public", source="live-auto-classifier",
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            self.log.warning("SQLite长期记忆写入失败: %s", exc)
         self._record_message("memory", user, message, status="success", reason=f"importance:{score}", summary=summary)
 
     async def _emit(self, text: str) -> None:

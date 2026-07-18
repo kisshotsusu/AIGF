@@ -1,0 +1,19 @@
+enabled: true
+server_name: vision-gui
+auto_start: true
+preload_model: true
+gui_enabled: true
+host: 127.0.0.1
+port: 8765
+url: http://127.0.0.1:8765/mcp
+startup_timeout_seconds: 120
+direct_operation_timeout_seconds: 60
+trigger_keywords:
+- 操作电脑
+- 点击屏幕
+- 看一下屏幕
+- 看屏幕
+- 主屏幕
+- 桌面上
+- 找到按钮
+- 视觉操作

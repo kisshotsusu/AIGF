@@ -1,0 +1,8 @@
+enabled: true
+time: 03:00
+retry_minutes: 1
+cleanup_home_chatter: true
+summary_file: workspace/HOME_CONTEXT_SUMMARY.md
+cleanup_work_directory: true
+work_directory: work
+work_retention_days: 3

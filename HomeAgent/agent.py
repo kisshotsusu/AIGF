@@ -1379,6 +1379,42 @@ class HomeAgent:
         if following_day or target <= now: target += timedelta(days=1)
         return target
 
+    @staticmethod
+    def _cleanup_work_directory(cfg: dict[str, Any], now: datetime) -> dict[str, Any]:
+        """Delete only expired files inside the explicitly configured temporary work root."""
+        if not cfg.get("cleanup_work_directory", True):
+            return {"enabled": False, "scanned": 0, "removed": 0, "freed_bytes": 0}
+        configured = Path(str(cfg.get("work_directory", "work")))
+        work_root = configured if configured.is_absolute() else ROOT / configured
+        work_root = work_root.resolve()
+        allowed_root = (ROOT / "work").resolve()
+        # Never let a configuration typo broaden deletion beyond the dedicated work tree.
+        if work_root != allowed_root and allowed_root not in work_root.parents:
+            raise ValueError(f"拒绝清理非 work 工作区：{work_root}")
+        keep_days = max(1, int(cfg.get("work_retention_days", 3)))
+        cutoff = now.timestamp() - keep_days * 86400
+        scanned = removed = freed = skipped = 0
+        if not work_root.exists():
+            return {"enabled": True, "path": str(work_root), "retention_days": keep_days, "scanned": 0, "removed": 0, "freed_bytes": 0}
+        directories: list[Path] = []
+        for base, names, files in os.walk(work_root, topdown=True, followlinks=False):
+            base_path = Path(base)
+            names[:] = [name for name in names if not (base_path / name).is_symlink()]
+            directories.extend(base_path / name for name in names)
+            for name in files:
+                path = base_path / name; scanned += 1
+                try:
+                    if path.is_symlink() or path.name == ".gitkeep" or path.stat().st_mtime >= cutoff:
+                        skipped += 1; continue
+                    size = path.stat().st_size
+                    path.unlink(); removed += 1; freed += size
+                except (FileNotFoundError, PermissionError, OSError):
+                    skipped += 1
+        for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+            try: directory.rmdir()
+            except OSError: pass
+        return {"enabled": True, "path": str(work_root), "retention_days": keep_days, "scanned": scanned, "removed": removed, "skipped": skipped, "freed_bytes": freed}
+
     async def run_context_maintenance(self) -> dict[str, Any] | None:
         """每日压缩家庭上下文；错过或失败时保持到期状态并每分钟重试。"""
         cfg = self.config.get("context_maintenance", {})
@@ -1396,6 +1432,12 @@ class HomeAgent:
         state.update({"status": "running", "last_attempt_at": now.isoformat(timespec="seconds")})
         self._write_maintenance_state(state)
         snapshot = list(self.history)
+        try:
+            work_cleanup = await asyncio.to_thread(self._cleanup_work_directory, cfg, now)
+            self.log_event("work_directory_cleanup_completed", result=work_cleanup)
+        except Exception as exc:
+            work_cleanup = {"ok": False, "error": str(exc)}
+            self.log_event("work_directory_cleanup_failed", result=work_cleanup)
         try:
             summary_path = ROOT / cfg.get("summary_file", "workspace/HOME_CONTEXT_SUMMARY.md")
             previous = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
@@ -1421,7 +1463,7 @@ class HomeAgent:
             if self.history[:len(snapshot)] == snapshot: self.history = self.history[len(snapshot):]
             state.update({"status": "pending", "last_success_at": now.isoformat(timespec="seconds"), "last_error": None, "next_run_at": self._next_maintenance_time(now, following_day=True).isoformat(timespec="seconds")})
             self._write_maintenance_state(state)
-            result = {"ok": True, "compressed_messages": len(snapshot), "remaining_messages": len(self.history), "memory_cleanup": cleanup, "next_run_at": state["next_run_at"]}
+            result = {"ok": True, "compressed_messages": len(snapshot), "remaining_messages": len(self.history), "memory_cleanup": cleanup, "work_cleanup": work_cleanup, "next_run_at": state["next_run_at"]}
             self.log_event("context_maintenance_completed", result=result)
             return result
         except Exception as exc:

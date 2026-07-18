@@ -1,0 +1,9 @@
+enabled: true
+full_access: true
+confirm_before_action: false
+confirm_launch_app: false
+allowed_roots: []
+applications:
+  记事本: C:\Windows\System32\notepad.exe
+  计算器: C:\Windows\System32\calc.exe
+  文件管理器: C:\Windows\explorer.exe

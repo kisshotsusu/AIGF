@@ -1,0 +1,3 @@
+live_enabled: true
+live_max_age_minutes: 120
+check_interval_seconds: 60

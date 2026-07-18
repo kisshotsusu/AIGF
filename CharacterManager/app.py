@@ -938,4 +938,11 @@ class CharacterManager:
     def run(self): self.root.mainloop()
 
 
-if __name__ == "__main__": CharacterManager().run()
+if __name__ == "__main__":
+    # Qt is now the default presentation layer.  Keep the proven Tk frontend as
+    # an explicit fallback while both UIs share the same persistent data.
+    if "--legacy-tk" in sys.argv:
+        CharacterManager().run()
+    else:
+        from qt_app import run as run_qt
+        raise SystemExit(run_qt())

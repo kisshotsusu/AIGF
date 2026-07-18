@@ -30,11 +30,43 @@ def score(label: str, query: str) -> int:
     return sum(3 if token in label else 0 for token in tokens) + (2 if all(token in label for token in tokens) else 0)
 
 
-async def run(url: str, site: str, query: str, action: str):
+async def run(url: str, site: str, query: str, action: str, mode: str = "search", index: int = 1):
     async with streamablehttp_client(url) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             if site != "bilibili": raise RuntimeError(f"unsupported site: {site}")
+            if mode == "favorites":
+                emit("stage", state="NAVIGATED", detail="opening signed-in Bilibili home")
+                await call(session, "navigate", {"url": "https://www.bilibili.com/"})
+                opened = ast.literal_eval(await call(session, "web_click_text", {"text": "收藏", "exact": False}))
+                if not opened.get("clicked"): raise RuntimeError("没有找到收藏入口，请确认当前浏览器已登录 Bilibili")
+                await call(session, "wait", {"ms": 1500})
+                current_url = await call(session, "get_url")
+                page = ast.literal_eval(await call(session, "web_read", {"max_chars": 18000}))
+                if "favlist" not in current_url:
+                    favorite_links = [(str(link.get("text", "")), str(link.get("href", ""))) for link in page.get("links", []) if "favlist" in str(link.get("href", ""))]
+                    if not favorite_links: raise RuntimeError("收藏入口没有进入收藏夹页面，请确认登录状态")
+                    preferred = next((item for item in favorite_links if "默认收藏夹" in item[0] or "默认" in item[0]), favorite_links[0])
+                    await call(session, "navigate", {"url": preferred[1]})
+                    page = ast.literal_eval(await call(session, "web_read", {"max_chars": 24000}))
+                default_link = next((str(link.get("href", "")) for link in page.get("links", []) if "默认收藏夹" in str(link.get("text", "")) and "favlist" in str(link.get("href", ""))), "")
+                if default_link:
+                    await call(session, "navigate", {"url": default_link}); page = ast.literal_eval(await call(session, "web_read", {"max_chars": 24000}))
+                videos, seen = [], set()
+                for link in page.get("links", []):
+                    href, label = str(link.get("href", "")), str(link.get("text", "")).strip()
+                    if "bilibili.com/video/" in href:
+                        canonical = href.split("?")[0]
+                        if canonical not in seen: seen.add(canonical); videos.append((label, href))
+                if len(videos) < index: raise RuntimeError(f"默认收藏夹只读取到 {len(videos)} 个视频，无法打开第 {index} 个")
+                label, href = videos[index - 1]; emit("result_selected", title=label, url=href, index=index)
+                await call(session, "navigate", {"url": href})
+                verified_url = await call(session, "get_url")
+                if "/video/" not in verified_url: raise RuntimeError("收藏视频页面导航未验证成功")
+                final = ast.literal_eval(await call(session, "web_read", {"max_chars": 3000}))
+                emit("stage", state="FINAL_VERIFIED", title=final.get("title") or label, url=verified_url)
+                emit("completed", title=final.get("title") or label, url=verified_url, played=False, index=index)
+                return
             emit("stage", state="NAVIGATED", detail="opening search results directly")
             await call(session, "navigate", {"url": f"https://search.bilibili.com/all?keyword={quote(query)}"})
             search_url = await call(session, "get_url")
@@ -73,14 +105,19 @@ async def run(url: str, site: str, query: str, action: str):
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--site", required=True)
-    parser.add_argument("--query", required=True)
+    parser.add_argument("--query", default="")
+    parser.add_argument("--mode", default="search", choices=("search", "favorites"))
+    parser.add_argument("--index", type=int, default=1)
     parser.add_argument("--action", default="open", choices=("open", "play"))
     parser.add_argument("--url", default="http://127.0.0.1:8765/mcp")
     parser.add_argument("--timeout", type=int, default=60)
     args = parser.parse_args()
-    try: await asyncio.wait_for(run(args.url, args.site, args.query, args.action), timeout=args.timeout)
+    try: await asyncio.wait_for(run(args.url, args.site, args.query, args.action, args.mode, max(1, args.index)), timeout=args.timeout)
     except Exception as exc:
-        emit("failed", error=str(exc)); raise SystemExit(1)
+        def details(error):
+            nested = getattr(error, "exceptions", None)
+            return " | ".join(details(item) for item in nested) if nested else f"{type(error).__name__}: {error}"
+        emit("failed", error=details(exc)); raise SystemExit(1)
 
 
 if __name__ == "__main__": asyncio.run(main())

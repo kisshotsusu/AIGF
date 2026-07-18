@@ -193,6 +193,18 @@ def desktop_type_text(instruction: str, text: str) -> str:
 
 
 @mcp.tool()
+def desktop_type_active_text(text: str, clear: bool = True) -> str:
+    """向当前已聚焦的原生输入控件粘贴文本；适合 Ctrl+L 后输入网址。"""
+    return str(agent.desktop_type_active_text(text, clear))
+
+
+@mcp.tool()
+def desktop_read_clipboard() -> str:
+    """读取用户刚刚明确复制到 Windows 剪贴板中的文本。"""
+    return str(agent.desktop_read_clipboard())
+
+
+@mcp.tool()
 def desktop_scroll(direction: str = "down", amount: int = 600) -> str:
     """滚动当前 Windows 桌面活动窗口。"""
     return str(agent.desktop_scroll(direction, amount))

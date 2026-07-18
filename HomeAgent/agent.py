@@ -219,6 +219,85 @@ class HomeAgent:
         return any(str(word).strip().lower() in lowered for word in cfg.get("trigger_keywords", []) if str(word).strip())
 
     @staticmethod
+    def _analyze_task(text: str, context: str = "") -> dict[str, Any]:
+        """Build a small, deterministic execution contract before selecting a route."""
+        value = str(text).strip(); lowered = value.lower(); context_value = str(context); context_lower = context_value.lower()
+        implicit_bilibili_favorite = "收藏夹" in value and "视频" in value
+        explicit_bilibili = any(word in lowered for word in ("bilibili", "哔哩哔哩", "b站"))
+        continuation = any(word in value for word in ("收藏夹", "第", "这个", "那个", "上一个", "下一个", "换成", "播放", "打开", "点击"))
+        inherited_bilibili = not explicit_bilibili and continuation and any(word in context_lower for word in ("bilibili", "哔哩哔哩", "b站", "收藏夹"))
+        is_bilibili = explicit_bilibili or implicit_bilibili_favorite or inherited_bilibili
+        is_cloudmusic = any(word in lowered for word in ("网易云", "cloudmusic"))
+        is_web = is_bilibili or any(word in lowered for word in (
+            "网页", "网站", "浏览器", "http://", "https://", "百度", "淘宝", "天猫", "京东", "知乎", "微博", "github",
+        ))
+        context_favorite = inherited_bilibili and "收藏夹" in context_value and any(word in value for word in ("第", "这个", "那个", "上一个", "下一个", "换成", "视频"))
+        favorite = is_bilibili and ("收藏夹" in value or context_favorite or ("收藏" in value and any(word in value for word in ("我的", "默认", "第"))))
+        folder_name = ""
+        if favorite:
+            compact = value.replace(" ", "")
+            matches = list(re.finditer(r"(?:打开)?(?:我的)?(?:(?:bilibili|哔哩哔哩|B站)的?)?([^\n：:]{1,30}?)收藏夹", compact, re.I))
+            if not matches and context_favorite:
+                compact_context = context_value.replace(" ", "")
+                matches = list(re.finditer(r"(?:打开)?(?:我的)?(?:(?:bilibili|哔哩哔哩|B站)的?)?([^\n：:]{1,30}?)收藏夹", compact_context, re.I))
+            folder_match = matches[-1] if matches else None
+            folder_name = str(folder_match.group(1) if folder_match else "默认").strip() or "默认"
+            if folder_name in {"默认", "我的默认"}: folder_name = "默认收藏夹"
+        action_words = [word for word in ("打开", "换成", "搜索", "查找", "找", "点击", "选择", "播放", "填写", "提交", "登录", "下载") if word in value]
+        query = HomeAgent._visual_search_query(value) if (is_bilibili or is_cloudmusic) else ""
+        if inherited_bilibili and query in {"这个", "那个", "它", "这一个", "那一个"}:
+            inherited_query = HomeAgent._visual_search_query(context_value.splitlines()[-1] if context_value.splitlines() else context_value)
+            if inherited_query: query = inherited_query
+        if not query and is_web:
+            generic_query = re.search(r"(?:搜索|搜一下|搜|查找|找一下|找)\s*[《\"“]?(.+?)[》\"”]?(?:然后|并且|并|再|选择|点击|打开|播放|$)", value, re.I)
+            if generic_query:
+                query = generic_query.group(1).strip(" ，,。.!！?？")[:80]
+        number_map = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        ordinal = re.search(r"第\s*(\d+|[一二两三四五六七八九十])\s*个", value)
+        index = int(ordinal.group(1)) if ordinal and ordinal.group(1).isdigit() else number_map.get(ordinal.group(1), 1) if ordinal else None
+        handler = None
+        if favorite: handler = "bilibili_favorites"
+        elif is_bilibili and query: handler = "bilibili_search"
+        elif is_cloudmusic and query: handler = "cloudmusic_search"
+        steps = []
+        if is_web: steps.append("打开或接管目标网站，并确认登录态/页面地址")
+        if favorite: steps.append(f"进入“{folder_name}”")
+        if query: steps.append(f"搜索或定位：{query}")
+        if index: steps.append(f"按页面实际顺序选择第 {index} 项")
+        if any(word in value for word in ("点击", "打开", "选择", "播放")): steps.append("执行目标点击或打开动作")
+        if "播放" in value: steps.append("确认媒体已经开始播放")
+        if action_words: steps.append("读取最终页面/窗口状态并验证用户目标")
+        return {
+            "goal": value, "domain": "web" if is_web else ("desktop" if action_words else "conversation"),
+            "actionable": bool(action_words), "multi_step": len(steps) >= 2, "requires_mcp": bool(is_web and action_words),
+            "site": "bilibili" if is_bilibili else ("cloudmusic" if is_cloudmusic else ""),
+            "handler": handler, "query": query, "index": index, "favorite_folder": folder_name, "steps": steps,
+            "browser_policy": "existing_profile_only" if favorite else ("prefer_existing" if is_web else "not_applicable"),
+            "context_inherited": inherited_bilibili,
+            "context_evidence": "recent_bilibili_or_favorite_task" if inherited_bilibili else "",
+            "success_criteria": steps[-1] if steps else "给出准确、直接的回答",
+        }
+
+    @staticmethod
+    def _normalize_tool_result(name: str, result: Any) -> Any:
+        """Give the model explicit success/failure semantics instead of ambiguous raw output."""
+        if isinstance(result, dict):
+            normalized = dict(result)
+            if normalized.get("error"):
+                normalized.setdefault("status", "failed")
+                normalized.setdefault("next_action", "检查错误原因，换一种可用工具或路径继续；未经终态验证不得报告成功")
+            elif normalized.get("cancelled"):
+                normalized.setdefault("status", "cancelled")
+                normalized.setdefault("next_action", "尊重用户取消，不再执行该操作")
+            else:
+                normalized.setdefault("status", "success")
+                normalized.setdefault("evidence", {key: normalized[key] for key in ("url", "path", "title", "opened", "played") if key in normalized})
+            normalized.setdefault("tool", name)
+            return normalized
+        if isinstance(result, list): return {"status": "success", "tool": name, "count": len(result), "items": result}
+        return {"status": "success", "tool": name, "result": result}
+
+    @staticmethod
     def _is_multistep_web_request(text: str) -> bool:
         """Recognize outcome-oriented web requests that must not degrade to open_url."""
         value = str(text).lower()
@@ -438,9 +517,12 @@ class HomeAgent:
         url = str(self.config.get("vision_mcp", {}).get("url", "http://127.0.0.1:8765/mcp"))
         python = ROOT / ".venv" / "Scripts" / "python.exe"
         helper = ROOT / "Vision" / "mcp_call.py"
+        client_env = os.environ.copy()
+        client_env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
         proc = await asyncio.create_subprocess_exec(str(python), str(helper), url, tool_name,
             json.dumps(arguments or {}, ensure_ascii=False), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            stderr=asyncio.subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            env=client_env)
         with self.active_process_lock: self.active_process = proc
         try:
             out, err = await proc.communicate()
@@ -520,22 +602,32 @@ class HomeAgent:
             self.log_event("direct_vision_failed", query=query, error=str(exc))
             return {"error": str(exc)}
 
-    async def _run_direct_web_media(self, text: str, status=None) -> dict[str, Any] | None:
+    async def _run_direct_web_media(self, text: str, status=None, task_plan: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Operate Bilibili through DOM/text only; never loads the GUI vision model."""
-        lowered = text.lower()
-        if not any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站")): return None
+        lowered = text.lower(); plan = task_plan or self._analyze_task(text)
+        implicit_favorite = plan.get("handler") == "bilibili_favorites"
+        if not any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站")) and not implicit_favorite: return None
+        favorite_mode = plan.get("handler") == "bilibili_favorites"
         query = self._visual_search_query(text)
-        if not query: return {"error": "没有识别出要搜索的内容"}
+        if not query and not favorite_mode: return {"error": "没有识别出要搜索的内容"}
+        if favorite_mode:
+            ordinal = re.search(r"第\s*(\d+|[一二两三四五六七八九十])\s*个", text)
+            number_map = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            index = int(ordinal.group(1)) if ordinal and ordinal.group(1).isdigit() else number_map.get(ordinal.group(1), 1) if ordinal else 1
+            return await self._run_existing_browser_favorites(index, status, str(plan.get("favorite_folder") or "默认收藏夹"))
         if not await asyncio.to_thread(self.ensure_vision_service, True): return {"error": "网页工具服务未就绪"}
         self.log_event("direct_web_started", target="bilibili", query=query)
         try:
             if status: status("网页 Agent 正在分步搜索、选择并验证…")
             python = ROOT / ".venv" / "Scripts" / "python.exe"
             script = ROOT / "Skill" / "web-agent-operator" / "scripts" / "web_agent.py"
-            timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
+            timeout = max(45 if favorite_mode else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
             action = "play" if any(word in text for word in ("播放", "听", "播一下")) else "open"
+            number_map = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            ordinal = re.search(r"第\s*(\d+|[一二两三四五六七八九十])\s*个", text)
+            index = int(ordinal.group(1)) if ordinal and ordinal.group(1).isdigit() else number_map.get(ordinal.group(1), 1) if ordinal else 1
             proc = await asyncio.create_subprocess_exec(str(python), str(script), "--site", "bilibili", "--query", query,
-                "--action", action, "--timeout", str(timeout), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                "--mode", "favorites" if favorite_mode else "search", "--index", str(index), "--action", action, "--timeout", str(timeout), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             with self.active_process_lock: self.active_process = proc
             try: out, err = await proc.communicate()
@@ -546,7 +638,8 @@ class HomeAgent:
             for line in out.decode("utf-8", "replace").splitlines():
                 try: events.append(json.loads(line))
                 except json.JSONDecodeError: continue
-            for event in events: self.log_event("web_agent_step", **event)
+            for event in events:
+                self.log_event("web_agent_step", step_event=event.get("event"), **{key: value for key, value in event.items() if key != "event"})
             completed = next((event for event in reversed(events) if event.get("event") == "completed"), None)
             failed = next((event for event in reversed(events) if event.get("event") == "failed"), None)
             if proc.returncode or not completed: return {"error": (failed or {}).get("error") or err.decode("utf-8", "replace")[-500:] or "网页 Agent 未验证完成状态"}
@@ -556,6 +649,129 @@ class HomeAgent:
         except Exception as exc:
             self.log_event("direct_web_failed", query=query, error=str(exc))
             return {"error": str(exc)}
+
+    async def _run_existing_browser_favorites(self, index: int, status=None, folder_name: str = "默认收藏夹") -> dict[str, Any]:
+        """Use an already-open normal browser profile; never launch Playwright Chromium."""
+        if not await asyncio.to_thread(self.ensure_vision_service, True): return {"error": "视觉服务未就绪"}
+        allowed = {"msedge.exe", "chrome.exe", "firefox.exe", "brave.exe", "opera.exe"}
+
+        async def windows():
+            raw = await self._vision_mcp_call("list_windows", {})
+            try: values = ast.literal_eval(raw)
+            except (ValueError, SyntaxError): values = []
+            return [item for item in values if str(item.get("process_name", "")).lower() in allowed and "ms-playwright" not in str(item.get("process_path", "")).lower()]
+
+        candidates = await windows()
+        if not candidates:
+            if status: status("没有打开的浏览器，正在使用系统默认浏览器…")
+            await asyncio.to_thread(webbrowser.open, "https://www.bilibili.com/")
+            await asyncio.sleep(4); candidates = await windows()
+        if not candidates: return {"error": "没有检测到现有浏览器窗口；未启动内部 Chromium"}
+        browser = next((item for item in candidates if any(word in str(item.get("title", "")).lower() for word in ("bilibili", "哔哩哔哩"))), candidates[0])
+        pid = int(browser.get("pid", 0)); title = str(browser.get("title", ""))
+
+        async def current_title():
+            current = await windows()
+            match = next((item for item in current if int(item.get("pid", 0)) == pid), None)
+            return str((match or browser).get("title", title))
+
+        async def current_address():
+            active_title = await current_title()
+            await self._vision_mcp_call("activate_window", {"title_contains": active_title})
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "c"]})
+            copied = ast.literal_eval(await self._vision_mcp_call("desktop_read_clipboard", {}))
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["esc"]})
+            return str(copied.get("text", "")).strip()
+
+        if status: status("正在读取现有浏览器中的 Bilibili 登录会话…")
+        await self._vision_mcp_call("activate_window", {"title_contains": title})
+        profile_path = HOME_AGENT / "state" / "browser-profiles.json"
+        try: profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {}
+        except (OSError, json.JSONDecodeError): profile = {}
+        stored_mid = str(profile.get("bilibili_mid", "")).strip()
+        address = await current_address(); uid_match = re.search(r"space\.bilibili\.com/(\d+)", address)
+        if not uid_match and stored_mid.isdigit(): uid_match = re.match(r"(\d+)", stored_mid)
+        if not uid_match:
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
+            await self._vision_mcp_call("desktop_type_active_text", {"text": "https://www.bilibili.com/", "clear": True})
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]}); await asyncio.sleep(4)
+            title = await current_title()
+            if status: status("正在从已登录首页进入个人空间…")
+            avatar = ast.literal_eval(await asyncio.wait_for(self._vision_mcp_call("window_click", {"title_contains": title, "instruction": "Bilibili页面顶部已登录用户的头像或个人中心入口"}), timeout=90))
+            if not avatar.get("clicked"): return {"error": "无法从现有浏览器读取当前 Bilibili 用户空间"}
+            await asyncio.sleep(3); address = await current_address(); uid_match = re.search(r"space\.bilibili\.com/(\d+)", address)
+        if not uid_match: return {"error": "现有浏览器虽然打开了 Bilibili，但无法确认当前账户的用户空间地址"}
+        mid = uid_match.group(1)
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile.update({"bilibili_mid": int(mid), "updated_at": datetime.now().isoformat(timespec="seconds")})
+        temporary = profile_path.with_suffix(".json.tmp"); temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(profile_path)
+        if status: status(f"正在读取“{folder_name}”的准确数据顺序…")
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://space.bilibili.com/{mid}/favlist"}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
+                async with session.get(f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={mid}") as response:
+                    folders = await response.json(content_type=None)
+                folder_list = ((folders.get("data") or {}).get("list") or []) if folders.get("code") == 0 else []
+                default_folder = next((item for item in folder_list if str(item.get("title", "")).strip().lower() == folder_name.strip().lower()), None)
+                if not default_folder: raise RuntimeError(f"Bilibili 接口没有返回名为“{folder_name}”的收藏夹")
+                page_number = (index - 1) // 20 + 1; page_index = (index - 1) % 20
+                media_id = int(default_folder["id"])
+                resource_url = f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={media_id}&pn={page_number}&ps=20&keyword=&order=mtime&type=0&tid=0&platform=web"
+                async with session.get(resource_url) as response:
+                    resources = await response.json(content_type=None)
+                medias = ((resources.get("data") or {}).get("medias") or []) if resources.get("code") == 0 else []
+                if page_index >= len(medias): raise RuntimeError(f"“{folder_name}”没有第 {index} 个视频")
+                media = medias[page_index]; bvid = str(media.get("bvid", "")).strip(); video_title = str(media.get("title", "")).strip()
+                if not re.fullmatch(r"BV[0-9A-Za-z]+", bvid): raise RuntimeError("收藏条目缺少有效 BV 号")
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
+            return {"error": f"读取默认收藏夹数据失败：{exc}"}
+        video_url = f"https://www.bilibili.com/video/{bvid}/?spm_id_from=333.1387.favlist.content.click"
+        existing_title = await current_title(); existing_address = await current_address()
+        if bvid.lower() in existing_address.lower() and video_title[:10].lower() in existing_title.lower():
+            result = {"ok": True, "answer": f"“{folder_name}”第 {index} 个视频已经在当前浏览器中打开：{video_title}。", "browser_pid": pid, "browser_process": browser.get("process_name"), "title": existing_title, "url": existing_address, "bvid": bvid, "favorite_folder": folder_name, "favorite_index": index, "order": "mtime", "used_existing_browser": True, "already_open": True}
+            self.log_event("existing_browser_favorite_completed", result=result); return result
+        if status: status(f"正在现有浏览器中打开“{folder_name}”第 {index} 个视频…")
+        previous_title = await current_title()
+        await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
+        await self._vision_mcp_call("desktop_type_active_text", {"text": video_url, "clear": True})
+        await asyncio.sleep(0.4); await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]})
+
+        async def verify_loaded(seconds: int):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                active_title = await current_title()
+                title_changed = active_title != previous_title
+                title_matches = video_title[:10].lower() in active_title.lower() if len(video_title) >= 4 else title_changed
+                if title_changed and title_matches:
+                    active_address = await current_address()
+                    if bvid.lower() in active_address.lower(): return active_title, active_address
+                await asyncio.sleep(1)
+            return "", ""
+
+        final_title, final_address = await verify_loaded(12)
+        if not final_address:
+            # Some browsers leave a pasted URL pending in the address bar. Re-focus
+            # and commit once more before using a new tab in the same normal browser.
+            self.log_event("existing_browser_navigation_retry", bvid=bvid, strategy="commit_address_again")
+            await self._vision_mcp_call("activate_window", {"title_contains": await current_title()})
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
+            await self._vision_mcp_call("desktop_type_active_text", {"text": video_url, "clear": True})
+            await asyncio.sleep(0.5); await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]})
+            final_title, final_address = await verify_loaded(12)
+        if not final_address:
+            process_path = str(browser.get("process_path", ""))
+            if not process_path or not Path(process_path).is_file(): return {"error": f"地址栏导航未生效，且无法找到现有浏览器程序：{process_path}"}
+            self.log_event("existing_browser_navigation_retry", bvid=bvid, strategy="existing_browser_new_tab", process=process_path)
+            switch = "-new-tab" if str(browser.get("process_name")) == "firefox.exe" else "--new-tab"
+            subprocess.Popen([process_path, switch, video_url], creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            final_title, final_address = await verify_loaded(15)
+        if not final_address:
+            observed_title = await current_title(); observed_address = await current_address()
+            return {"error": f"浏览器没有真正切换到“{folder_name}”第 {index} 个视频。目标 {bvid}；当前标题：{observed_title}；当前地址：{observed_address}"}
+        result = {"ok": True, "answer": f"已经用你现有的浏览器账户打开“{folder_name}”第 {index} 个视频：{video_title}。", "browser_pid": pid, "browser_process": browser.get("process_name"), "title": final_title, "url": final_address, "bvid": bvid, "favorite_folder": folder_name, "favorite_index": index, "order": "mtime", "used_existing_browser": True}
+        self.log_event("existing_browser_favorite_completed", result=result)
+        return result
 
     async def _natural_visual_failure(self, request: str, reason: str) -> str:
         """Generate only failure wording through the character LLM; keep it short for TTS."""
@@ -596,7 +812,7 @@ class HomeAgent:
         self.log_event("live_context_clear_requested", token=token)
         return payload
 
-    async def _run_codex_task(self, task: str, require_mcp: bool = False, status=None, preferred_mcp: str = "") -> dict[str, Any]:
+    async def _run_codex_task(self, task: str, require_mcp: bool = False, status=None, preferred_mcp: str = "", task_plan: dict[str, Any] | None = None, previous_failure: str = "") -> dict[str, Any]:
         if self.cancel_event.is_set():
             raise asyncio.CancelledError
         cfg = self._codex_config()
@@ -610,9 +826,18 @@ class HomeAgent:
         if not working_directory.is_dir():
             return {"error": f"Codex 工作目录不存在：{working_directory}"}
         gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", False))
+        plan = task_plan or self._analyze_task(task)
         prompt = (
             "你是家庭 AI 助手的执行代理。请使用可用的 CLI、文件和 MCP 工具完成任务，"
-            "最后用简洁中文给出适合语音朗读的结果。不要输出密钥。\n\n"
+            "最后用简洁中文给出适合语音朗读的结果。不要输出密钥。\n"
+            "执行规则：先观察再操作；逐项完成清单；每次操作后读取新状态；失败时诊断原因并切换 DOM、视觉、直接网址或其他可用路径；"
+            "只有成功条件有可观察证据时才能报告成功。不得把‘已打开首页’当作多步骤任务完成。\n\n"
+            f"结构化任务合同：\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n"
+            + ("浏览器策略是 existing_profile_only：必须先用 list_windows 查找普通 Edge/Chrome/Firefox/Brave，"
+               "只通过 activate_window、window_screenshot、window_click、desktop_hotkey、desktop_type_active_text 操作现有登录会话。"
+               "禁止调用 navigate 或任何会启动 Playwright/内部 Chromium 的网页工具。若没有现有浏览器，只能使用系统默认浏览器，不得强制 Chromium。\n\n"
+               if plan.get("browser_policy") == "existing_profile_only" else "")
+            + (f"上一条确定性路径失败：{previous_failure}\n必须避免重复同一失败动作，改用不同策略继续。\n\n" if previous_failure else "")
             + ("本任务必须优先使用合适的 MCP 工具；若没有可用 MCP，请明确说明。\n\n" if require_mcp else "")
             + (f"本任务必须首先使用 `{preferred_mcp}` MCP。"
                + ("这是网页任务且图像 GUI 已关闭：必须遵循 E:\\Doc\\AI直播\\Skill\\web-agent-operator\\SKILL.md，"
@@ -636,7 +861,7 @@ class HomeAgent:
         command.append(prompt)
         if status:
             status("Codex CLI 正在执行…")
-        self.log_event("codex_task_started", task=task, require_mcp=require_mcp, working_directory=working_directory)
+        self.log_event("codex_task_started", task=task, require_mcp=require_mcp, working_directory=working_directory, task_plan=plan, previous_failure=previous_failure)
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         env = self._codex_environment(codex_command)
         proc = await asyncio.create_subprocess_exec(
@@ -806,6 +1031,9 @@ class HomeAgent:
         max_context = int(self.config["home"].get("max_context_messages", 30))
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
         self.log_event("user_message", message=text, history_messages=len(self.history))
+        recent_task_context = "\n".join(str(item.get("content", "")) for item in self.history[:-1][-6:] if item.get("role") == "user")
+        task_plan = self._analyze_task(text, recent_task_context)
+        self.log_event("task_plan_created", task_plan=task_plan)
         recalled_memories = []
         if self._is_memory_recall_request(text):
             query_tags = self._memory_query_tags(text)
@@ -838,19 +1066,20 @@ class HomeAgent:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, answer, status)
             return answer
-        if self._is_direct_visual_media_request(text):
-            visual_query = self._visual_search_query(text)
-            visual_target = "B站" if any(x in text.lower() for x in ("bilibili", "哔哩哔哩", "b站")) else "网易云"
+        if task_plan.get("handler"):
+            visual_query = str(task_plan.get("query") or "")
+            visual_target = "B站" if task_plan.get("site") == "bilibili" else "网易云"
             gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", True))
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, f"好呀，我去{visual_target}帮你找找{visual_query or '想要的内容'}。", status)
-            operation_timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
+            is_favorite_request = "收藏夹" in text or ("收藏" in text and any(word in text for word in ("第", "默认", "我的")))
+            operation_timeout = max(60 if is_favorite_request else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
             try:
-                is_bilibili = any(x in text.lower() for x in ("bilibili", "哔哩哔哩", "b站"))
+                is_bilibili = task_plan.get("site") == "bilibili"
                 # Bilibili has deterministic DOM verification and must not be
                 # downgraded to a single visual click merely because GUI is on.
-                operation = self._run_direct_web_media(text, status) if is_bilibili or not gui_enabled else self._run_direct_visual_media(text, status)
+                operation = self._run_direct_web_media(text, status, task_plan) if is_bilibili or not gui_enabled else self._run_direct_visual_media(text, status)
                 direct_visual = await asyncio.wait_for(operation, timeout=operation_timeout)
             except asyncio.TimeoutError:
                 self.stop_current_task()
@@ -858,6 +1087,19 @@ class HomeAgent:
                 self.log_event("direct_vision_total_timeout", limit_seconds=operation_timeout)
             if direct_visual is None:
                 direct_visual = {"error": "图像 GUI 识别已禁用，而且该目标不是可直接读取的网页"}
+            if direct_visual.get("error") and self._codex_config().get("enabled", False):
+                previous_failure = str(direct_visual["error"])
+                self.log_event("deterministic_route_fallback", handler=task_plan.get("handler"), error=previous_failure)
+                if status: status("固定流程未完成，正在切换通用 Agent 继续处理…")
+                preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui"))
+                try:
+                    fallback_timeout = max(120, int(self.config.get("vision_mcp", {}).get("task_timeout_seconds", 150)))
+                    direct_visual = await asyncio.wait_for(
+                        self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred, task_plan=task_plan, previous_failure=previous_failure),
+                        timeout=fallback_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    self.stop_current_task(); direct_visual = {"error": f"固定流程失败后，通用 Agent 在 {fallback_timeout} 秒内也未完成"}
             answer = (await self._natural_visual_failure(text, str(direct_visual["error"])) if direct_visual.get("error")
                       else str(direct_visual.get("answer", "好啦，已经帮你操作完成了。")))
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
@@ -876,11 +1118,11 @@ class HomeAgent:
                     if self.config["home"].get("auto_speak", True): await self._speak_home(session, "好呀，我来看一下屏幕，很快就好。", status)
                 operation_timeout = max(90 if web_route else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
                 try:
-                    result = await asyncio.wait_for(self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred), timeout=operation_timeout)
+                    result = await asyncio.wait_for(self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred, task_plan=task_plan), timeout=operation_timeout)
                 except asyncio.TimeoutError:
                     self.stop_current_task(); result = {"error": f"超过{operation_timeout}秒仍未执行成功，操作已超时停止"}
             else:
-                result = await self._run_codex_task(text, require_mcp=False, status=status, preferred_mcp="")
+                result = await self._run_codex_task(text, require_mcp=False, status=status, preferred_mcp="", task_plan=task_plan)
             if result.get("error"):
                 answer = (await self._natural_visual_failure(text, str(result["error"])) if vision_route
                           else f"Codex CLI 执行失败：{result['error']}")
@@ -910,7 +1152,7 @@ class HomeAgent:
             singing_performed = False
             created_task_result = None
             long_term_stored = False
-            for _ in range(int(self.config["agent"].get("max_tool_rounds", 5))):
+            for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
                 payload = {"model": provider["model"], "messages": messages, "tools": self._tools(), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7)), "max_tokens": int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600)))}
@@ -922,6 +1164,10 @@ class HomeAgent:
                 calls = choice.get("tool_calls") or []
                 if not calls:
                     answer = (choice.get("content") or "").strip()
+                    if task_plan.get("actionable") and round_index == 0:
+                        self.log_event("premature_answer_rejected", answer=answer, task_plan=task_plan)
+                        messages.append({"role": "system", "content": "这是需要实际执行的操作任务，但你尚未调用任何工具。不要只描述步骤或声称完成；立即选择合适工具执行，并在获得终态证据后回答。"})
+                        continue
                     if created_task_result:
                         task = created_task_result["task"]
                         # 精确时间、任务 ID 和队列长度仅供内部状态同步，不能进入普通回复或 TTS。
@@ -939,7 +1185,7 @@ class HomeAgent:
                     except json.JSONDecodeError: args = {}
                     if status: status(f"正在调用工具：{name}")
                     self.log_event("tool_started", tool=name, arguments=args)
-                    result = await self._run_tool(name, args, confirm)
+                    result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm))
                     if name == "create_scheduled_task" and isinstance(result, dict) and result.get("ok"):
                         created_task_result = result
                     if name == "sing_song" and isinstance(result, dict) and result.get("ok"):

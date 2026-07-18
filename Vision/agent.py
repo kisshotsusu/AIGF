@@ -395,8 +395,18 @@ def list_windows(title_contains: str = ""):
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)): return True
         pid = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        process_path = ""
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)
+        if handle:
+            try:
+                size = ctypes.c_ulong(32768); path_buf = ctypes.create_unicode_buffer(size.value)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, path_buf, ctypes.byref(size)):
+                    process_path = path_buf.value
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
         results.append({"hwnd": int(hwnd), "pid": int(pid.value), "title": title,
-                        "bounds": [rect.left, rect.top, rect.right, rect.bottom]})
+                        "bounds": [rect.left, rect.top, rect.right, rect.bottom],
+                        "process_name": os.path.basename(process_path).lower(), "process_path": process_path})
         return True
 
     user32.EnumWindows(callback, 0)
@@ -420,11 +430,10 @@ def activate_window(title_contains: str):
 def window_screenshot_pil(title_contains: str) -> Image.Image:
     window = _find_window(title_contains)
     left, top, right, bottom = window["bounds"]
-    _, _, width, height = _primary_screen()
-    bbox = (max(0, left), max(0, top), min(width, right), min(height, bottom))
+    bbox = (left, top, right, bottom)
     if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-        raise RuntimeError("target window is outside the primary screen")
-    return ImageGrab.grab(bbox=bbox, all_screens=False).convert("RGB")
+        raise RuntimeError("target window has invalid bounds")
+    return ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
 
 
 def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
@@ -433,7 +442,7 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
     if not points: return {"clicked": False, "reason": "model returned no point", "window": window}
     x, y = points[min(max(0, idx), len(points) - 1)]
     left, top, _, _ = window["bounds"]
-    px = max(0, left) + int(x * img.width); py = max(0, top) + int(y * img.height)
+    px = left + int(x * img.width); py = top + int(y * img.height)
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
@@ -441,14 +450,55 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
     return {"clicked": True, "pixel": [px, py], "window": window, "all_points": points}
 
 
+def _set_clipboard_text(text: str):
+    """Set Unicode clipboard text directly, avoiding shell/session quoting issues."""
+    data = str(text).encode("utf-16-le") + b"\x00\x00"
+    kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    handle = kernel32.GlobalAlloc(0x0002, len(data))
+    if not handle: raise RuntimeError("GlobalAlloc failed for clipboard")
+    pointer = kernel32.GlobalLock(handle)
+    if not pointer:
+        kernel32.GlobalFree(handle); raise RuntimeError("GlobalLock failed for clipboard")
+    ctypes.memmove(pointer, data, len(data)); kernel32.GlobalUnlock(handle)
+    for _ in range(10):
+        if user32.OpenClipboard(None): break
+        time.sleep(0.05)
+    else:
+        kernel32.GlobalFree(handle); raise RuntimeError("OpenClipboard failed")
+    try:
+        user32.EmptyClipboard()
+        if not user32.SetClipboardData(13, handle): raise RuntimeError("SetClipboardData failed")
+        handle = None
+    finally:
+        user32.CloseClipboard()
+        if handle: kernel32.GlobalFree(handle)
+
+
+def desktop_read_clipboard():
+    """Read Unicode text from the Windows clipboard after an explicit copy action."""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode: raise RuntimeError(completed.stderr.strip() or "Get-Clipboard failed")
+    return {"text": completed.stdout.strip()}
+
+
 def window_type_text(title_contains: str, instruction: str, text: str):
     result = window_click(title_contains, instruction)
     if not result.get("clicked"): return {"typed": False, **result}
     desktop_hotkey(["ctrl", "a"])
     desktop_hotkey(["backspace"])
-    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                    "Set-Clipboard -Value $args[0]", str(text)], check=True,
-                   creationflags=subprocess.CREATE_NO_WINDOW)
+    _set_clipboard_text(text)
     desktop_hotkey(["ctrl", "v"])
     return {"typed": True, "text_length": len(str(text)), **result}
 
@@ -483,9 +533,18 @@ def desktop_hotkey(keys: list[str]):
 def desktop_type_text(instruction: str, text: str):
     clicked = desktop_click(instruction)
     if not clicked.get("clicked"): return {"typed": False, **clicked}
-    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Set-Clipboard -Value $args[0]", str(text)], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    _set_clipboard_text(text)
     desktop_hotkey(["ctrl", "v"])
     return {"typed": True, "pixel": clicked["pixel"], "text_length": len(str(text))}
+
+
+def desktop_type_active_text(text: str, clear: bool = True):
+    """Paste text into the currently focused native control without visual relocation."""
+    if clear:
+        desktop_hotkey(["ctrl", "a"]); desktop_hotkey(["backspace"])
+    _set_clipboard_text(text)
+    desktop_hotkey(["ctrl", "v"])
+    return {"typed": True, "focused": True, "cleared": bool(clear), "text_length": len(str(text))}
 
 
 def desktop_scroll(direction: str = "down", amount: int = 600):

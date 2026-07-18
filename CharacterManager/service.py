@@ -190,6 +190,23 @@ class CharacterService:
         lines = path.read_text(encoding="utf-8").splitlines()
         if index < 0 or index >= len(lines):
             raise CharacterServiceError("记忆位置已变化，请刷新后重试")
+        expected_id = item.get("id")
+        if expected_id:
+            try:
+                current_id = json.loads(lines[index]).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                current_id = None
+            if current_id != expected_id:
+                matches = []
+                for candidate, line in enumerate(lines):
+                    try:
+                        if json.loads(line).get("id") == expected_id:
+                            matches.append(candidate)
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                if len(matches) != 1:
+                    raise CharacterServiceError("记忆文件已被其它进程修改，请刷新后重试")
+                index = matches[0]
         if replacement is None:
             lines.pop(index)
         else:
@@ -205,7 +222,14 @@ class CharacterService:
         document = TOOL_DOCUMENTS.get((section, home))
         if document:
             if document.exists():
-                value = self._read_yaml(document, value if isinstance(value, dict) else {})
+                if path.exists() and path.stat().st_mtime_ns > document.stat().st_mtime_ns:
+                    value = value if isinstance(value, dict) else {}
+                    self._write_yaml(document, value)
+                else:
+                    value = self._read_yaml(document, value if isinstance(value, dict) else {})
+                    if data.get(section) != value:
+                        data[section] = deepcopy(value)
+                        self._write_yaml(path, data)
             else:
                 self._write_yaml(document, value if isinstance(value, dict) else {})
         return deepcopy(value if isinstance(value, dict) else {})

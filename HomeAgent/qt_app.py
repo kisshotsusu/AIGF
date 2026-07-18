@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import yaml
-from PySide6.QtCore import QObject, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QLockFile, QObject, QPoint, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
@@ -312,6 +312,13 @@ QDialog {{ background: {COLORS['window']}; }} #dialogTitle {{ font-size: 22px; f
 
 def run():
     app = QApplication.instance() or QApplication([])
+    lock_path = Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "ai-home-agent.lock"
+    lock = QLockFile(str(lock_path)); lock.setStaleLockTime(30000)
+    if not lock.tryLock(100):
+        lock.removeStaleLockFile()
+        if not lock.tryLock(100):
+            return 0
+    app._home_agent_lock = lock
     font_path = Path(r"C:\Windows\Fonts\NotoSansSC.ttf")
     if font_path.exists():
         font_id = QFontDatabase.addApplicationFont(str(font_path))

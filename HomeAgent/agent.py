@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from urllib.parse import quote
 from datetime import datetime, timedelta
@@ -328,6 +329,43 @@ class HomeAgent:
         python = ROOT / ".venv" / "Scripts" / "python.exe"; server = ROOT / "Vision" / "mcp_server.py"
         if not python.exists() or not server.exists():
             self.log_event("vision_service_missing", python=python, server=server); return False
+        # The HTTP port is not opened until model preload finishes.  Coordinate
+        # across HomeAgent processes so that only one process loads the model.
+        lock_path = ROOT / "Vision" / "state" / "startup.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        timeout = float(cfg.get("startup_timeout_seconds", 120))
+        token = uuid.uuid4().hex
+        payload = {"owner_pid": os.getpid(), "token": token, "created_at": time.time()}
+        owns_lock = False
+        while not owns_lock:
+            # Another process may have finished preload between lock checks.
+            if ready(): return True
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+                owns_lock = True
+            except FileExistsError:
+                try:
+                    existing = json.loads(lock_path.read_text(encoding="utf-8"))
+                    owner_pid = int(existing.get("owner_pid", 0))
+                    created_at = float(existing.get("created_at", 0))
+                    os.kill(owner_pid, 0)
+                    stale = time.time() - created_at > timeout + 30
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    stale = True
+                if stale:
+                    try: lock_path.unlink()
+                    except FileNotFoundError: pass
+                    continue
+                if not wait_until_ready: return True
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if ready(): return True
+                    if not lock_path.exists(): break
+                    time.sleep(1)
+                if ready(): return True
+                continue
         log_dir = ROOT / "Vision" / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
         log = (log_dir / "vision-mcp.log").open("a", encoding="utf-8")
         env = os.environ.copy(); env.update({
@@ -335,17 +373,43 @@ class HomeAgent:
             "VISION_PRELOAD_MODEL": "1" if cfg.get("preload_model", True) else "0",
             "GUI_ACTOR_MODEL": str(ROOT / "Vision" / "models" / "GUI-Actor-2B-Qwen2-VL"),
             "GUI_ACTOR_REPO": str(ROOT / "Vision" / "GUI-Actor"),
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         })
-        flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == "nt" else 0
-        self.vision_service_process = subprocess.Popen([str(python), str(server)], cwd=str(server.parent), env=env, stdout=log, stderr=log, creationflags=flags)
-        self.log_event("vision_service_started", pid=self.vision_service_process.pid, host=host, port=port, preload=cfg.get("preload_model", True))
-        if not wait_until_ready: return True
-        deadline = time.monotonic() + float(cfg.get("startup_timeout_seconds", 120))
-        while time.monotonic() < deadline:
-            if ready(): return True
-            if self.vision_service_process.poll() is not None: return False
-            time.sleep(1)
-        return False
+        try:
+            flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == "nt" else 0
+            self.vision_service_process = subprocess.Popen([str(python), str(server)], cwd=str(server.parent), env=env, stdout=log, stderr=log, creationflags=flags)
+            payload["server_pid"] = self.vision_service_process.pid
+            lock_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.log_event("vision_service_started", pid=self.vision_service_process.pid, host=host, port=port, preload=cfg.get("preload_model", True))
+            if not wait_until_ready:
+                # Keep the cross-process lock for the whole preload window even
+                # though the caller requested a non-blocking autostart.
+                def release_when_started() -> None:
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline and not ready():
+                        if self.vision_service_process.poll() is not None: break
+                        time.sleep(1)
+                    try:
+                        current = json.loads(lock_path.read_text(encoding="utf-8"))
+                        if current.get("token") == token: lock_path.unlink()
+                    except (FileNotFoundError, json.JSONDecodeError, OSError):
+                        pass
+                threading.Thread(target=release_when_started, daemon=True, name="vision-startup-lock").start()
+                owns_lock = False
+                return True
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if ready(): return True
+                if self.vision_service_process.poll() is not None: return False
+                time.sleep(1)
+            return False
+        finally:
+            if owns_lock:
+                try:
+                    current = json.loads(lock_path.read_text(encoding="utf-8"))
+                    if current.get("token") == token: lock_path.unlink()
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    pass
 
     async def codex_status(self) -> dict[str, Any]:
         """检查 CLI 版本和已配置 MCP 服务，不执行 Agent 任务。"""
@@ -555,7 +619,11 @@ class HomeAgent:
                   "只用 navigate/get_url/web_read/web_fill/web_click_text/web_press/web_play_media。"
                   "打开首页只是阶段一，绝不是完成；必须继续搜索、读取结果、选择匹配项、执行目标动作，并读取最终页面验证。"
                   "只有终态证据满足用户目标才能报告成功。\n\n" if not gui_enabled else
-                  "先用 list_windows 检测目标应用，再用目标窗口工具操作；每次关键操作后重新读取状态验证。\n\n")
+                  "先拆解用户请求中的全部动作并建立完成清单。网页优先使用 navigate/web_read/web_fill/web_click_text/web_press；"
+                  "需要图像定位时，视觉点击输入框后用 type_active_text 输入，禁止为同一输入框重复定位。"
+                  "原生应用先用 list_windows 检测目标窗口，再用 window_screenshot/window_click/window_type_text。"
+                  "每次点击、输入、搜索、选择后必须重新读取或截图验证；清单中任何动作未完成时不得结束或报告成功。"
+                  "连续两次状态不变才报告具体失败。\n\n")
                if preferred_mcp else "")
             + f"角色与规则：\n{self.workspace.prompt_documents('home')}\n\n用户任务：{task}"
         )
@@ -659,7 +727,7 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "list_mcp_servers", "description": "检查 Codex CLI 和已配置的 MCP 服务", "parameters": {"type": "object", "properties": {}}}},
             ]
             if self.config.get("vision_mcp", {}).get("gui_enabled", False):
-                tools.append({"type": "function", "function": {"name": "vision_gui_task", "description": "调用 GUI 图像识别 MCP 操作桌面窗口", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}})
+                tools.append({"type": "function", "function": {"name": "vision_gui_task", "description": "调用 GUI 图像识别 MCP 完成多步骤桌面或网页操作。必须持续执行用户要求的全部点击、输入、搜索、选择和播放动作，并在最终状态验证后才返回成功。", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}})
         if self.config.get("computer_control", {}).get("enabled", False):
             tools += [
                 {"type": "function", "function": {"name": "list_directory", "description": "列出允许目录中的文件和子目录", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
@@ -779,7 +847,10 @@ class HomeAgent:
                     await self._speak_home(session, f"好呀，我去{visual_target}帮你找找{visual_query or '想要的内容'}。", status)
             operation_timeout = max(5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
             try:
-                operation = self._run_direct_visual_media(text, status) if gui_enabled else self._run_direct_web_media(text, status)
+                is_bilibili = any(x in text.lower() for x in ("bilibili", "哔哩哔哩", "b站"))
+                # Bilibili has deterministic DOM verification and must not be
+                # downgraded to a single visual click merely because GUI is on.
+                operation = self._run_direct_web_media(text, status) if is_bilibili or not gui_enabled else self._run_direct_visual_media(text, status)
                 direct_visual = await asyncio.wait_for(operation, timeout=operation_timeout)
             except asyncio.TimeoutError:
                 self.stop_current_task()

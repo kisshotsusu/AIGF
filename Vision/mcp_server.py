@@ -23,6 +23,10 @@ import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+# Must be set before importing torch through agent.  Expandable segments reduce
+# allocator fragmentation during repeated screenshots with varying dimensions.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from mcp.server.fastmcp import FastMCP, Image as MCPImage
 import agent
 
@@ -42,30 +46,48 @@ async def navigate(url: str) -> str:
 
 
 @mcp.tool()
-def click(instruction: str, topk: int = 3) -> str:
+async def click(instruction: str, topk: int = 3, region: str = "full") -> str:
     """查看当前页面截图, 点击与 instruction 描述相符的界面元素。
     例如: 'click the play button to start the video' /
           'click the search box' / 'click the login button'。
     返回点击的归一化坐标与像素坐标。"""
-    return str(agent.click(instruction, topk=topk))
+    return str(await _web_call(agent.click, instruction, topk, 0, region))
 
 
 @mcp.tool()
-def type_text(instruction: str, text: str) -> str:
+async def ground_page(instruction: str, topk: int = 3) -> str:
+    """只定位当前网页中的目标并返回坐标，不执行点击；用于观察和安全验证。"""
+    return str(await _web_call(agent.ground, instruction, topk))
+
+
+@mcp.tool()
+async def vision_memory_status() -> str:
+    """返回 Vision 进程自身的 CUDA 已分配、缓存和峰值显存。"""
+    return str(await _web_call(agent.cuda_memory_status))
+
+
+@mcp.tool()
+async def type_text(instruction: str, text: str, topk: int = 3) -> str:
     """点击 instruction 描述的输入框, 然后输入 text。"""
-    return str(agent.type_text(instruction, text))
+    return str(await _web_call(agent.type_text, instruction, text, topk))
 
 
 @mcp.tool()
-def scroll(direction: str = "down", amount: int = 400) -> str:
+async def type_active_text(text: str, clear: bool = True) -> str:
+    """向上一步视觉点击后已获得焦点的输入框输入文字，避免重复视觉定位。"""
+    return str(await _web_call(agent.type_active_text, text, clear))
+
+
+@mcp.tool()
+async def scroll(direction: str = "down", amount: int = 400) -> str:
     """滚动页面。direction: 'down' 或 'up'; amount: 像素。"""
-    return str(agent.scroll(direction, amount))
+    return str(await _web_call(agent.scroll, direction, amount))
 
 
 @mcp.tool()
-def screenshot() -> MCPImage:
+async def screenshot() -> MCPImage:
     """返回当前页面的截图(图片), 供你观察页面状态。"""
-    img = agent.screenshot_pil()
+    img = await _web_call(agent.screenshot_pil)
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return MCPImage(data=buf.getvalue(), format="png")
@@ -108,16 +130,16 @@ async def web_play_media() -> str:
 
 
 @mcp.tool()
-def wait(ms: int = 1000) -> str:
+async def wait(ms: int = 1000) -> str:
     """等待指定毫秒数, 让页面加载/动画完成。"""
-    agent.wait(ms)
+    await _web_call(agent.wait, ms)
     return f"waited {ms} ms"
 
 
 @mcp.tool()
-def play_video(instruction: str = "click the play button to start the video") -> str:
+async def play_video(instruction: str = "click the play button to start the video") -> str:
     """便捷工具: 找到并点击播放按钮, 开始播放视频。"""
-    return str(agent.play_video(instruction))
+    return str(await _web_call(agent.play_video, instruction))
 
 
 @mcp.tool()

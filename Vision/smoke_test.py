@@ -34,15 +34,19 @@ pred = agent.inference(conv, agent._model, agent._tokenizer,
                        agent._processor, use_placeholder=True, topk=3)
 pts = pred.get("topk_points") or []
 print(f"[smoke] 2) PIL图 grounding topk_points: {pts}")
+if not pts or not all(len(p) == 2 and 0 <= p[0] <= 1 and 0 <= p[1] <= 1 for p in pts):
+    raise RuntimeError(f"合成图 grounding 失败: {pts!r}")
 
 # ---- 核心2：真实浏览器截图 -> grounding（验证端到端）----
+print("[smoke] 3) opening browser -> bing ...", flush=True)
 try:
-    print("[smoke] 3) opening browser -> bing ...", flush=True)
-    agent.navigate("https://www.bing.com")
+    url = agent.navigate("https://www.bing.com")
+    if "bing.com" not in url: raise RuntimeError(f"导航地址异常: {url}")
     bpts = agent.ground("click the search box", topk=3)
+    if not bpts or not all(len(p) == 2 and 0 <= p[0] <= 1 and 0 <= p[1] <= 1 for p in bpts):
+        raise RuntimeError(f"真实页面 grounding 失败: {bpts!r}")
     print(f"[smoke]    bing search-box grounding: {bpts}")
+finally:
     agent.close()
-except Exception as e:
-    print(f"[smoke]    browser test error (non-fatal): {e!r}")
 
-print("[smoke] DONE. model OK =", bool(pts), flush=True)
+print("[smoke] DONE. all checks passed", flush=True)

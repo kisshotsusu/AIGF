@@ -621,4 +621,5 @@ class DesktopPet:
 
 
 if __name__ == "__main__":
-    DesktopPet().run()
+    from qt_app import run
+    raise SystemExit(run())

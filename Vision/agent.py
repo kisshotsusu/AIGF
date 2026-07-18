@@ -122,6 +122,19 @@ def reset_browser():
     _page = None; _browser = None; _pw = None
 
 
+def _adopt_latest_page(page):
+    """Follow target=_blank/popups so subsequent steps verify the page that opened."""
+    global _page
+    pages = [item for item in page.context.pages if not item.is_closed()]
+    latest = pages[-1] if pages else page
+    if latest is not page:
+        _page = latest
+        latest.bring_to_front()
+        try: latest.wait_for_load_state("domcontentloaded", timeout=15000)
+        except PlaywrightError: pass
+    return _page or page
+
+
 # ---------------- 公开 API ----------------
 def navigate(url: str) -> str:
     last_error = None
@@ -160,11 +173,15 @@ def ground_image(instruction: str, img: Image.Image, topk: int = 3):
             ],
         },
     ]
-    pred = inference(
-        conversation, _model, _tokenizer, _processor,
-        use_placeholder=True, topk=topk,
-    )
-    return pred.get("topk_points") or []
+    # Grounding is inference-only.  Disabling autograd prevents an accidental
+    # graph from surviving in the returned prediction and growing VRAM usage.
+    with torch.inference_mode():
+        pred = inference(
+            conversation, _model, _tokenizer, _processor,
+            use_placeholder=True, topk=topk,
+        )
+    points = pred.get("topk_points") or []
+    return [[float(point[0]), float(point[1])] for point in points]
 
 
 def ground(instruction: str, topk: int = 3):
@@ -172,24 +189,73 @@ def ground(instruction: str, topk: int = 3):
     return ground_image(instruction, screenshot_pil(), topk)
 
 
-def click(instruction: str, topk: int = 3, idx: int = 0):
+def cuda_memory_status():
+    """Return this Vision process' CUDA allocator usage in MiB."""
+    if not torch.cuda.is_available():
+        return {"available": False}
+    device = torch.cuda.current_device()
+    mib = 1024 * 1024
+    return {
+        "available": True,
+        "device": device,
+        "allocated_mib": round(torch.cuda.memory_allocated(device) / mib, 1),
+        "reserved_mib": round(torch.cuda.memory_reserved(device) / mib, 1),
+        "max_allocated_mib": round(torch.cuda.max_memory_allocated(device) / mib, 1),
+        "max_reserved_mib": round(torch.cuda.max_memory_reserved(device) / mib, 1),
+    }
+
+
+def click(instruction: str, topk: int = 3, idx: int = 0, region: str = "full"):
     page = ensure_browser()
-    pts = ground(instruction, topk=topk)
+    image = screenshot_pil()
+    regions = {
+        "full": (0, 0, image.width, image.height),
+        "left": (0, 0, int(image.width * 0.68), image.height),
+        "right": (int(image.width * 0.32), 0, image.width, image.height),
+        "top": (0, 0, image.width, int(image.height * 0.55)),
+        "bottom": (0, int(image.height * 0.45), image.width, image.height),
+    }
+    box = regions.get(str(region).lower(), regions["full"])
+    cropped = image.crop(box)
+    pts = ground_image(instruction, cropped, topk=topk)
     if not pts:
         return {"clicked": False, "reason": "model returned no point", "all_points": []}
     x, y = pts[min(idx, len(pts) - 1)]
     x = max(0.0, min(1.0, x))
     y = max(0.0, min(1.0, y))
-    px = int(x * VIEWPORT["width"])
-    py = int(y * VIEWPORT["height"])
+    px = box[0] + int(x * cropped.width)
+    py = box[1] + int(y * cropped.height)
+    global_x, global_y = px / image.width, py / image.height
+    snap = page.evaluate("""({x,y}) => {
+      const direct = document.elementFromPoint(x, y)?.closest('a,button,input,[role=button]');
+      const usable = e => e && (() => { const r=e.getBoundingClientRect(); return r.width>2 && r.height>2; })();
+      let best = usable(direct) ? direct : null, bestDistance = Infinity;
+      if (!best) for (const e of document.querySelectorAll('a,button,input,[role=button]')) {
+        const r=e.getBoundingClientRect();
+        if (r.width<=2 || r.height<=2 || r.bottom<0 || r.top>innerHeight) continue;
+        const cx=Math.max(r.left,Math.min(x,r.right)), cy=Math.max(r.top,Math.min(y,r.bottom));
+        const d=Math.hypot(cx-x,cy-y);
+        if (d<bestDistance && d<=90) { best=e; bestDistance=d; }
+      }
+      if (!best) return null;
+      const r=best.getBoundingClientRect();
+      return {x:r.left+r.width/2,y:r.top+r.height/2,tag:best.tagName,text:(best.innerText||best.getAttribute('aria-label')||'').trim().slice(0,120),href:best.href||''};
+    }""", {"x": px, "y": py})
+    if snap:
+        px, py = int(snap["x"]), int(snap["y"])
+        global_x, global_y = px / image.width, py / image.height
     page.mouse.click(px, py)
     page.wait_for_timeout(600)
+    page = _adopt_latest_page(page)
     return {
         "clicked": True,
         "instruction": instruction,
-        "norm": [round(x, 4), round(y, 4)],
+        "norm": [round(global_x, 4), round(global_y, 4)],
         "pixel": [px, py],
-        "all_points": [[round(p[0], 4), round(p[1], 4)] for p in pts],
+        "region": str(region).lower(),
+        "snapped": snap,
+        "all_points": [[round((box[0] + p[0] * cropped.width) / image.width, 4), round((box[1] + p[1] * cropped.height) / image.height, 4)] for p in pts],
+        "url": page.url,
     }
 
 
@@ -203,8 +269,20 @@ def type_text(instruction: str, text: str, topk: int = 3):
     py = int(max(0.0, min(1.0, y)) * VIEWPORT["height"])
     page.mouse.click(px, py)
     page.wait_for_timeout(300)
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
     page.keyboard.type(text, delay=20)
     return {"typed": True, "pixel": [px, py], "text": text}
+
+
+def type_active_text(text: str, clear: bool = True):
+    """Type into the element focused by a preceding visual click."""
+    page = ensure_browser()
+    if clear:
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+    page.keyboard.type(str(text), delay=20)
+    return {"typed": True, "focused": True, "cleared": bool(clear), "text_length": len(str(text)), "url": page.url}
 
 
 def scroll(direction: str = "down", amount: int = 400):
@@ -240,6 +318,7 @@ def web_click_text(text: str, exact: bool = False):
     if not count: return {"clicked": False, "reason": "text not found", "text": text}
     locator.first.click(timeout=10000)
     page.wait_for_timeout(500)
+    page = _adopt_latest_page(page)
     return {"clicked": True, "text": text, "matches": count, "url": page.url}
 
 
@@ -365,6 +444,8 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
 def window_type_text(title_contains: str, instruction: str, text: str):
     result = window_click(title_contains, instruction)
     if not result.get("clicked"): return {"typed": False, **result}
+    desktop_hotkey(["ctrl", "a"])
+    desktop_hotkey(["backspace"])
     subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                     "Set-Clipboard -Value $args[0]", str(text)], check=True,
                    creationflags=subprocess.CREATE_NO_WINDOW)

@@ -1,0 +1,19 @@
+家庭 Agent 使用说明
+
+1. 双击“启动家庭Agent.bat”打开透明悬浮桌宠。
+2. 单击桌宠展开或收起对话框；拖动桌宠可改变位置，退出时会保存位置。
+3. 在对话框中可以输入文字，或点击“语音”开始录音，再次点击停止并识别。
+4. 右键桌宠选择“设置”，可以选择麦克风、配置语音识别 API、API Key、模型和本地识别路径。
+5. 语音转文字可以配置一种方式：
+   - api：填写 OpenAI 兼容语音识别接口 api_url，并在主项目 .env 设置 STT_API_KEY。
+   - faster_whisper：填写可运行 faster-whisper 的 Python 路径及本地模型目录。
+6. 模型回复后会自动调用现有 SVC 服务播放语音。
+7. 可以自然地说“记住我喜欢……”“查找关于……的记忆”“生成一张角色在家里的图片”，Agent 会按需调用记忆或图片技能。
+8. 家庭场景规则位于 E:\Doc\AI直播\workspace\HOME.md，可直接修改。
+
+录音文件保存在 HomeAgent\recordings；本程序不会发送直播弹幕。
+
+Codex CLI 与 MCP：
+- 右键桌宠 → 设置，可启用 Codex CLI、选择权限和触发模式。
+- “自动”模式只在命中配置关键词时转交 Codex；“始终”会把全部对话交给 Codex；“手动”仅允许模型主动调用工具。
+- MCP 服务使用 Codex 的 %USERPROFILE%\.codex\config.toml 配置，可在设置中点击“测试 CLI 与 MCP”查看状态。

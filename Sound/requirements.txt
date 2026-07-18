@@ -1,0 +1,8 @@
+# SenseVoiceSmall 语音识别依赖
+# 注意: torch 必须装 cu128 版以支持 RTX 5070 Ti (Blackwell, sm_120)。
+#   先执行: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   再执行: pip install -r requirements.txt
+funasr
+modelscope
+sounddevice
+mcp

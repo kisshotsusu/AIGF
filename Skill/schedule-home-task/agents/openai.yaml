@@ -1,0 +1,4 @@
+interface:
+  display_name: "家庭定时任务"
+  short_description: "为家庭Agent创建一次性提醒、语音闹钟与周期任务"
+  default_prompt: "Use $schedule-home-task to create a spoken reminder or recurring alarm."

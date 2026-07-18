@@ -1,0 +1,16 @@
+image_generation:
+  # images 调用 /images/generations 与 /images/edits。
+  # chat_multimodal 调用 /chat/completions 并发送图片 data URI。
+  mode: images
+  base_url: https://your-domestic-provider.example/v1
+  api_key_env: IMAGE_API_KEY
+  model: your-image-model
+  size: 1024x1024
+  timeout_seconds: 180
+  extra_body: {}
+
+workspace:
+  path: workspace
+  character_image_dir: character_images
+  character_profile_file: CHARACTER.md
+

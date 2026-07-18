@@ -1,0 +1,7 @@
+.mode-card { display:grid; grid-template-columns:1fr minmax(310px, 1fr); gap:20px; align-items:center; margin-bottom:18px; border-left:4px solid #145e59; }
+.mode-card small { color:#6f797b; font-weight:700; }
+.mode-card h3 { margin:4px 0 0; }
+.mode-card select { margin:0; }
+.mode-card p { grid-column:2; margin:-12px 0 0; color:#6f797b; font-size:12px; }
+.mode-help { min-height:18px; color:#145e59!important; }
+@media(max-width:700px){.mode-card{grid-template-columns:1fr}.mode-card p{grid-column:1;margin:0}}

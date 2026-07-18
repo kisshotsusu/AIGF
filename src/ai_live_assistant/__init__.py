@@ -1,0 +1,2 @@
+"""Bilibili AI live assistant."""
+

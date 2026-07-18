@@ -1,0 +1,26 @@
+# ============================================================
+# AI直播 共享依赖清单 (供 set_env.bat 使用)
+#
+# 重要: torch / torchvision / torchaudio 不要写在本文件里!
+# 它们由 set_env.bat 单独从 PyTorch 官方 cu128 源安装,
+# 以支持 RTX 50 系 (Blackwell, sm_120)。若在这里写 torch,
+# pip 可能装回 CPU 版, 导致推理无法用 GPU。
+# ============================================================
+
+# --- Vision: GUI-Actor-2B 网页视觉控制 (MCP: vision-gui) ---
+transformers==4.51.3
+qwen-vl-utils==0.0.8
+accelerate
+pillow
+numpy
+opencv-python-headless
+playwright
+mcp[cli]
+huggingface_hub
+
+# --- Sound: SenseVoiceSmall 语音识别 (MCP: sound-asr) ---
+funasr
+modelscope
+sounddevice
+librosa
+soundfile

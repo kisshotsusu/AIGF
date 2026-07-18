@@ -1,0 +1,13 @@
+# GUI-Actor-2B Web Agent 依赖
+# Python 3.12 推荐 (repo pyproject 要求 <3.13)
+torch
+torchvision
+transformers==4.51.3
+qwen-vl-utils==0.0.8
+accelerate
+pillow
+numpy
+opencv-python-headless
+playwright
+mcp[cli]
+huggingface_hub

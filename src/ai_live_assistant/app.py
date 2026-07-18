@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+
+from .bilibili import BilibiliLive
+from .config import secret_from_env
+from .llm import LLMClient
+from .tts import TTSClient
+from .workspace import Workspace
+
+
+class LiveAssistant:
+    def __init__(self, cfg: dict[str, Any]):
+        self.cfg, self.root = cfg, Path(cfg["_root"])
+        self.log = logging.getLogger("ai_live")
+        self.context: deque[dict[str, Any]] = deque(maxlen=cfg["reply"].get("max_context_messages", 12))
+        self.last_context_cleanup = 0.0
+        self.welcomed: dict[str, float] = {}
+        self.last_reply: dict[str, float] = {}
+        self.send_lock = asyncio.Lock()
+        self.message_log = self.root / "logs" / "messages.jsonl"
+        self.message_log.parent.mkdir(parents=True, exist_ok=True)
+        self.recent_danmaku: dict[tuple[str, str], float] = {}
+
+    @staticmethod
+    def _shorten_live_reply(reply: str, limit: int) -> str:
+        reply = re.sub(r"[\r\n]+", " ", reply).strip().strip('"“”')
+        if limit <= 0 or len(reply) <= limit: return reply
+        shortened = reply[:limit]
+        punctuation = max(shortened.rfind(mark) for mark in "。！？!?，,")
+        return shortened[:punctuation + 1] if punctuation >= max(10, limit // 2) else reply[:max(1, limit - 1)].rstrip("，,") + "…"
+
+    def _record_message(self, event: str, user: str, message: str, **extra: Any) -> None:
+        row = {"time": datetime.now().isoformat(timespec="seconds"), "event": event, "user": user, "message": message, **extra}
+        with self.message_log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    async def run(self) -> None:
+        headers = {"User-Agent": "Mozilla/5.0 AI-Live-Assistant/1.0"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            bili = BilibiliLive(session, int(self.cfg["app"]["room_id"]), secret_from_env(self.cfg["bilibili"].get("cookie_env")))
+            self.llm = LLMClient(session, self.cfg["llm"])
+            self.tts = TTSClient(session, self.cfg["tts"], self.root / "audio")
+            self.workspace = Workspace(self.root, self.cfg["workspace"])
+            self.bili = bili
+            self.log.info(
+                "正在连接 B站直播间 %s（dry_run=%s, send_danmaku=%s）",
+                bili.room_id,
+                self.cfg["app"].get("dry_run", True),
+                self.cfg["app"].get("send_danmaku", False),
+            )
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            async def produce(stream) -> None:
+                async for item in stream: await queue.put(item)
+            producers = [asyncio.create_task(produce(bili.events())), asyncio.create_task(produce(bili.history_events())), asyncio.create_task(self._context_cleanup_loop())]
+            try:
+                while True: await self.handle_event(await queue.get())
+            finally:
+                for task in producers: task.cancel()
+
+    async def handle_event(self, event: dict[str, Any]) -> None:
+        self._cleanup_live_context()
+        cmd = str(event.get("cmd", "")).split(":", 1)[0]
+        if cmd == "DANMU_MSG":
+            info = event.get("info", [])
+            if len(info) > 2:
+                text, user = str(info[1]), str(info[2][1])
+                duplicate_key = (user, text)
+                now = time.monotonic()
+                if now - self.recent_danmaku.get(duplicate_key, 0) < 3:
+                    return
+                self.recent_danmaku[duplicate_key] = now
+                self.log.info("弹幕 <%s> %s", user, text)
+                identity = self.workspace.resolve_user(user)
+                identity_label = f"同一用户身份: {identity['name']} ({identity['id']})" if identity["is_owner"] else f"观众身份: {identity['id']}"
+                self._append_live_context("user", f"[观众用户名: {user}]\n[{identity_label}]\n弹幕内容: {text}")
+                should_reply, reason = self._should_reply(user, text)
+                self._record_message("received", user, text, status="triggered" if should_reply else "skipped", reason=reason)
+                if should_reply: asyncio.create_task(self._smart_reply(user, text))
+        elif cmd in {"INTERACT_WORD", "ENTRY_EFFECT"}:
+            data = event.get("data", {})
+            user = str(data.get("uname") or data.get("copy_writing") or "新朋友")
+            uid = str(data.get("uid") or user)
+            if self.cfg["bilibili"].get("welcome_enabled", True): asyncio.create_task(self._welcome(uid, user))
+
+    async def _welcome(self, uid: str, user: str) -> None:
+        now = time.monotonic(); cooldown = self.cfg["bilibili"].get("welcome_cooldown_seconds", 1800)
+        if now - self.welcomed.get(uid, 0) < cooldown: return
+        self.welcomed[uid] = now
+        safe_user = re.sub(r"[\r\n]", "", user)[:12]
+        await self._emit(self.cfg["bilibili"]["welcome_template"].format(username=safe_user))
+
+    def _should_reply(self, user: str, text: str) -> tuple[bool, str]:
+        rc = self.cfg["reply"]
+        if not rc.get("enabled", True): return False, "reply_disabled"
+        if user in rc.get("ignore_users", []): return False, "ignored_user"
+        remaining = float(rc.get("cooldown_seconds", 2)) - (time.monotonic() - self.last_reply.get(user, 0))
+        if remaining > 0:
+            self.log.info("跳过弹幕 <%s>：冷却中，剩余 %.1f 秒", user, remaining)
+            return False, f"cooldown:{remaining:.1f}s"
+        mode = rc.get("trigger_mode", "mention")
+        hit = mode == "all" or (mode == "mention" and any(n in text for n in rc.get("bot_names", []))) or (mode == "prefix" and any(text.startswith(p) for p in rc.get("prefixes", [])))
+        if hit: self.last_reply[user] = time.monotonic()
+        return (True, f"mode:{mode}") if hit else (False, f"not_matched:{mode}")
+
+    async def _smart_reply(self, user: str, text: str) -> None:
+        try:
+            # 私密记忆和私人照片只允许家庭模式读取，绝不注入直播模型上下文。
+            memories = self.workspace.recent_memories(self.cfg["reply"].get("max_memory_items", 8), include_private=False)
+            system = self.workspace.prompt_documents("live") + "\n\n身份识别规则：每条弹幕都带有[观众用户名]标签。用户名代表不同观众，回复时必须识别当前发言者，不要把不同用户名的经历或身份混淆。\n\n近期记忆：\n" + "\n".join(str(x) for x in memories)
+            identity = self.workspace.resolve_user(user)
+            relation = f"该账号已关联为家庭模式用户“{identity['name']}”，规范身份ID为 {identity['id']}。" if identity["is_owner"] else "该账号是独立直播观众，不要套用主人的记忆。"
+            current = f"当前需要回复的观众用户名：{user}\n{relation}\n该观众本次弹幕：{text}\n请直接生成对这位观众的简短口语回复。"
+            self._cleanup_live_context()
+            context = [{"role": item["role"], "content": item["content"]} for item in self.context]
+            messages = [{"role": "system", "content": system}, *context, {"role": "user", "content": current}]
+            reply = self._shorten_live_reply(await self.llm.reply(messages), int(self.cfg["reply"].get("max_reply_chars", 60)))
+            await self._emit(reply)
+            self._append_live_context("assistant", reply)
+            self._record_message("reply", user, text, status="success", reply=reply)
+            await self._maybe_remember(user, text, reply)
+        except Exception as exc:
+            self._record_message("reply", user, text, status="error", error=str(exc))
+            self.log.exception("智能回复失败")
+
+    def _append_live_context(self, role: str, content: str) -> None:
+        self.context.append({"role": role, "content": content, "_created_at": time.time()})
+
+    def _cleanup_live_context(self, force: bool = False) -> int:
+        cfg = self.cfg.get("context_cleanup", {})
+        if not cfg.get("live_enabled", True): return 0
+        now = time.time(); interval = max(10, int(cfg.get("check_interval_seconds", 60)))
+        if not force and now - self.last_context_cleanup < interval: return 0
+        self.last_context_cleanup = now
+        cutoff = now - max(10, int(cfg.get("live_max_age_minutes", 120))) * 60
+        before = len(self.context)
+        kept = [item for item in self.context if float(item.get("_created_at", now)) >= cutoff]
+        self.context.clear(); self.context.extend(kept)
+        removed = before - len(self.context)
+        if removed: self.log.info("已清理 %s 条超过保留时长的直播模型上下文", removed)
+        return removed
+
+    async def _context_cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(max(10, int(self.cfg.get("context_cleanup", {}).get("check_interval_seconds", 60))))
+            self._cleanup_live_context(force=True)
+
+    async def _maybe_remember(self, user: str, message: str, reply: str) -> None:
+        cfg = self.cfg.get("memory_write", {})
+        identity = self.workspace.resolve_user(user)
+        memory_user = identity["name"] if identity["is_owner"] else user
+        mode = cfg.get("mode", "important")
+        if mode == "off":
+            return
+        today = self.workspace.root / self.workspace.cfg.get("memory_dir", "memory") / f"{datetime.now():%Y-%m-%d}.jsonl"
+        daily_count = 0
+        if today.exists():
+            try:
+                for line in today.read_text(encoding="utf-8").splitlines():
+                    item = json.loads(line); source = str(item.get("source", ""))
+                    if source.startswith("auto") or source.startswith("home-auto"): daily_count += 1
+            except (OSError, json.JSONDecodeError):
+                pass
+        if daily_count >= int(cfg.get("max_daily_writes", 20)):
+            self._record_message("memory", user, message, status="skipped", reason="daily_limit")
+            return
+        base = {"user": memory_user, "user_id": identity["id"], "source_username": user, "message": message, "reply": reply, "source": "auto-all"}
+        if mode == "all":
+            self.workspace.remember({"type": "conversation", **base})
+            self._record_message("memory", user, message, status="success", reason="mode:all")
+            return
+        always = any(word and word in message for word in cfg.get("always_keywords", []))
+        ignored = any(word and word in message for word in cfg.get("ignore_keywords", []))
+        if ignored and not always:
+            self._record_message("memory", user, message, status="skipped", reason="ignored_keyword")
+            return
+        if len(message.strip()) < int(cfg.get("min_message_length", 4)) and not always:
+            self._record_message("memory", user, message, status="skipped", reason="too_short")
+            return
+        threshold = int(cfg.get("importance_threshold", 70))
+        result = {"importance": 90 if always else 50, "should_remember": always, "category": "identity" if always else "event", "summary": f"{memory_user}说：{message}"}
+        if cfg.get("analyze_with_llm", True):
+            prompt = (
+                "你是直播间长期记忆筛选器。判断这段互动是否值得跨场次长期记住。"
+                "身份、称呼、稳定喜好、重要关系、明确约定和重大事件分数应高；寒暄、玩笑、测试、重复弹幕和临时话题分数应低。"
+                "只输出JSON对象，字段为 importance(0到100整数)、should_remember(布尔)、category(identity/preference/relationship/agreement/event)、summary(一句不超过60字的第三人称事实)。\n"
+                f"观众用户名：{user}\n规范用户身份：{memory_user} ({identity['id']})\n观众消息：{message}\nAI回复：{reply}"
+            )
+            try:
+                raw = await self.llm.reply([{"role": "system", "content": "只输出合法JSON，不要Markdown。"}, {"role": "user", "content": prompt}], profile="memory")
+                match = re.search(r"\{.*\}", raw, re.S)
+                if match: result.update(json.loads(match.group(0)))
+            except Exception:
+                self.log.exception("记忆重要度分析失败")
+        score = max(0, min(100, int(result.get("importance", 0))))
+        should = bool(result.get("should_remember")) and score >= threshold
+        if always: should, score = True, max(score, threshold)
+        if not should:
+            self._record_message("memory", user, message, status="skipped", reason=f"importance:{score}")
+            return
+        category = str(result.get("category", "event"))
+        summary = str(result.get("summary") or f"{memory_user}说：{message}").strip()[:120]
+        self.workspace.remember({
+            "type": category, "user": memory_user, "user_id": identity["id"],
+            "source_username": user, "content": summary, "importance": score,
+            "source": "auto-important", "original_message": message,
+        })
+        self._record_message("memory", user, message, status="success", reason=f"importance:{score}", summary=summary)
+
+    async def _emit(self, text: str) -> None:
+        self.log.info("回复: %s", text)
+        async with self.send_lock:
+            if self.cfg["app"].get("send_danmaku", False) and not self.cfg["app"].get("dry_run", True):
+                limit = int(self.cfg["bilibili"].get("max_message_length", 20))
+                await self.bili.send_danmaku(text[:limit])
+                await asyncio.sleep(self.cfg["bilibili"].get("send_interval_seconds", 6))
+            try: await self.tts.speak(text)
+            except Exception: self.log.exception("语音生成/播放失败")

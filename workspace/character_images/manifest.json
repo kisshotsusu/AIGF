@@ -1,0 +1,37 @@
+{
+  "primary": "64db0915e4bf4f52a63a6e1b4da9bb58",
+  "images": [
+    {
+      "id": "64db0915e4bf4f52a63a6e1b4da9bb58",
+      "filename": "64db0915e4bf4f52a63a6e1b4da9bb58.png",
+      "original_name": "正面照片.png",
+      "label": "正面照片",
+      "tags": [],
+      "created_at": "2026-07-17T20:28:42"
+    },
+    {
+      "id": "generated-three-view-20260717",
+      "filename": "角色三视图.png",
+      "original_name": "角色三视图.png",
+      "label": "角色正侧背三视图",
+      "tags": ["三视图", "角色设定", "正面", "侧面", "背面"],
+      "created_at": "2026-07-17T21:00:00"
+    },
+    {
+      "id": "generated-chibi-pet-20260717",
+      "filename": "桌宠Q版大头贴.png",
+      "original_name": "桌宠Q版大头贴.png",
+      "label": "Q版桌宠大头贴",
+      "tags": ["Q版", "桌宠", "头像", "透明背景"],
+      "created_at": "2026-07-17T21:00:00"
+    },
+    {
+      "id": "generated-pet-icon-20260717",
+      "filename": "桌宠图标.png",
+      "original_name": "桌宠图标.png",
+      "label": "桌宠窗口图标",
+      "tags": ["Q版", "桌宠", "图标", "透明背景", "170x170"],
+      "created_at": "2026-07-17T21:00:00"
+    }
+  ]
+}

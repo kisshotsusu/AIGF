@@ -1,0 +1,50 @@
+# ============================================================
+# AI-Live (.gitignore)
+# Ignore: Python/Node environments, secret & local config,
+# caches, runtime logs, generated media, and model weights.
+# Keep: source code and *.example templates.
+# ============================================================
+
+# ---- Python virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Python caches / build artifacts ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---- Node (HomeAgent/cli) ----
+node_modules/
+
+# ---- Secret / local config files ----
+# Ignore the real files; keep the *.example templates.
+.env
+.env.*
+!.env.example
+config.yaml
+!config.example.yaml
+
+# ---- Runtime logs ----
+**/logs/
+*.log
+
+# ---- Generated audio ----
+audio/*.wav
+audio/*.mp3
+
+# ---- Local memory dumps ----
+workspace/memory/*.jsonl
+
+# ---- Downloaded model weights (large binaries) ----
+**/models/

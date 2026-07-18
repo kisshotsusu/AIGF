@@ -1,0 +1,9 @@
+.url-input { position: relative; }
+.url-input input { padding-right: 110px; }
+.url-input span {
+  position: absolute; right: 9px; top: 15px; padding: 5px 8px;
+  border-radius: 99px; background: #eeeae1; color: #7b817d;
+  font-size: 10px; font-weight: 800;
+}
+.url-input span.valid { background: #dcebe4; color: #25705c; }
+.url-input span.invalid { background: #f7ddd6; color: #a34e38; }

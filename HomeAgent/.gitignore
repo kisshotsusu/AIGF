@@ -1,0 +1,3 @@
+recordings/*.wav
+logs/*.log
+__pycache__/

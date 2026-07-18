@@ -1,0 +1,44 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+SenseVoiceSmall 语音识别 - MCP Server
+把本地语音识别封装成 MCP 工具, 可被 WorkBuddy / 任意 MCP 客户端调用。
+
+工具:
+  transcribe_file(path, language)       转写本地音频文件(wav/mp3/flac/m4a...)
+  record_and_transcribe(duration, lang) 录音并转写(需麦克风)
+
+运行: python mcp_server.py   (由 MCP 宿主以 stdio 方式拉起)
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from mcp.server.fastmcp import FastMCP
+import asr
+
+mcp = FastMCP("sound-asr")
+
+
+@mcp.tool()
+def transcribe_file(path: str, language: str = "auto") -> str:
+    """转写本地音频文件(wav/mp3/flac/m4a/ogg 等)。
+    path: 音频文件绝对路径; language: auto/zh/en/ja/ko/yue。
+    返回识别文本(含情绪/事件标签的原始输出与清洗后的纯文本)。"""
+    r = asr.transcribe_file(path, language=language)
+    return f"文本: {r['text']}\n原始(含标签): {r['raw']}"
+
+
+@mcp.tool()
+def record_and_transcribe(duration: float = 5.0, language: str = "auto") -> str:
+    """录制麦克风 duration 秒并实时转写(需本机有麦克风)。
+    duration: 录音秒数; language: auto/zh/en/ja/ko/yue。
+    返回识别文本。"""
+    r = asr.record_and_transcribe(duration=duration, language=language)
+    return f"文本: {r['text']}\n原始(含标签): {r['raw']}"
+
+
+if __name__ == "__main__":
+    mcp.run()

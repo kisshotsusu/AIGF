@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI直播角色图像"
+  short_description: "通过多模态模型API生成、编辑、检查并管理AI直播角色形象素材"
+  default_prompt: "使用 $ai-live-character-image 根据角色主形象生成一张新立绘并保存到形象库。"

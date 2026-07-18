@@ -1,0 +1,4 @@
+interface:
+  display_name: "MiMo 角色唱歌"
+  short_description: "使用角色本地 TTS 音色朗读歌词并保留 MiMo 备用分支"
+  default_prompt: "Use $sing-with-mimo to read a short lyric passage with the character's local TTS voice."

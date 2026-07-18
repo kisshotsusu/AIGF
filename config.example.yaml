@@ -1,0 +1,95 @@
+app:
+  room_id: 0                    # B站直播间号，必须修改
+  dry_run: true                 # 首次运行保持 true；确认无误再改 false
+  send_danmaku: false           # false=只生成/播放语音，永远不发送回复弹幕
+  log_level: INFO
+
+bilibili:
+  cookie_env: BILIBILI_COOKIE   # 不要把 Cookie 直接写进配置文件
+  welcome_enabled: true
+  welcome_template: "欢迎 {username} 来到直播间！"
+  welcome_cooldown_seconds: 1800
+  send_interval_seconds: 6
+  max_message_length: 20        # B站普通弹幕常见限制，超长回复自动截断
+
+reply:
+  enabled: true
+  trigger_mode: mention         # mention | all | prefix
+  bot_names: ["小助手", "主播"]
+  prefixes: ["!ai", "问一下"]
+  ignore_users: []
+  cooldown_seconds: 2
+  max_context_messages: 12
+  max_memory_items: 8
+
+llm:
+  provider: deepseek            # deepseek | mimo | custom
+  timeout_seconds: 45
+  temperature: 0.8
+  max_tokens: 120
+  providers:
+    deepseek:
+      base_url: "https://api.deepseek.com"
+      api_key_env: DEEPSEEK_API_KEY
+      model: deepseek-chat
+    mimo:
+      base_url: "https://api.xiaomimimo.com/v1"
+      api_key_env: MIMO_API_KEY
+      model: mimo-v2.5
+    custom:
+      base_url: "http://127.0.0.1:8000/v1"
+      api_key_env: CUSTOM_API_KEY
+      model: local-model
+
+tts:
+  enabled: true
+  url: "http://127.0.0.1:9879/api/tts"
+  health_url: "http://127.0.0.1:9879/api/options"
+  auto_start: true
+  start_command: "E:\\Doc\\SVC\\启动推理.bat"
+  startup_timeout_seconds: 240
+  svc_auto_options: true         # 自动从 /api/options 选择最新模型和参考音频
+  model: ""                     # 留空自动选；也可填写训练轮次，例如 50
+  reference: ""                 # 留空自动选；也可填写参考 wav 的完整路径
+  method: POST
+  timeout_seconds: 60
+  # 可用占位符：{text}、{speaker}。默认按 JSON 发送。
+  request_json:
+    text: "{text}"
+    speed: 1.0
+    top_k: 5
+    top_p: 1.0
+    temperature: 1.0
+  speaker: default               # 供其他兼容语音服务使用
+  # audio: 响应体就是音频；json_base64: JSON 字段里是 base64；json_url: JSON 字段里是音频URL
+  response_type: audio
+  response_field: audio
+  play_audio: true
+
+memory_write:
+  mode: important                # off | all | important
+  importance_threshold: 70       # 0-100，仅达到阈值才写入
+  analyze_with_llm: true         # 用当前模型判断重要度并生成摘要
+  min_message_length: 4
+  max_daily_writes: 20
+  always_keywords: ["记住", "我叫", "我的名字", "我喜欢", "我讨厌", "以后叫我"]
+  ignore_keywords: ["测试", "111", "哈哈"]
+
+image_generation:
+  mode: images                  # images | chat_multimodal
+  base_url: https://api.example.com/v1
+  api_key_env: IMAGE_API_KEY
+  model: your-image-model
+  size: 1024x1024
+  timeout_seconds: 180
+
+workspace:
+  path: workspace
+  identity_file: IDENTITY.yaml
+  soul_file: SOUL.md
+  rules_file: RULES.md
+  abilities_file: ABILITIES.md
+  memory_dir: memory
+  character_image_dir: character_images
+  character_profile_file: CHARACTER.md
+  daily_memory: true

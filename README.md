@@ -56,7 +56,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 | `state/` | 跨进程上下文、维护和任务控制状态 |
 | `logs/` | 直播、HomeAgent、Vision、Sound 日志 |
 | `audio/` | TTS 输出，自动保留最新 20 个音频 |
-| `AI Read/` | 架构、接口、数据、运维和开发进度文档 |
+| `AI Read/` | 架构、接口、数据、运维和开发进度文档（`07_DEVELOPER_REFERENCE.md` 为函数级 API 与已知坑） |
 
 ## 环境与部署
 

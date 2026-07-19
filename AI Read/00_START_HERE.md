@@ -11,6 +11,7 @@
 5. `04_DATA_MEMORY_CONTEXT.md`：身份、记忆、上下文和日志。
 6. `05_OPERATIONS_AND_RULES.md`：启动、验证和修改约束。
 7. `06_CURRENT_STATE.md`：开发进度、当前配置、已验证能力和下一步。
+8. `07_DEVELOPER_REFERENCE.md`：函数级 API、数据契约、配置同步机制与已知坑（改代码前必读）。
 
 ## 一句话概括
 
@@ -41,3 +42,11 @@
 ## 信息优先级
 
 `当前代码与 YAML` > `AI Read` > 根 `README.md` > 各模块历史说明。发现不一致时更新本目录和 README，并在 `06_CURRENT_STATE.md` 记录影响当前开发的决策。
+
+## 本轮（2026-07-20）细化要点
+
+- 直播核心代码只有一份：`modules/live/ai_live_assistant/`。`src/ai_live_assistant/` 是**再导出 shim**，改代码只改前者。
+- Vision MCP 工具集比旧文档更完整（见 `03`，新增 `click`/`ground_page`/`type_active_text`/`vision_memory_status`/`window_double_click`/`desktop_read_clipboard` 等）。
+- HomeAgent 配置新增 `semantic_planner` 与 `progress_reporting` 两节（见 `03`）。
+- 直播控制台 `PUT /api/config`、`PUT /api/secrets` 已服务端保护 `llm/tts/...` 与大部分密钥，这些项归属角色工作台。
+- `CharacterService` 按修改时间双向同步 `config.yaml` ↔ `config.d`（见 `05` 与 `07`）。当前 `computer_control` 在两处不一致，待人工核对。

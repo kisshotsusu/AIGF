@@ -25,6 +25,7 @@
 - CharacterManager 负责 `vision_mcp.gui_enabled/preload_model`；旧 HomeAgent UI 不得覆盖整段视觉配置。
 - 禁用 GUI 时立即停止旧视觉模型进程；`preload_model: false` 表示允许视觉但启动服务时不加载模型，两者不要混淆。
 - MCP 配置同步到 `workspace/MCP_SERVERS.yaml`、WorkBuddy 和 Codex 注册表时保留未修改项。
+- **`HomeAgent/config.yaml` ↔ `config.d/*.yaml` 由 `CharacterService` 按修改时间双向同步**：主配置 `mtime` 新则覆盖拆分文件，反之用拆分文件回填主配置并落盘；`save_config_section` 同时写两处。因此手改其一后，下次经服务读取可能被另一处旧值覆盖——改配置应走角色工作台或在两处一并修改（详见 `07`）。
 
 ## Agent 行为规则
 

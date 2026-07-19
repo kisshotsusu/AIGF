@@ -89,6 +89,8 @@
 - `INTERACT_WORD`/`ENTRY_EFFECT` 依赖 WebSocket；历史弹幕接口只能补弹幕，不能完整补回断线期间所有进场事件。
 - Codex 网络和远端 MCP 可能返回 5xx 或不完整 JSONL，普通网页任务不得依赖它作为首选。
 - 项目中仍保留 Tk 兼容代码与部分历史说明，修改时要确认真实启动入口。
+- `[2026-07-20 文档细化]` `HomeAgent/config.yaml` 的 `computer_control.applications` 有 6 项（含 `网易云音乐`/`cloudmusic`），而 `HomeAgent/config.d/computer_control.yaml` 只有 4 项；两者未对齐，`CharacterService` 下次读取会按 mtime 取其一。建议统一基准后再改。
+- `[2026-07-20 文档细化]` 新增 `07_DEVELOPER_REFERENCE.md`：函数级 API、数据契约、配置同步机制与已知坑；`03` 补全完整 Vision MCP 工具集并新增 `semantic_planner`/`progress_reporting` 两节；`02` 标注 `src/ai_live_assistant` 为 shim、`task_manager` 实际位置。
 
 ## 下一步优先级
 

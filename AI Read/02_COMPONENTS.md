@@ -23,8 +23,12 @@
 - `modules/live/ai_live_assistant/bilibili.py`：直播事件和历史弹幕来源、弹幕发送。
 - `modules/live/ai_live_assistant/llm.py`：OpenAI 兼容 Chat Completions 客户端。
 - `modules/live/ai_live_assistant/tts.py`：9879 服务探活/防重复启动、GPU 串行合成、退避重试、播放和音频清理。
+- `modules/live/ai_live_assistant/config.py`：`load_config` 注入 `_root` 并校验 `room_id>0`；`secret_from_env` 从环境变量读密钥。
 - `modules/live/ai_live_assistant/workspace.py`：人格文档、用户身份映射、每日记忆、近期直播记录。
-- `modules/live/ai_live_assistant/long_term_memory.py`：SQLite 高价值长期记忆。
+- `modules/live/ai_live_assistant/long_term_memory.py`：SQLite 高价值长期记忆（`store` 有硬校验，见 `07`）。
+
+> **单一真相源**：`src/ai_live_assistant/` 只是 `from modules.live.ai_live_assistant.xxx import *` 的兼容再导出 shim，供 `HomeAgent/agent.py` 通过 `src.ai_live_assistant.*` 引用。改直播核心代码只改 `modules/live/ai_live_assistant/`。
+> `task_manager`（HomeAgent 的任务调度）不在 `HomeAgent/` 本地，而在 `Skill/schedule-home-task/scripts/task_manager.py`；`agent.py` 启动时把该目录加入 `sys.path` 后以 `from task_manager import TaskStore` 使用。
 - `HomeAgent/agent.py`：家庭 Agent、MiMo 语义计划、本地工具优先路由、Codex/MCP 后备、TTS 和上下文维护。
 - `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入、设置和重启恢复；`app.py` 保留 Tk 后备和 Qt 转发入口。
 - `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。

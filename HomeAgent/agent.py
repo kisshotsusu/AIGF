@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import difflib
 import json
 import os
 import re
@@ -36,6 +37,7 @@ from src.ai_live_assistant.tts import TTSClient, cleanup_audio_files
 from src.ai_live_assistant.workspace import Workspace
 from src.ai_live_assistant.long_term_memory import LongTermMemoryStore
 from task_manager import TaskStore
+from self_upgrade import SelfUpgradeManager
 
 
 class HomeAgent:
@@ -59,14 +61,29 @@ class HomeAgent:
         self.vision_service_lock = threading.Lock()
         self.sound_service_process: subprocess.Popen | None = None
         self.sound_service_lock = threading.Lock()
+        self.self_upgrade = SelfUpgradeManager(ROOT, HOME_AGENT, self.config)
+        self.restart_requested = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
         threading.Thread(target=self.ensure_sound_service, daemon=True, name="sound-mcp-autostart").start()
         self.character_name = "小助手"
         self.refresh_identity()
         self.log_event("long_term_memory_migration", result=migration, total=self.long_term_memory.count())
 
-    def begin_task(self) -> None:
+    def begin_task(self, prompt: str = "", resumed: bool = False) -> None:
         self.cancel_event.clear()
+        if prompt:
+            self.self_upgrade.begin(prompt, resumed=resumed)
+
+    def update_task_recovery(self, current: str, completed: list[str]) -> None:
+        self.self_upgrade.progress(current, completed)
+
+    def finalize_task_recovery(self, answer: str) -> bool:
+        self.restart_requested = self.self_upgrade.finalize(answer)
+        self.log_event("task_recovery_finalized", restart_requested=self.restart_requested)
+        return self.restart_requested
+
+    def recover_interrupted_task(self) -> str:
+        return self.self_upgrade.resume_prompt()
 
     def stop_current_task(self) -> bool:
         """Cancel current tool work without stopping persistent services."""
@@ -85,6 +102,7 @@ class HomeAgent:
             except Exception as exc:
                 self.log_event("task_stop_process_error", error=str(exc), pid=pid)
         self.log_event("current_task_stop_requested", pid=pid)
+        self.self_upgrade.cancel()
         return bool(pid)
 
     def log_event(self, event: str, **data: Any) -> None:
@@ -209,6 +227,8 @@ class HomeAgent:
         cfg = self._codex_config()
         if not cfg.get("enabled", False):
             return False
+        if self.self_upgrade.is_upgrade_request(text):
+            return True
         mode = str(cfg.get("trigger_mode", "auto")).lower()
         if mode == "always":
             return True
@@ -222,6 +242,48 @@ class HomeAgent:
         if not cfg.get("enabled", True) or not cfg.get("gui_enabled", True) or not self._codex_config().get("enabled", False): return False
         lowered = str(text).lower()
         return any(str(word).strip().lower() in lowered for word in cfg.get("trigger_keywords", []) if str(word).strip())
+
+    @staticmethod
+    def _favorite_folder_key(value: str) -> str:
+        """Convert a conversational folder mention or API title to a comparable key."""
+        name = str(value or "").strip()
+        name = re.sub(r"[\s,，。.!！?？:：、;；'\"“”‘’]+", "", name)
+        for _ in range(4):
+            previous = name
+            name = re.sub(r"^(?:(?:请|麻烦)?(?:帮我)?(?:打开|进入|查看))+", "", name)
+            name = re.sub(r"^(?:(?:bilibili|哔哩哔哩|B站)(?:里|中|的)*)+", "", name, flags=re.I)
+            name = re.sub(r"^(?:(?:我|本人)的)+", "", name)
+            if name == previous:
+                break
+        name = re.sub(r"(?:收藏夹|收藏)$", "", name)
+        return name.casefold()
+
+    @staticmethod
+    def _normalize_favorite_folder_name(value: str) -> str:
+        """Produce a display/API candidate without enumerating whole user phrases."""
+        key = HomeAgent._favorite_folder_key(value)
+        return "默认收藏夹" if not key or key == "默认" else f"{key}收藏夹"
+
+    @staticmethod
+    def _resolve_favorite_folder(requested: str, folders: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """Resolve against the account's live folder titles using exact and scored evidence."""
+        requested_key = HomeAgent._favorite_folder_key(requested)
+        candidates = [(item, str(item.get("title", "")).strip(), HomeAgent._favorite_folder_key(item.get("title", ""))) for item in folders]
+        exact = [item for item, _title, key in candidates if key == requested_key]
+        if len(exact) == 1:
+            return exact[0], []
+        scored: list[dict[str, Any]] = []
+        for item, title, key in candidates:
+            if not key:
+                continue
+            containment = bool(requested_key and (requested_key in key or key in requested_key))
+            ratio = difflib.SequenceMatcher(None, requested_key, key).ratio()
+            score = max(ratio, 0.92 if containment else 0.0)
+            scored.append({"item": item, "title": title, "key": key, "score": score})
+        scored.sort(key=lambda row: row["score"], reverse=True)
+        if scored and scored[0]["score"] >= 0.82 and (len(scored) == 1 or scored[0]["score"] - scored[1]["score"] >= 0.08):
+            return scored[0]["item"], scored
+        return None, scored
 
     @staticmethod
     def _analyze_task(text: str, context: str = "") -> dict[str, Any]:
@@ -246,8 +308,8 @@ class HomeAgent:
                 compact_context = context_value.replace(" ", "")
                 matches = list(re.finditer(r"(?:打开)?(?:我的)?(?:(?:bilibili|哔哩哔哩|B站)的?)?([^\n：:]{1,30}?)收藏夹", compact_context, re.I))
             folder_match = matches[-1] if matches else None
-            folder_name = str(folder_match.group(1) if folder_match else "默认").strip() or "默认"
-            if folder_name in {"默认", "我的默认"}: folder_name = "默认收藏夹"
+            raw_folder_name = str(folder_match.group(1) if folder_match else "默认")
+            folder_name = HomeAgent._normalize_favorite_folder_name(raw_folder_name)
         action_words = [word for word in ("打开", "换成", "搜索", "查找", "找", "点击", "选择", "播放", "填写", "提交", "登录", "下载") if word in value]
         query = HomeAgent._visual_search_query(value) if (is_bilibili or is_cloudmusic) else ""
         if inherited_bilibili and query in {"这个", "那个", "它", "这一个", "那一个"}:
@@ -722,8 +784,13 @@ class HomeAgent:
                 async with session.get(f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={mid}") as response:
                     folders = await response.json(content_type=None)
                 folder_list = ((folders.get("data") or {}).get("list") or []) if folders.get("code") == 0 else []
-                default_folder = next((item for item in folder_list if str(item.get("title", "")).strip().lower() == folder_name.strip().lower()), None)
-                if not default_folder: raise RuntimeError(f"Bilibili 接口没有返回名为“{folder_name}”的收藏夹")
+                requested = self._normalize_favorite_folder_name(folder_name)
+                default_folder, ranked_folders = self._resolve_favorite_folder(requested, folder_list)
+                if not default_folder:
+                    available = "、".join(str(item.get("title", "")).strip() for item in folder_list[:12] if str(item.get("title", "")).strip()) or "无"
+                    ranked = "、".join(f"{row['title']}({row['score']:.2f})" for row in ranked_folders[:3])
+                    raise RuntimeError(f"无法唯一匹配收藏夹“{requested}”；当前可用收藏夹：{available}；最接近：{ranked or '无'}")
+                folder_name = str(default_folder.get("title") or requested).strip()
                 page_number = (index - 1) // 20 + 1; page_index = (index - 1) % 20
                 media_id = int(default_folder["id"])
                 resource_url = f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={media_id}&pn={page_number}&ps=20&keyword=&order=mtime&type=0&tid=0&platform=web"
@@ -994,14 +1061,14 @@ class HomeAgent:
             else: chunks.append(piece)
         return chunks or ([normalized] if normalized else [])
 
-    async def _speak_home(self, session: aiohttp.ClientSession, text: str, status=None) -> list[str]:
+    async def _speak_home(self, session: aiohttp.ClientSession, text: str, status=None, ignore_cancel: bool = False) -> list[str]:
         await asyncio.to_thread(self.tts_execution_lock.acquire)
         try:
-            return await self._speak_home_unlocked(session, text, status)
+            return await self._speak_home_unlocked(session, text, status, ignore_cancel=ignore_cancel)
         finally:
             self.tts_execution_lock.release()
 
-    async def _speak_home_unlocked(self, session: aiohttp.ClientSession, text: str, status=None) -> list[str]:
+    async def _speak_home_unlocked(self, session: aiohttp.ClientSession, text: str, status=None, ignore_cancel: bool = False) -> list[str]:
         chunks = self._home_tts_chunks(text)
         client = TTSClient(session, self.project["tts"], ROOT / "audio"); paths: list[str] = []
         self.log_event("home_tts_split", chunks=len(chunks), chunk_chars=self.config.get("home", {}).get("tts_chunk_chars", 90))
@@ -1011,7 +1078,7 @@ class HomeAgent:
         async def generate() -> None:
             try:
                 for index, chunk in enumerate(chunks, start=1):
-                    if self.cancel_event.is_set():
+                    if self.cancel_event.is_set() and not ignore_cancel:
                         self.log_event("home_tts_cancelled", stage="generate", index=index)
                         break
                     if status: status(f"正在生成语音 {index}/{len(chunks)}…")
@@ -1026,7 +1093,7 @@ class HomeAgent:
             while True:
                 item = await queue.get()
                 if item is None: break
-                if self.cancel_event.is_set():
+                if self.cancel_event.is_set() and not ignore_cancel:
                     self.log_event("home_tts_cancelled", stage="play")
                     break
                 index, path = item
@@ -1112,7 +1179,7 @@ class HomeAgent:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, f"好呀，我去{visual_target}帮你找找{visual_query or '想要的内容'}。", status)
             is_favorite_request = "收藏夹" in text or ("收藏" in text and any(word in text for word in ("第", "默认", "我的")))
-            operation_timeout = max(60 if is_favorite_request else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
+            operation_timeout = max(120 if is_favorite_request else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
             try:
                 is_bilibili = task_plan.get("site") == "bilibili"
                 # Bilibili has deterministic DOM verification and must not be
@@ -1125,7 +1192,14 @@ class HomeAgent:
                 self.log_event("direct_vision_total_timeout", limit_seconds=operation_timeout)
             if direct_visual is None:
                 direct_visual = {"error": "图像 GUI 识别已禁用，而且该目标不是可直接读取的网页"}
-            if direct_visual.get("error") and self._codex_config().get("enabled", False):
+            deterministic_parameter_error = bool(
+                task_plan.get("handler") == "bilibili_favorites"
+                and direct_visual.get("error")
+                and any(marker in str(direct_visual.get("error")) for marker in ("找不到收藏夹", "没有第", "缺少有效 BV"))
+            )
+            if deterministic_parameter_error:
+                self.log_event("deterministic_failure_preserved", handler=task_plan.get("handler"), error=direct_visual.get("error"))
+            if direct_visual.get("error") and not deterministic_parameter_error and self._codex_config().get("enabled", False):
                 previous_failure = str(direct_visual["error"])
                 self.log_event("deterministic_route_fallback", handler=task_plan.get("handler"), error=previous_failure)
                 if status: status("固定流程未完成，正在切换通用 Agent 继续处理…")
@@ -1138,11 +1212,15 @@ class HomeAgent:
                     )
                 except asyncio.TimeoutError:
                     self.stop_current_task(); direct_visual = {"error": f"固定流程失败后，通用 Agent 在 {fallback_timeout} 秒内也未完成"}
-            answer = (await self._natural_visual_failure(text, str(direct_visual["error"])) if direct_visual.get("error")
-                      else str(direct_visual.get("answer", "好啦，已经帮你操作完成了。")))
+            if direct_visual.get("error") and deterministic_parameter_error:
+                answer = f"这次没有执行完成：{direct_visual['error']}。我保留了实际错误和可用选项，没有再盲目切换其他流程。"
+            elif direct_visual.get("error"):
+                answer = await self._natural_visual_failure(text, str(direct_visual["error"]))
+            else:
+                answer = str(direct_visual.get("answer", "好啦，已经帮你操作完成了。"))
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
             async with aiohttp.ClientSession() as session:
-                if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status)
+                if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status, ignore_cancel=True)
             return answer
         web_route = self._is_multistep_web_request(text) or self._has_recent_web_context(text)
         vision_route = self._should_route_to_vision(text)

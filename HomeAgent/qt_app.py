@@ -45,6 +45,7 @@ class ChatWorker(QThread):
     def __init__(self, agent: HomeAgent, prompt: str, bridge: Bridge, confirm):
         super().__init__(); self.agent = agent; self.prompt = prompt; self.bridge = bridge; self.confirm = confirm
         self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.last_report_at = 0.0; self.report_count = 0
+        self.agent.begin_task(prompt, resumed=prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"))
 
     async def progress_clock(self):
         while True:
@@ -67,6 +68,7 @@ class ChatWorker(QThread):
         else: self.current_step = value
         elapsed = max(0, int(time.monotonic() - self.started_at))
         snapshot = {"current": self.current_step, "completed": list(self.completed_steps), "elapsed": elapsed, "state": "running"}
+        self.agent.update_task_recovery(self.current_step, self.completed_steps)
         self.bridge.status.emit(value); self.bridge.progress.emit(snapshot)
         cfg = self.agent.config.get("progress_reporting", {})
         threshold = max(15, int(cfg.get("long_task_seconds", 60))); cooldown = max(30, int(cfg.get("tts_cooldown_seconds", 90))); limit = max(0, int(cfg.get("max_reports_per_task", 3)))
@@ -81,7 +83,9 @@ class ChatWorker(QThread):
             asyncio.set_event_loop(self.loop)
             self.task = self.loop.create_task(self.agent.chat(self.prompt, self.report_status, self.confirm))
             self.clock = self.loop.create_task(self.progress_clock())
-            self.bridge.answer.emit(self.loop.run_until_complete(self.task))
+            answer = self.loop.run_until_complete(self.task)
+            self.agent.finalize_task_recovery(answer)
+            self.bridge.answer.emit(answer)
         except asyncio.CancelledError:
             self.bridge.answer.emit("当前任务已停止。")
         except Exception as exc:
@@ -157,6 +161,13 @@ class SettingsDialog(QDialog):
         progress_page=QWidget(); progress_form=QFormLayout(progress_page); progress_cfg=cfg.get("progress_reporting",{}); self.progress_enabled=QCheckBox("长任务自动进行语音进度汇报");self.progress_enabled.setChecked(bool(progress_cfg.get("enabled",True)));self.progress_seconds=QSpinBox();self.progress_seconds.setRange(15,1800);self.progress_seconds.setSuffix(" 秒");self.progress_seconds.setValue(int(progress_cfg.get("long_task_seconds",60)));self.progress_cooldown=QSpinBox();self.progress_cooldown.setRange(30,3600);self.progress_cooldown.setSuffix(" 秒");self.progress_cooldown.setValue(int(progress_cfg.get("tts_cooldown_seconds",90)));self.progress_reports=QSpinBox();self.progress_reports.setRange(0,10);self.progress_reports.setValue(int(progress_cfg.get("max_reports_per_task",3)));progress_form.addRow("进度播报",self.progress_enabled);progress_form.addRow("长任务判定",self.progress_seconds);progress_form.addRow("播报冷却",self.progress_cooldown);progress_form.addRow("单任务最多播报",self.progress_reports);tabs.addTab(progress_page,"任务进度")
         self.progress_enabled.toggled.connect(self.save);self.progress_seconds.valueChanged.connect(self.save);self.progress_cooldown.valueChanged.connect(self.save);self.progress_reports.valueChanged.connect(self.save)
         close = QPushButton("完成"); close.setObjectName("primaryButton"); close.clicked.connect(self.accept); root.addWidget(close, 0, Qt.AlignRight)
+        upgrade_page = QWidget(); upgrade_form = QFormLayout(upgrade_page); upgrade_cfg = cfg.get("self_upgrade", {})
+        self.upgrade_enabled = QCheckBox("允许 Home Agent 编辑和升级自身"); self.upgrade_enabled.setChecked(bool(upgrade_cfg.get("enabled", True)))
+        self.upgrade_restart = QCheckBox("升级代码后自动重启并继续任务"); self.upgrade_restart.setChecked(bool(upgrade_cfg.get("auto_restart", True)))
+        self.upgrade_validation = QCheckBox("重启前强制校验代码和配置"); self.upgrade_validation.setChecked(bool(upgrade_cfg.get("require_validation", True)))
+        self.upgrade_attempts = QSpinBox(); self.upgrade_attempts.setRange(1, 5); self.upgrade_attempts.setValue(int(upgrade_cfg.get("max_restart_attempts", 2)))
+        upgrade_form.addRow("自主升级", self.upgrade_enabled); upgrade_form.addRow("自动恢复", self.upgrade_restart); upgrade_form.addRow("安全校验", self.upgrade_validation); upgrade_form.addRow("最多连续重启", self.upgrade_attempts); tabs.addTab(upgrade_page, "自主升级")
+        self.upgrade_enabled.toggled.connect(self.save); self.upgrade_restart.toggled.connect(self.save); self.upgrade_validation.toggled.connect(self.save); self.upgrade_attempts.valueChanged.connect(self.save)
         self.timer = QTimer(self); self.timer.setSingleShot(True); self.timer.timeout.connect(self.save)
 
     def defer_save(self): self.status.setText("正在保存…"); self.timer.start(450)
@@ -172,6 +183,7 @@ class SettingsDialog(QDialog):
             cfg.setdefault("codex_cli", {})["enabled"] = self.codex.isChecked()
             stt = cfg.setdefault("stt", {}); stt["mode"] = self.stt_mode.currentText(); stt["api_url"] = self.stt_url.text().strip(); stt["model"] = self.stt_model.text().strip(); stt["language"] = self.stt_language.text().strip() or "auto"
             progress=cfg.setdefault("progress_reporting",{});progress["enabled"]=self.progress_enabled.isChecked();progress["long_task_seconds"]=self.progress_seconds.value();progress["tts_cooldown_seconds"]=self.progress_cooldown.value();progress["max_reports_per_task"]=self.progress_reports.value()
+            upgrade = cfg.setdefault("self_upgrade", {}); upgrade["enabled"] = self.upgrade_enabled.isChecked(); upgrade["auto_restart"] = self.upgrade_restart.isChecked(); upgrade["require_validation"] = self.upgrade_validation.isChecked(); upgrade["max_restart_attempts"] = self.upgrade_attempts.value()
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
             self.agent.config = cfg; self.owner.apply_always_on_top(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
         except Exception as exc: self.status.setText(f"保存失败：{exc}")
@@ -197,7 +209,9 @@ class HomeAgentWindow(QMainWindow):
         super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
         self.setWindowTitle(f"{self.agent.character_name} · Home Agent"); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window); self.setAttribute(Qt.WA_TranslucentBackground); self.resize(860, 380); self.setMinimumSize(640, 300)
         self._build(); self._connect(); self.apply_always_on_top()
+        self.bridge.finished.connect(self._restart_if_requested)
         self.scheduler = QTimer(self); self.scheduler.timeout.connect(self.poll_tasks); self.scheduler.start(10000)
+        QTimer.singleShot(1800, self.resume_interrupted_task)
 
     def _build(self):
         shell = QFrame(); shell.setObjectName("shell"); self.setCentralWidget(shell)
@@ -241,6 +255,24 @@ class HomeAgentWindow(QMainWindow):
     def finish_task(self):
         if self.progress_card:self.progress_card.finish(self.task_cancelled)
         self.send_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.set_status("就绪"); self.input.setFocus()
+
+    def resume_interrupted_task(self):
+        prompt = self.agent.recover_interrupted_task()
+        if not prompt or (self.worker and self.worker.isRunning()):
+            return
+        self.append_message("assistant", self.agent.character_name, "检测到重启前未完成的任务，正在继续执行。")
+        self.input.setPlainText(prompt)
+        self.send()
+
+    def _restart_if_requested(self):
+        if self.agent.restart_requested:
+            self.set_status("升级完成，正在重启并继续任务…")
+            QTimer.singleShot(800, self.restart_for_upgrade)
+
+    def restart_for_upgrade(self):
+        self.agent.self_upgrade.launch_restart_watchdog(os.getpid())
+        self.force_quit = True
+        QApplication.quit()
 
     def confirm_action(self, description):
         request = {"event": threading.Event(), "ok": False}

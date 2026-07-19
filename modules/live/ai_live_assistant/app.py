@@ -31,12 +31,22 @@ class LiveAssistant:
         self.last_context_control_token = ""
         self._load_live_context_state()
         self.welcomed: dict[str, float] = {}
+        self._welcoming: set[str] = set()
         self.last_reply: dict[str, float] = {}
         self.send_lock = asyncio.Lock()
         self.message_log = self.root / "logs" / "messages.jsonl"
         self.message_log.parent.mkdir(parents=True, exist_ok=True)
         self.recent_danmaku: dict[tuple[str, str], float] = {}
         self.last_gift_reply: dict[str, float] = {}
+        self._speech_queue: asyncio.PriorityQueue[tuple[int, int, str, asyncio.Future[bool]]] | None = None
+        self._speech_sequence = 0
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    def _start_background_task(self, coroutine: Any) -> None:
+        """Keep fire-and-forget handlers alive and make their failures visible."""
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     @staticmethod
     def _shorten_live_reply(reply: str, limit: int) -> str:
@@ -61,6 +71,7 @@ class LiveAssistant:
             self.long_term_memory = LongTermMemoryStore(self.root / "LongTermMemory")
             self.long_term_memory.migrate_legacy(self.workspace.root / self.workspace.cfg.get("memory_dir", "memory"))
             self.bili = bili
+            self._speech_queue = asyncio.PriorityQueue()
             self.log.info(
                 "正在连接 B站直播间 %s（dry_run=%s, send_danmaku=%s）",
                 bili.room_id,
@@ -70,7 +81,7 @@ class LiveAssistant:
             queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
             async def produce(stream) -> None:
                 async for item in stream: await queue.put(item)
-            producers = [asyncio.create_task(produce(bili.events())), asyncio.create_task(produce(bili.history_events())), asyncio.create_task(self._context_cleanup_loop())]
+            producers = [asyncio.create_task(produce(bili.events())), asyncio.create_task(produce(bili.history_events())), asyncio.create_task(self._context_cleanup_loop()), asyncio.create_task(self._speech_worker())]
             try:
                 while True: await self.handle_event(await queue.get())
             finally:
@@ -104,14 +115,16 @@ class LiveAssistant:
                 self._append_live_context("user", f"[观众用户名: {user}]\n[{identity_label}]\n弹幕内容: {text}")
                 should_reply, reason = self._should_reply(user, text)
                 self._record_message("received", user, text, status="triggered" if should_reply else "skipped", reason=reason)
-                if should_reply: asyncio.create_task(self._smart_reply(user, text))
+                if should_reply: self._start_background_task(self._smart_reply(user, text))
         elif cmd == "SEND_GIFT":
             await self._handle_gift(event.get("data", {}))
         elif cmd in {"INTERACT_WORD", "ENTRY_EFFECT"}:
             data = event.get("data", {})
             user = str(data.get("uname") or data.get("copy_writing") or "新朋友")
             uid = str(data.get("uid") or user)
-            if self.cfg["bilibili"].get("welcome_enabled", True): asyncio.create_task(self._welcome(uid, user))
+            if self.cfg["bilibili"].get("welcome_enabled", True):
+                self._record_message("welcome", user, "", status="received", uid=uid, command=cmd)
+                self._start_background_task(self._welcome(uid, user))
 
     def _is_masked_username(self, user: str) -> bool:
         return bool(self.cfg.get("reply", {}).get("ignore_masked_usernames", True) and "***" in str(user))
@@ -147,12 +160,29 @@ class LiveAssistant:
         await self._emit(reply)
 
     async def _welcome(self, uid: str, user: str) -> None:
-        if self._is_masked_username(user): return
+        if self._is_masked_username(user):
+            self._record_message("welcome", user, "", status="skipped", reason="masked_username", uid=uid)
+            return
         now = time.monotonic(); cooldown = self.cfg["bilibili"].get("welcome_cooldown_seconds", 1800)
-        if now - self.welcomed.get(uid, 0) < cooldown: return
-        self.welcomed[uid] = now
+        if now - self.welcomed.get(uid, 0) < cooldown:
+            self._record_message("welcome", user, "", status="skipped", reason="cooldown", uid=uid)
+            return
+        if uid in self._welcoming:
+            self._record_message("welcome", user, "", status="skipped", reason="already_queued", uid=uid)
+            return
+        self._welcoming.add(uid)
         safe_user = re.sub(r"[\r\n]", "", user)[:12]
-        await self._emit(self.cfg["bilibili"]["welcome_template"].format(username=safe_user))
+        text = self.cfg["bilibili"]["welcome_template"].format(username=safe_user)
+        try:
+            success = await self._emit(text, speech_priority=0)
+            if success:
+                # A failed/busy TTS attempt must not consume the user's welcome cooldown.
+                self.welcomed[uid] = time.monotonic()
+                self._record_message("welcome", user, "", status="success", uid=uid, reply=text)
+            else:
+                self._record_message("welcome", user, "", status="error", reason="tts_failed", uid=uid, reply=text)
+        finally:
+            self._welcoming.discard(uid)
 
     def _should_reply(self, user: str, text: str) -> tuple[bool, str]:
         rc = self.cfg["reply"]
@@ -313,12 +343,42 @@ class LiveAssistant:
             self.log.warning("SQLite长期记忆写入失败: %s", exc)
         self._record_message("memory", user, message, status="success", reason=f"importance:{score}", summary=summary)
 
-    async def _emit(self, text: str) -> None:
+    async def _speech_worker(self) -> None:
+        """Serialize GPU synthesis/playback without blocking event ingestion."""
+        assert self._speech_queue is not None
+        while True:
+            _, _, text, completed = await self._speech_queue.get()
+            try:
+                await self.tts.speak(text)
+            except asyncio.CancelledError:
+                if not completed.done(): completed.cancel()
+                raise
+            except Exception as exc:
+                self.log.exception("语音生成/播放最终失败（已完成内部重试）")
+                if not completed.done(): completed.set_result(False)
+                self._record_message("speech", "", text, status="error", error=str(exc))
+            else:
+                if not completed.done(): completed.set_result(True)
+                self._record_message("speech", "", text, status="success")
+            finally:
+                self._speech_queue.task_done()
+
+    async def _emit(self, text: str, speech_priority: int = 10) -> bool:
         self.log.info("回复: %s", text)
         async with self.send_lock:
             if self.cfg["app"].get("send_danmaku", False) and not self.cfg["app"].get("dry_run", True):
                 limit = int(self.cfg["bilibili"].get("max_message_length", 20))
                 await self.bili.send_danmaku(text[:limit])
                 await asyncio.sleep(self.cfg["bilibili"].get("send_interval_seconds", 6))
+        if not self.cfg.get("tts", {}).get("enabled", True): return True
+        if self._speech_queue is None:
             try: await self.tts.speak(text)
-            except Exception: self.log.exception("语音生成/播放失败")
+            except Exception:
+                self.log.exception("语音生成/播放失败")
+                return False
+            return True
+        completed: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._speech_sequence += 1
+        await self._speech_queue.put((speech_priority, self._speech_sequence, text, completed))
+        self.log.info("语音已排队: priority=%s queue=%s", speech_priority, self._speech_queue.qsize())
+        return await completed

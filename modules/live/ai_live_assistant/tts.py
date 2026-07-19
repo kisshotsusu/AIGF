@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -49,6 +50,9 @@ class TTSClient:
     def __init__(self, session: aiohttp.ClientSession, cfg: dict[str, Any], audio_dir: Path):
         self.session, self.cfg, self.audio_dir = session, cfg, audio_dir
         self.service_process: subprocess.Popen | None = None
+        self._service_start_lock = asyncio.Lock()
+        self._synthesis_lock = asyncio.Lock()
+        self._cached_options: dict[str, Any] | None = None
         audio_dir.mkdir(parents=True, exist_ok=True)
         cleanup_audio_files(audio_dir, 20)
 
@@ -57,32 +61,57 @@ class TTSClient:
         if not url:
             return None
         try:
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=2)) as r:
-                return await r.json() if r.status == 200 else None
+            timeout = max(2.0, float(self.cfg.get("health_timeout_seconds", 6)))
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status != 200: return None
+                value = await r.json()
+                if isinstance(value, dict): self._cached_options = value
+                return value
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return None
 
+    async def _service_reachable(self) -> bool:
+        """A busy inference server may time out on /options but must not be started twice."""
+        parsed = urlparse(str(self.cfg.get("url", "")))
+        if not parsed.hostname: return False
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(parsed.hostname, port), timeout=1.5)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (OSError, asyncio.TimeoutError):
+            return False
+
     async def ensure_service(self) -> dict[str, Any] | None:
         options = await self._options()
-        if options is not None or not self.cfg.get("auto_start", False):
-            return options
-        command = self.cfg.get("start_command")
-        if not command or not Path(command).exists():
-            raise RuntimeError(f"找不到语音服务启动文件: {command}")
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        args = ["cmd.exe", "/c", command] if os.name == "nt" else [command]
-        self.service_process = subprocess.Popen(args, cwd=str(Path(command).parent), creationflags=flags)
-        deadline = time.monotonic() + float(self.cfg.get("startup_timeout_seconds", 240))
-        while time.monotonic() < deadline:
-            if self.service_process.poll() is not None:
-                raise RuntimeError("语音服务启动失败，请检查 E:\\Doc\\SVC\\gpt-sovits.log")
-            await asyncio.sleep(1)
+        if options is not None: return options
+        if await self._service_reachable():
+            # The existing process is accepting connections. Reuse cached model data
+            # and let synthesis retry instead of launching another GPU-heavy service.
+            if self._cached_options is not None: return self._cached_options
+            raise TimeoutError("语音服务端口存在，但健康接口正忙")
+        if not self.cfg.get("auto_start", False): return None
+        async with self._service_start_lock:
             options = await self._options()
-            if options is not None:
-                return options
-        raise TimeoutError("等待 SVC 语音服务启动超时")
+            if options is not None: return options
+            if await self._service_reachable(): return self._cached_options
+            command = self.cfg.get("start_command")
+            if not command or not Path(command).exists():
+                raise RuntimeError(f"找不到语音服务启动文件: {command}")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            args = ["cmd.exe", "/c", command] if os.name == "nt" else [command]
+            self.service_process = subprocess.Popen(args, cwd=str(Path(command).parent), creationflags=flags)
+            deadline = time.monotonic() + float(self.cfg.get("startup_timeout_seconds", 240))
+            while time.monotonic() < deadline:
+                if self.service_process.poll() is not None:
+                    raise RuntimeError("语音服务启动失败，请检查 GPT-SoVITS 服务日志")
+                await asyncio.sleep(1)
+                options = await self._options()
+                if options is not None: return options
+            raise TimeoutError("等待 SVC 语音服务启动超时")
 
-    async def synthesize(self, text: str) -> Path | None:
+    async def _synthesize_once(self, text: str) -> Path | None:
         """只生成音频文件，不播放，供流水线提前推理后续分段。"""
         if not self.cfg.get("enabled", True): return None
         safe_text = _tts_safe_text(text)
@@ -122,6 +151,25 @@ class TTSClient:
         path.write_bytes(content)
         cleanup_audio_files(self.audio_dir, 20)
         return path
+
+    async def synthesize(self, text: str) -> Path | None:
+        """Serialize GPU work and retry transient overload/timeouts without dropping speech."""
+        attempts = max(1, int(self.cfg.get("retry_attempts", 4)))
+        base_delay = max(0.1, float(self.cfg.get("retry_delay_seconds", 2.0)))
+        async with self._synthesis_lock:
+            for attempt in range(1, attempts + 1):
+                try:
+                    return await self._synthesize_once(text)
+                except asyncio.CancelledError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                    if attempt >= attempts: raise
+                    delay = min(base_delay * (2 ** (attempt - 1)), 15.0)
+                    logging.getLogger("ai_live").warning(
+                        "TTS 暂时不可用，第 %s/%s 次失败，%.1f 秒后重试: %s",
+                        attempt, attempts, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
 
     async def play(self, path: Path) -> None:
         """等待当前文件播放完毕；由单消费者顺序调用可避免声音重叠。"""

@@ -4,8 +4,8 @@
 |---|---|---|
 | `main.py` | 直播助手 CLI 入口、配置检查 | `python main.py --config config.yaml` |
 | `modules/live/ai_live_assistant/` | 直播业务核心 | `app.py`、`bilibili.py`、`llm.py`、`tts.py`、`workspace.py` |
-| `manager.py` + `web/` | 直播管理后台和 REST API | `启动管理页面.bat`，端口 9888 |
-| `CharacterManager/` | 角色管理 Tkinter 程序 | `启动角色管理器.bat` |
+| `modules/live/manager.py` + `modules/live/web/` | 直播管理后台和 REST API；根 `manager.py` 为兼容入口 | `启动管理页面.bat`，端口 9888 |
+| `CharacterManager/` | 角色数据服务、默认 PySide6 UI、Tk 兼容后备 | `启动角色管理器.bat` |
 | `HomeAgent/` | 家庭桌宠、工具循环、语音输入、任务调度 | `HomeAgent/启动家庭Agent.bat` |
 | `Vision/` | 网页 DOM MCP、可选 GUI 图像识别 | `mcp_server.py`，端口 8765 |
 | `Sound/` | SenseVoice 本地 STT MCP | `Sound/mcp_server.py` |
@@ -19,16 +19,18 @@
 
 ## 核心 Python 模块
 
-- `modules/live/ai_live_assistant/app.py`：`LiveAssistant`，直播事件、回复、上下文、记忆与礼物回复。
+- `modules/live/ai_live_assistant/app.py`：`LiveAssistant`，直播事件、回复、上下文、记忆、礼物、欢迎去重与优先语音队列。
 - `modules/live/ai_live_assistant/bilibili.py`：直播事件和历史弹幕来源、弹幕发送。
 - `modules/live/ai_live_assistant/llm.py`：OpenAI 兼容 Chat Completions 客户端。
-- `modules/live/ai_live_assistant/tts.py`：9879 服务启动、合成、播放、音频清理。
+- `modules/live/ai_live_assistant/tts.py`：9879 服务探活/防重复启动、GPU 串行合成、退避重试、播放和音频清理。
 - `modules/live/ai_live_assistant/workspace.py`：人格文档、用户身份映射、每日记忆、近期直播记录。
 - `modules/live/ai_live_assistant/long_term_memory.py`：SQLite 高价值长期记忆。
-- `HomeAgent/agent.py`：家庭 Agent、确定性路由、工具、Codex/MCP、TTS、上下文维护。
-- `HomeAgent/app.py`：桌宠 UI、右键菜单、停止任务、设置和日志页。
-- `CharacterManager/app.py`：角色工作台所有管理页面。
-- `Vision/agent.py`：Playwright DOM 操作、可选 GUI-Actor、Windows 窗口工具。
+- `HomeAgent/agent.py`：家庭 Agent、MiMo 语义计划、本地工具优先路由、Codex/MCP 后备、TTS 和上下文维护。
+- `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入、设置和重启恢复；`app.py` 保留 Tk 后备和 Qt 转发入口。
+- `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。
+- `CharacterManager/service.py`：UI 无关的数据接口、原子保存、配置文档拆分和未知字段保留。
+- `CharacterManager/qt_app.py`：默认角色工作台；`app.py --legacy-tk` 启动旧 Tk 前端。
+- `Vision/agent.py`：现有浏览器 CDP/DOM、独立 Playwright、懒加载 GUI-Actor、Windows 窗口工具和操作后截图验证。
 - `Vision/mcp_server.py`：FastMCP 工具注册；网页工具固定在单一专用线程共享浏览器会话。
 - `Vision/mcp_call.py`：系统 Python 到项目 `.venv` MCP 客户端桥。
 
@@ -38,3 +40,7 @@
 - `schedule-home-task`：提醒、闹钟、一次性/周期任务。
 - `sing-with-mimo`：默认本地 TTS 朗读歌词，MiMo 为关闭的备用分支。
 - `web-agent-operator`：无图像识别的多步网页操作与最终状态验证。
+
+## 回归测试
+
+- `modules/live/tests/test_reliable_speech.py`：直播 TTS 暂态失败重试、欢迎冷却提交时机、重复进场合并。

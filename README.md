@@ -1,199 +1,142 @@
 # AI 直播工具箱
 
-一套围绕「B站 AI 直播弹幕助手」的本地 AI 工具集合，包含直播弹幕回复、角色管理、家庭桌宠、
-GUI 网页/桌面视觉控制、本地语音识别、长期记忆与子技能。所有组件**共享同一份 Python 环境**与
-**同一份工作区记忆**，互相联动。
+Windows 本地 AI 角色系统，围绕一个共享角色同时提供：B站直播互动、家庭桌宠、网页与桌面自动化、语音识别与合成、角色配置、长期记忆和可复用 Skill。
 
-## 目录总览
+> 文档核对日期：2026-07-20。运行代码与 YAML 配置优先于文档；面向后续开发会话的详细资料位于 [`AI Read/`](AI%20Read/00_START_HERE.md)。
 
-| 目录 / 文件 | 功能 | 启动方式 |
-|------|------|------|
-| `modules/live/`（根目录 `main.py` / `manager.py` 为兼容入口） | **B站 AI 直播弹幕助手**（主程序 + 可视化管理后台 :9888） | `启动管理页面.bat` |
-| `CharacterManager/` | **角色管理器**（Tkinter GUI，管理身份/记忆/人格/模型/语音/图片） | `启动角色管理器.bat` |
-| `HomeAgent/` | **家庭桌宠**（透明悬浮窗，语音对话、操控电脑、调度任务） | `HomeAgent\启动家庭Agent.bat` |
-| `Vision/` | **GUI 网页/桌面控制 Agent**（本地 GUI-Actor-2B 视觉 grounding，MCP 服务） | HTTP :8765（被 HomeAgent 托管） |
-| `Sound/` | **语音识别**（本地 SenseVoiceSmall / FunASR，MCP 工具） | stdio `sound-asr` |
-| `LongTermMemory/` | **长期记忆库**（SQLite `memory.db`，跨场景记忆） | 被主程序/HomeAgent 读写 |
-| `Skill/` | **子技能**：角色出图、家庭定时任务、MiMo 唱歌 | 被 HomeAgent 按需调用 |
-| `workspace/` | 共享工作区：SOUL.md / RULES.md / HOME.md / memory/ 等人格与每日记忆文档 | — |
-| `audio/` | TTS 生成的回复语音（.wav） | — |
-| `.venv/` | **共享 Python 环境**（Python 3.12 + torch cu128） | 所有组件共用 |
-| `config.yaml` / `.env` | 主程序配置与密钥 | — |
+## 当前能力
 
----
+| 子系统 | 当前实现 | 入口 |
+|---|---|---|
+| 直播助手 | B站事件、进场欢迎、礼物回复、MiMo/兼容 API 回复、GPT-SoVITS 播放、记忆写入 | `启动管理页面.bat` |
+| HomeAgent | PySide6 无边框桌宠、文字/麦克风输入、实时任务进度、TTS、工具循环、任务恢复与自主升级 | `HomeAgent/启动家庭Agent.bat` |
+| 角色管理器 | PySide6 配置工作台；Qt UI 经 `CharacterService` 读写，Tk 仅保留为兼容后备 | `启动角色管理器.bat` |
+| Vision | 现有浏览器优先、DOM/HTML 优先，必要时懒加载 GUI-Actor 操作浏览器或 Windows 窗口 | MCP `127.0.0.1:8765/mcp` |
+| Sound | SenseVoice/FunASR 本地语音识别 | MCP `127.0.0.1:8766/mcp` |
+| 长期记忆 | 每日 JSONL + SQLite 高价值记忆，家庭/直播分场景读取 | 被直播与 HomeAgent 共用 |
+| Skill | 网页多步任务、角色图片、定时任务、MiMo 唱歌 | `Skill/*/SKILL.md` |
 
-## 共享环境（重要）
+## 总体架构
 
-所有子项目（Vision、Sound、主程序、HomeAgent、CharacterManager）**都使用同一个 venv**：
-`.venv\Scripts\python.exe`（从项目根目录运行，Python 3.12）。
+```text
+B站事件 ──> LiveAssistant ──> LLM ──> 优先语音队列 ──> GPT-SoVITS ──> 播放
+                  │                         │
+                  └── 日志 / 上下文 / 记忆 ┘
 
-该环境已安装：
-- 直播/角色：`aiohttp`、`PyYAML`、`python-dotenv`、`Pillow`、`sounddevice`、`numpy`
-- Vision（GUI 控制）：`torch` **cu128**（适配 RTX 5070 Ti 的 Blackwell sm_120）、`transformers` 4.51.3、`qwen-vl-utils`、`playwright`
-- Sound（语音识别）：`funasr`、`modelscope`、`librosa`、`soundfile`、`mcp`
-- 通用：`mcp`（FastMCP）
+文字/麦克风 ──> HomeAgent ──> 语义计划 ──> 本地工具 / Skill / Vision MCP
+                       │                       │
+                       ├── Codex（复杂任务后备）│
+                       ├── 实时进度 / TTS 汇报  │
+                       └── 任务恢复 / 自主升级 ─┘
 
-> 不再为每个子目录单独建 venv（早期版本曾拆成 `Version/.venv`、`Sound/.venv`，已合并清理）。
-> 重装依赖统一用父 `.venv`；CUDA 版 torch 必须走 cu128（`download.pytorch.org/whl/cu128`），
-> 因 5070 Ti 是 Blackwell 架构，cu124 会报 `no kernel image is available`。
-
----
-
-## 0. 给别人部署（共享环境 + 模型一键拉起）
-
-把本目录整体拷贝/打包给他人时，**无需带 `.venv/`（约 5GB+）和 `models/`（约 5.5GB）**——
-这两块用脚本一键重建即可。分享时建议包含：项目源码、`set_env.bat`、`down_model.bat`、`requirements.txt`、
-以及各子目录里的 `download_model.py`（已就绪）。
-
-**接收方只需两步：**
-
-1. **双击 `set_env.bat`** —— 自动检测 Python、创建 `.venv`、安装全部依赖：
-   - PyTorch 走官方 **cu128** 源（适配 RTX 50 系 Blackwell；普通 pip 会装成 CPU 版）；
-   - 其余依赖按 `requirements.txt` 安装；
-   - 安装 Playwright Chromium 浏览器内核。
-   - 若缺少 `Vision/GUI-Actor` 源码会自动告警（需随包保留或 `git clone`）。
-2. **双击 `down_model.bat`** —— 调两个 `download_model.py` 补全模型权重：
-   - `Vision/models/GUI-Actor-2B-Qwen2-VL`（约 4.5 GB，curl 断点续传）；
-   - `Sound/models/SenseVoiceSmall`（约 1 GB，走 ModelScope）。
-
-> 注：`.bat` 内部全英文（ASCII），避免中文 Windows 代码页把脚本读成乱码；
-> 中文路径靠 `%~dp0` 运行时变量传入，不受影响。
-
----
-
-## 1. 主程序：B站 AI 直播弹幕助手
-
-读取直播弹幕和进房事件、自动欢迎、DeepSeek/MiMo 智能短回复、本地 HTTP 语音生成与播放、按天保存工作区记忆。
-
-### 三套程序共用关系
-- `启动管理页面.bat`：直播控制台，只负责直播间、触发回复、运行状态和消息日志。
-- `启动角色管理器.bat`：统一管理角色身份、共享记忆、人格规则、模型 API、语音服务、角色图片和图片 API。
-- `HomeAgent\启动家庭Agent.bat`：家庭桌宠模式。
-
-三套程序共同读取 `workspace`。长期记忆保存在 `workspace\memory`；家庭桌宠还会读取 `logs\messages.jsonl`
-中最近成功的直播对话，以保持跨场景连续性。
-
-### 快速开始
-1. 复制 `config.example.yaml` 为 `config.yaml`，填写 `app.room_id`。
-2. 复制 `.env.example` 为 `.env`，填入模型 Key；需要真正发送弹幕时再填 B站 Cookie。
-3. 双击 `run.bat`。首次运行会自动创建虚拟环境并安装依赖。
-4. 只需要语音回复时，保持 `send_danmaku: false`。此时程序会监听弹幕、生成 AI 回复和播放语音，但永远不会发送回复弹幕。
-
-只有同时满足 `send_danmaku: true` 和 `dry_run: false` 时，程序才会发出真实弹幕。
-
-配置检查：`.venv\Scripts\python.exe main.py --config config.yaml --check`
-
-### 可视化管理页面
-双击 `启动管理页面.bat`，浏览器会自动打开 `http://127.0.0.1:9888`。页面可管理全部常用配置、API 密钥、
-人格文档，测试 AI/SVC，并启动或停止直播助手。
-
-### B站登录信息
-发送弹幕需要当前主播账号浏览器 Cookie 中的 `SESSDATA`、`bili_jct`，通常也建议保留 `buvid3`。
-把它们放在 `.env` 的 `BILIBILI_COOKIE` 中，不要提交或分享该文件。Cookie 过期后需要重新获取。
-读取弹幕不强制要求登录；发送弹幕会受到账号状态、频率、房间权限和平台风控限制。请遵守 B站规则，避免刷屏。
-
-### 智能回复触发
-- `mention`：弹幕包含 `reply.bot_names` 中任一名称。
-- `prefix`：弹幕以 `reply.prefixes` 中任一前缀开头。
-- `all`：每条弹幕都可能回复（不推荐，容易刷屏并产生费用）。
-
-### 9879 语音服务适配
-程序已适配 `E:\Doc\SVC\启动推理.bat`：如果 `9879` 服务没有运行，会自动启动该批处理并等待 GPT-SoVITS
-模型加载完成。实际请求发送到 `http://127.0.0.1:9879/api/tts`。
-程序会通过 `/api/options` 自动选择最新训练模型和默认参考音频，请求大致如下：
-```json
-{"text":"回复内容","model":"训练轮次","reference":"参考音频路径","speed":1.0}
+CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongTermMemory
 ```
-如果想固定模型或音色参考，可在 `tts.model` 和 `tts.reference` 中填写对应值。
-若服务返回 JSON：base64 音频设 `response_type: json_base64` 填 `response_field`；音频 URL 设
-`response_type: json_url` 填 `response_field`。
-若以后换成其他本机接口，可关闭 `svc_auto_options` 并修改 `tts.request_json`（其中 `{text}`、`{speaker}` 会被替换）。
 
-### 工作区
-`workspace/SOUL.md` 定义性格，`RULES.md` 定义注意事项和回复规则，`ABILITIES.md` 定义能力边界，
-`memory/` 保存每日互动。这些文档在每次智能回复前动态加载。
+设计原则：
 
-### 安全提示
-默认 `send_danmaku: false` 和 `dry_run: true` 是双重保护。建议限制模型 Key 额度、定期清理记忆，
-并在正式直播前用测试房间验证。AI 回复仍可能出错，主播应保留人工停用手段（关闭窗口或 Ctrl+C）。
+- 模型负责理解目标、参数和完成条件，本地执行器负责权限、调用、重试和结果验证。
+- 网页任务优先读取现有浏览器的 DOM/HTML；没有 DOM 时保留当前登录浏览器并使用窗口视觉，不为登录任务强制新开 Chrome。
+- 每次点击、输入、快捷键或滚动后默认等待约 550 ms 并重新截图，返回页面是否变化以及下一步建议。
+- 本地 HomeAgent 工具优先；Codex/MCP 网络链只处理本地工具无法完成的复杂任务。
+- 直播和家庭共享身份与高价值记忆，但私密记忆、私人图片不得注入直播提示词。
 
----
+## 目录
 
-## 2. Vision — GUI 网页/桌面控制 Agent（MCP）
+| 路径 | 职责 |
+|---|---|
+| `modules/live/` | 直播助手核心、管理 API 与网页控制台；根 `main.py`、`manager.py` 是兼容入口 |
+| `HomeAgent/` | 家庭 Agent、PySide6 桌宠、STT/TTS、工具链、任务调度与恢复 |
+| `CharacterManager/` | `service.py` 数据接口、Qt 默认 UI、Tk 兼容 UI |
+| `Vision/` | 浏览器 DOM、CDP 复用、GUI-Actor 和 Windows 窗口工具 |
+| `Sound/` | SenseVoice/FunASR 识别服务 |
+| `Skill/` | `web-agent-operator`、角色图片、定时任务、唱歌技能 |
+| `workspace/` | 身份、人格、场景规则、每日记忆、角色图片 |
+| `LongTermMemory/` | SQLite 长期记忆数据库 |
+| `Task/` | 一次性和周期任务 |
+| `state/` | 跨进程上下文、维护和任务控制状态 |
+| `logs/` | 直播、HomeAgent、Vision、Sound 日志 |
+| `audio/` | TTS 输出，自动保留最新 20 个音频 |
+| `AI Read/` | 架构、接口、数据、运维和开发进度文档 |
 
-本地 **GUI-Actor-2B（Qwen2-VL）** 视觉模型，看截图定位界面元素并点击/输入/滚动。封装为 MCP 服务，
-可被 WorkBuddy、HomeAgent 用自然语言调用。详见 `Vision/README.md`。
+## 环境与部署
 
-- MCP 服务名 `vision-gui`，默认 **streamable-http 常驻于 `127.0.0.1:8765`**（由 HomeAgent 自动拉起并预加载模型）。
-- 工具：`navigate` / `click` / `type_text` / `scroll` / `screenshot` / `get_url` / `wait` / `play_video`
-  以及桌面控制 `desktop_screenshot` / `desktop_click` / `desktop_type_text` / `desktop_scroll` / `desktop_hotkey`。
-- 模型：`Vision/models/GUI-Actor-2B-Qwen2-VL`。
-- 能力边界：普通网页/App（ScreenSpot-v2 ~88.6）足够；专业软件高分辨率界面（ScreenSpot-Pro ~36.7）偏弱。
+所有组件共用根目录 `.venv`（Python 3.12）。RTX 50 系使用 PyTorch cu128；不要给各模块另建互相隔离的虚拟环境。
 
----
+新机器部署：
 
-## 3. Sound — 语音识别（MCP）
+1. 运行 `set_env.bat`，创建环境、安装依赖和 Playwright 内核。
+2. 运行 `down_model.bat`，下载 GUI-Actor 与 SenseVoice 模型。
+3. 从示例生成 `config.yaml` 和 `.env`，只在 `.env` 保存密钥。
+4. 先运行配置检查：`.venv\Scripts\python.exe main.py --config config.yaml --check`。
+5. 分别启动管理页面、角色管理器或 HomeAgent。
 
-本地 **SenseVoiceSmall / FunASR**，支持中/英/日/韩/粤多语种、带标点与情绪标签。详见 `Sound/README.md`。
+## 当前配置摘要
 
-- MCP 工具名 `sound-asr`（stdio），工具：`transcribe_file(path, language)`、`record_and_transcribe(duration, language)`。
-- 模型：`Sound/models/SenseVoiceSmall`。
-- 已处理中文路径与 mp3 兼容性（模型自动复制到 ASCII 临时目录加载；音频用 librosa 加载）。
+- 直播模型：MiMo `mimo-v2.5`；直播最大 300 tokens，家庭最大 800 tokens。
+- B站：`send_danmaku: false`，因此不会发送真实弹幕；`dry_run: false` 不会绕过此保护。
+- TTS：`127.0.0.1:9879`，按需自动启动 GPT-SoVITS。
+- STT：HomeAgent 使用 `sound_mcp`，地址 `127.0.0.1:8766/mcp`。
+- Vision MCP：启用；`gui_enabled: true`、`preload_model: false`，即允许视觉但默认懒加载模型。
+- HomeAgent：本地工具优先，电脑操作默认最多 4 轮；Codex CLI 为复杂任务后备。
 
----
+配置可能随 UI 实时保存而改变，排障时应重新读取磁盘 YAML。
 
-## 4. CharacterManager — 角色管理器
+## 关键运行流程
 
-基于 Tkinter 的可视化「AI 角色工作台」（`启动角色管理器.bat`）。统一管理：
-- 角色身份（`workspace/IDENTITY.yaml`、`CHARACTER.md`）
-- 共享记忆（`workspace/memory`）
-- 人格规则文档（`SOUL.md` / `RULES.md` / `LIVE_RULES.md` / `HOME_RULES.md` / `ABILITIES.md` / `HOME.md`）
-- 模型 API、语音服务（SVC）、角色图片与图片 API
-- 角色图片库（`workspace/character_images`，含 `manifest.json`）
+### 直播互动
 
----
+`BilibiliLive` 接收 WebSocket 事件，历史弹幕轮询作为弹幕补充。`LiveAssistant` 处理用户名、去重、回复触发、礼物和进场欢迎；模型回复被截短后进入独立语音优先队列。
 
-## 5. HomeAgent — 家庭桌宠
+欢迎语优先于普通回复。同一用户同时收到 `INTERACT_WORD` 与 `ENTRY_EFFECT` 时只排队一次；只有播放成功才写入欢迎冷却。TTS 在超时、连接错误或显卡繁忙时默认重试 4 次，健康接口短暂超时不会重复启动第二个 GPT-SoVITS 进程。
 
-透明悬浮窗式家庭 AI 桌宠（`HomeAgent\启动家庭Agent.bat`），详见 `HomeAgent\使用说明.txt`。
+### HomeAgent 任务
 
-- 单击展开/收起对话框，拖动改位置；语音按钮录音识别。
-- **语音识别**可配置两种：① `api`（OpenAI 兼容接口，Key 在 `.env` 的 `STT_API_KEY`）；
-  ② `faster_whisper`（本地，见 `HomeAgent\transcribe_local.py`，走 CUDA）。
-- 回复后自动调用 SVC 服务播音；可说"记住…""查找关于…的记忆""生成一张角色在家里的图片"等。
-- **操控电脑**：连接 `vision-gui` MCP（HTTP :8765，预加载模型），命中 `操作电脑/点击屏幕/看屏幕` 等
-  关键词时由视觉模型接管桌面/浏览器。
-- **Codex CLI / MCP**：可启用，按 `auto`/`always`/`manual` 模式转交命令行与工具调用。
-- 配置：`HomeAgent/config.yaml`（助手名、麦克风、STT、vision_mcp、codex_cli、computer_control 等）。
-- 录音存于 `HomeAgent/recordings`；本程序**不会发送直播弹幕**。
+1. 模型生成语义任务计划和可观察完成条件。
+2. 优先选择本地确定性工具、网页 Skill 或 Vision MCP。
+3. 网页先检查当前目标：`browser_dom`、`browser_visual` 或 `desktop_visual`。
+4. 操作后重新观察并验证；失败保留阶段、证据与重试原因。
+5. 任务执行时 UI 实时显示当前步骤和已完成内容；长任务可以生成 TTS 进度汇报。
+6. 自主升级任务在重启前校验，并通过 `HomeAgent/state/task-recovery.json` 恢复未完成任务。
 
----
+### 网页自动化
 
-## 6. LongTermMemory — 长期记忆库
+`Skill/web-agent-operator` 强制执行：
 
-SQLite 数据库 `LongTermMemory/memory.db`，表 `memories` 字段：
-`id, created_at, user_id, scene, category, tags, summary, detail, importance, privacy, source`。
-主程序与 HomeAgent 跨场景读写，实现"直播对话 ↔ 家庭对话"的记忆延续。
+`NAVIGATED → SEARCH_SUBMITTED → RESULTS_VERIFIED → RESULT_SELECTED → ACTION_EXECUTED → FINAL_VERIFIED`
 
----
+只有打开页面就是最终目标时才允许停在导航。B站收藏夹任务读取真实收藏夹顺序，并优先导航用户已经打开的浏览器；搜索、选择或播放任务不得把“打开首页”报告成完成。
 
-## 7. Skill — 子技能
+## 配置与数据
 
-`Skill/` 下放置可复用技能（每个含 `SKILL.md` / `agents/` / `scripts/`）：
-- `ai-live-character-image`：生成角色在直播/家庭场景的图片。
-- `schedule-home-task`：家庭定时任务。
-- `sing-with-mimo`：用 MiMo 唱歌。
+- 根 `config.yaml`：直播、模型、TTS、记忆和共享工作区配置。
+- `HomeAgent/config.yaml`：桌宠、麦克风、STT、Vision、Codex、权限、维护与自主升级。
+- `HomeAgent/config.d/`：电脑控制、Vision MCP、上下文维护等独立配置文档。
+- `.env`：API Key、B站 Cookie；禁止提交、打印或复制到文档。
+- `workspace/*.md`：人格与规则，程序运行时动态读取。
+- `state/live-context.json`：直播短期上下文。
+- `LongTermMemory/memory.db`：结构化长期记忆。
 
-HomeAgent 通过 `HomeAgent/config.yaml` 的 `agent.skill_root`（默认 `Skill`）按需调用。
+角色管理器通过 `CharacterManager/service.py` 原子保存配置并保留 UI 不认识的字段；HomeAgent 设置页采用实时保存。
 
----
+## 验证与排障
 
-## 联动架构（一句话）
+- Python 语法：`.venv\Scripts\python.exe -m py_compile <files>`
+- 回归测试：`.venv\Scripts\python.exe -m unittest discover -s modules/live/tests -v`
+- 直播日志：`logs/assistant.log`、`logs/messages.jsonl`
+- HomeAgent：`HomeAgent/logs/agent-events.jsonl`
+- Vision：`Vision/logs/vision-mcp.log`
+- Sound：`Sound/logs/sound-mcp.log`
 
-`HomeAgent 桌宠` ⇄ 语音(`Sound`/`faster_whisper`) → 模型决策 → 操控电脑(`Vision` vision-gui MCP)
-⇄ 长期记忆(`LongTermMemory`) ⇄ 角色人格(`CharacterManager` / `workspace`)；
-主程序`直播助手`独立运行弹幕回复与 TTS，并共享同一份 `workspace` 记忆与 `.venv` 环境。
+任何自动化任务都不得只凭“调用没有报错”宣称成功；应检查最终 URL、正文、截图变化、媒体状态或对应业务返回值。
 
-## 安全提示（全局）
-默认 `send_danmaku: false` + `dry_run: true` 是弹幕双重保护；HomeAgent 的 `computer_control` 也建议保留
-`confirm_before_action: true`。AI 仍可能出错，请保留人工停用手段。
+## 安全边界
+
+- 发送 B站弹幕必须同时满足 `send_danmaku: true` 与 `dry_run: false`。
+- 登录态任务不启动临时浏览器，不关闭用户的浏览器会话。
+- 视觉开关关闭时不得暴露或调用 GUI-Actor 图像工具。
+- 配置写入必须保留未知字段；禁止整段默认配置覆盖用户设置。
+- 不删除 `workspace`、`LongTermMemory`、`Task`、角色图片和用户日志。
+
+## 文档导航
+
+新开发会话从 [`AI Read/00_START_HERE.md`](AI%20Read/00_START_HERE.md) 开始。当前完成度、近期修复和后续重点集中在 [`AI Read/06_CURRENT_STATE.md`](AI%20Read/06_CURRENT_STATE.md)。

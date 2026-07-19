@@ -376,7 +376,8 @@ class HomeAgent:
                 "domain(conversation/web/desktop), site(bilibili/cloudmusic/空), "
                 "operation(open/search/play/control/favorites/form/file/code/conversation), handler, query, "
                 "favorite_folder, index(整数或null), actionable, multi_step, requires_mcp, browser_policy, "
-                "steps(字符串数组), success_criteria, confidence(0到1), reasoning_short。\n"
+                "steps(字符串数组), final_action_requires_verification(是否要求播放/提交等终态), "
+                "success_criteria, confidence(0到1), reasoning_short。\n"
                 f"最近上下文：{context[-1200:]}\n当前请求：{text}"
             )
             timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
@@ -401,7 +402,7 @@ class HomeAgent:
             for key_name in ("domain", "site", "operation", "query", "favorite_folder", "browser_policy", "success_criteria", "reasoning_short"):
                 if key_name in proposed:
                     plan[key_name] = str(proposed.get(key_name) or "").strip()
-            for key_name in ("actionable", "multi_step", "requires_mcp"):
+            for key_name in ("actionable", "multi_step", "requires_mcp", "final_action_requires_verification"):
                 if key_name in proposed:
                     plan[key_name] = bool(proposed[key_name])
             if isinstance(proposed.get("steps"), list):
@@ -430,6 +431,7 @@ class HomeAgent:
                     plan["handler"] = "bilibili_favorites"
                     plan["index"] = fallback.get("index") or plan.get("index") or 1
                     plan["favorite_folder"] = plan.get("favorite_folder") or fallback.get("favorite_folder") or "默认收藏夹"
+                    plan["browser_policy"] = "existing_profile_only"
                 elif plan.get("query"):
                     plan["handler"] = "bilibili_search"
             plan["planner"] = "llm_validated"
@@ -829,10 +831,7 @@ class HomeAgent:
 
         candidates = await windows()
         if not candidates:
-            if status: status("没有打开的浏览器，正在使用系统默认浏览器…")
-            await asyncio.to_thread(webbrowser.open, "https://www.bilibili.com/")
-            await asyncio.sleep(4); candidates = await windows()
-        if not candidates: return {"error": "没有检测到现有浏览器窗口；未启动内部 Chromium"}
+            return {"error": "没有检测到现有浏览器窗口；为保护登录会话，未启动任何新浏览器"}
         browser = next((item for item in candidates if any(word in str(item.get("title", "")).lower() for word in ("bilibili", "哔哩哔哩"))), candidates[0])
         pid = int(browser.get("pid", 0)); title = str(browser.get("title", ""))
 
@@ -1121,6 +1120,25 @@ class HomeAgent:
             {"type": "function", "function": {"name": "acknowledge_scheduled_task", "description": "当用户明确回应刚才的提醒、表示知道了或已经完成时，确认最近一个待回应任务并停止本轮重复提醒。无关回复不要调用。", "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "description": "可选；不填时确认最近的待回应任务"}, "response": {"type": "string", "description": "用户的原始确认回复"}}}}},
             {"type": "function", "function": {"name": "long_term_memory", "description": "结构化长期记忆指令。高价值信息用store；用户询问过去经历或‘你记得吗’时必须先用retrieve。普通闲聊禁止store。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["store", "retrieve"]}, "tags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 5}, "summary": {"type": "string", "maxLength": 20}, "detail": {"type": "string"}, "category": {"type": "string", "enum": ["health", "emotion", "major_event", "preference", "habit", "relationship", "agreement"]}, "importance": {"type": "integer", "minimum": 70, "maximum": 100}, "query_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8}}, "required": ["action"]}}},
         ]
+        if self.config.get("vision_mcp", {}).get("enabled", False) and self.config.get("agent", {}).get("model_driven_computer_actions", True):
+            tools += [
+                {"type": "function", "function": {"name": "bilibili_open_favorite_video", "description": "在用户已经打开且已登录的普通浏览器中，按B站收藏夹真实数据顺序打开指定收藏夹第N个视频。B站收藏夹任务应优先调用；不会创建Chrome、Chromium或临时浏览器。", "parameters": {"type": "object", "properties": {"favorite_folder": {"type": "string", "description": "用户说出的收藏夹名称，例如二次元好看或默认收藏夹"}, "index": {"type": "integer", "minimum": 1, "description": "从1开始的视频序号"}}, "required": ["favorite_folder", "index"]}}},
+                {"type": "function", "function": {"name": "ui_inspect_target", "description": "观察当前活动目标，判断是可读DOM网页、视觉网页还是原生程序。任何网页/界面任务第一步调用。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "ui_list_windows", "description": "读取当前可见窗口标题和进程，用于找到并验证目标程序以及媒体播放标题。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}}}},
+                {"type": "function", "function": {"name": "ui_activate_window", "description": "激活一个已经打开的窗口，不启动新浏览器。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}, "required": ["title_contains"]}}},
+                {"type": "function", "function": {"name": "ui_type_window", "description": "在指定原生窗口中按语义定位输入框并输入文字。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "text": {"type": "string"}}, "required": ["title_contains", "target", "text"]}}},
+                {"type": "function", "function": {"name": "ui_click_window", "description": "在指定原生窗口中定位并单击目标。目标描述必须包含当前任务对象，不能用它代替播放指定搜索结果。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}}, "required": ["title_contains", "target"]}}},
+                {"type": "function", "function": {"name": "ui_double_click_window", "description": "在指定原生窗口中定位并双击目标，适合选择并播放搜索结果行。必须明确描述目标标题，禁止描述底部全局播放按钮。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}}, "required": ["title_contains", "target"]}}},
+                {"type": "function", "function": {"name": "ui_analyze_window", "description": "使用 MiMo 图像理解读取指定窗口当前画面并返回文字观察。搜索提交后、选择结果前以及最终验证时调用。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "question": {"type": "string"}}, "required": ["title_contains", "question"]}}},
+                {"type": "function", "function": {"name": "ui_hotkey", "description": "向当前活动窗口发送按键组合。", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}, "required": ["keys"]}}},
+                {"type": "function", "function": {"name": "ui_type_active_text", "description": "向现有活动窗口已聚焦的输入框输入文字；浏览器无DOM时可在Ctrl+L后填写网址，绝不启动新浏览器。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "clear": {"type": "boolean"}}, "required": ["text"]}}},
+                {"type": "function", "function": {"name": "web_read", "description": "读取当前网页DOM/HTML的正文、链接、按钮和输入框。网页操作优先调用。", "parameters": {"type": "object", "properties": {"max_chars": {"type": "integer", "minimum": 1000, "maximum": 30000}}}}},
+                {"type": "function", "function": {"name": "web_navigate", "description": "仅在现有浏览器已开放CDP DOM时导航；无DOM时返回失败，绝不新建浏览器，改用现有窗口Ctrl+L。", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+                {"type": "function", "function": {"name": "web_fill", "description": "按DOM字段名称、label或placeholder填写网页输入框，可选择提交。", "parameters": {"type": "object", "properties": {"field": {"type": "string"}, "text": {"type": "string"}, "submit": {"type": "boolean"}}, "required": ["field", "text"]}}},
+                {"type": "function", "function": {"name": "web_click_text", "description": "按网页DOM中的可见文字点击结果或按钮。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "exact": {"type": "boolean"}}, "required": ["text"]}}},
+                {"type": "function", "function": {"name": "web_play_media", "description": "播放当前已选定详情页中的媒体。搜索任务必须先选择正确结果，禁止在搜索结果选择前调用。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "web_get_url", "description": "读取当前网页地址，用于验证导航和结果选择。", "parameters": {"type": "object", "properties": {}}}},
+            ]
         if self._codex_config().get("enabled", False):
             tools += [
                 {"type": "function", "function": {"name": "codex_cli_task", "description": "调用 Codex CLI 完成复杂的本机命令、文件、编程或多步骤任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
@@ -1138,6 +1156,9 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "open_url", "description": "仅用于目标就是打开某个网页的单步请求。若还要搜索、查找、点击、选择、播放、填写或提交，禁止使用本工具，必须调用 web_agent_task。", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
                 {"type": "function", "function": {"name": "launch_app", "description": "按软件目录映射启动应用或打开软件目录。完整权限模式下也可使用可执行文件绝对路径", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "已配置的软件名称、程序路径或目录路径"}, "arguments": {"type": "array", "items": {"type": "string"}}}, "required": ["name"]}}},
             ]
+        if self.config.get("agent", {}).get("model_driven_computer_actions", True):
+            delegated = {"web_agent_task", "vision_gui_task"}
+            tools = [item for item in tools if item.get("function", {}).get("name") not in delegated]
         return tools
 
     def _home_tts_chunks(self, text: str) -> list[str]:
@@ -1237,6 +1258,7 @@ class HomeAgent:
         recent_task_context = "\n".join(str(item.get("content", "")) for item in self.history[:-1][-6:] if item.get("role") == "user")
         if status: status("正在理解任务并制定执行计划…")
         task_plan = await self._plan_task(text, recent_task_context)
+        self.current_task_plan = task_plan
         self.log_event("task_plan_created", task_plan=task_plan)
         if task_plan.get("requires_clarification"):
             answer = "我没能可靠识别这次操作的目标对象，所以没有执行，避免搜索或点击错误内容。请再说一次目标名称。"
@@ -1277,7 +1299,7 @@ class HomeAgent:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, answer, status)
             return answer
-        if task_plan.get("handler"):
+        if task_plan.get("handler") and not self.config.get("agent", {}).get("model_driven_computer_actions", True):
             visual_query = str(task_plan.get("query") or "")
             visual_target = "B站" if task_plan.get("site") == "bilibili" else "网易云"
             gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", True))
@@ -1367,13 +1389,42 @@ class HomeAgent:
             memory_context = "\n\n【已从SQLite长期记忆检索到的事实】\n" + json.dumps(recalled_memories, ensure_ascii=False) + "\n回答相关问题时只依据这些事实，不要虚构。"
         elif self._is_memory_recall_request(text):
             memory_context = "\n\n【SQLite长期记忆检索结果为空】不要声称记得具体事实；如实说明没有找到。"
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt() + memory_context}, *self.history]
+        operation_contract = ""
+        if task_plan.get("actionable"):
+            operation_contract = (
+                "\n\n【当前操作任务计划】\n" + json.dumps(task_plan, ensure_ascii=False) +
+                "\n你负责根据观察结果逐步决定并调用白名单工具，本地代码只执行你的工具调用。"
+                "每次工具返回后重新判断下一步，不得跳过选择目标和终态验证。"
+                + ("当前是B站收藏夹任务：直接调用 bilibili_open_favorite_video，并把任务计划中的 favorite_folder 和 index 原样传入。"
+                   "该工具会读取真实收藏夹顺序、复用现有登录浏览器并验证最终BV地址；不要用截图猜收藏夹入口。"
+                   if task_plan.get("handler") == "bilibili_favorites" else "") +
+                "网页先调用 ui_inspect_target；若是 browser_dom，优先 web_read/web_fill/web_click_text。"
+                "若是 browser_visual，必须保持现有浏览器，用 ui_hotkey Ctrl+L、ui_type_active_text、Enter 和窗口视觉工具操作。"
+                "禁止调用 launch_app 启动 Chrome/Edge/Firefox，也禁止为了DOM能力创建新浏览器。"
+                "原生程序第一次调用 ui_list_windows 时不要传标题过滤；应用窗口标题可能是当前文档或歌曲名，"
+                "应从全部窗口的 process_name 找到目标进程，再把返回的真实窗口标题用于激活、输入和点击。"
+                "确认程序确实未运行后才允许启动；随后输入、提交并选择目标。"
+                "原生窗口搜索提交后必须调用 ui_analyze_window 观察结果列表，再根据观察双击准确结果。"
+                "选择点击锚点时使用分析结果中最有区分度的精确可见文字；存在明确歌手时优先用歌手名或‘歌名+歌手’，"
+                "不要只描述‘结果区域’或模糊整行。双击工具返回 before_title/after_title；"
+                "只有该自动化工具自身造成 after_title 切换到目标，才可作为自动播放成功证据。"
+                "用户或其他程序在工具调用之外改变的状态不能算自动化成功。"
+                "当 query 非空且目标是播放搜索结果时，必须先明确选择与 query 匹配的结果；"
+                "原生音乐列表优先双击准确的歌曲行。禁止直接点击底部或全局播放按钮来代替选择目标。"
+                "操作后必须再次读取网页、URL或窗口标题验证实际目标已打开/播放；没有证据不得报告成功。"
+            )
+        messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt() + memory_context + operation_contract}, *self.history]
         url = provider["base_url"].rstrip("/") + "/chat/completions"
         timeout = aiohttp.ClientTimeout(total=llm_cfg.get("timeout_seconds", 45))
         async with aiohttp.ClientSession(timeout=timeout) as session:
             singing_performed = False
             created_task_result = None
             long_term_stored = False
+            automated_media_target_verified = False
+            bilibili_favorite_verified = False
+            bilibili_favorite_result = None
+            initial_media_state_checked = False
+            media_target_preexisting = False
             for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
@@ -1387,6 +1438,21 @@ class HomeAgent:
                 calls = choice.get("tool_calls") or []
                 if not calls:
                     answer = (choice.get("content") or "").strip()
+                    requires_automated_media_proof = bool(
+                        task_plan.get("site") == "cloudmusic"
+                        and task_plan.get("handler") == "cloudmusic_search"
+                        and str(task_plan.get("query") or "").strip()
+                        and bool(task_plan.get("final_action_requires_verification") or task_plan.get("operation") == "play")
+                    )
+                    if requires_automated_media_proof and not (automated_media_target_verified or media_target_preexisting):
+                        self.log_event("unproven_media_success_rejected", answer=answer, query=task_plan.get("query"))
+                        messages.append({"role": "system", "content": "当前目标播放尚无自动化归因证据。不要依据用户手动操作后的画面报告成功；继续执行精确自动双击。只有 ui_double_click_window 自身返回的 after_title 包含目标 query，才可完成。"})
+                        continue
+                    requires_bilibili_favorite_proof = task_plan.get("handler") == "bilibili_favorites"
+                    if requires_bilibili_favorite_proof and not bilibili_favorite_verified:
+                        self.log_event("unproven_bilibili_favorite_success_rejected", answer=answer, task_plan=task_plan)
+                        messages.append({"role": "system", "content": "B站收藏夹任务尚未取得受验证结果。立即调用 bilibili_open_favorite_video；只有返回 ok=true、used_existing_browser=true、BV号以及匹配的收藏夹序号后才能完成。"})
+                        continue
                     if task_plan.get("actionable") and round_index == 0:
                         self.log_event("premature_answer_rejected", answer=answer, task_plan=task_plan)
                         messages.append({"role": "system", "content": "这是需要实际执行的操作任务，但你尚未调用任何工具。不要只描述步骤或声称完成；立即选择合适工具执行，并在获得终态证据后回答。"})
@@ -1395,6 +1461,10 @@ class HomeAgent:
                         task = created_task_result["task"]
                         # 精确时间、任务 ID 和队列长度仅供内部状态同步，不能进入普通回复或 TTS。
                         answer = f"好啦主人，{task['title']}已经设置好了。"
+                    if bilibili_favorite_result:
+                        # 收藏夹执行器已经验证浏览器、序号和最终 BV；不要让模型
+                        # 在完成措辞中额外声称“正在播放”等未经验证的状态。
+                        answer = str(bilibili_favorite_result.get("answer") or answer)
                     self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
                     self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
                     if not long_term_stored:
@@ -1409,6 +1479,39 @@ class HomeAgent:
                     if status: status(f"正在调用工具：{name}")
                     self.log_event("tool_started", tool=name, arguments=args)
                     result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm))
+                    if name == "ui_list_windows" and not initial_media_state_checked and isinstance(result, dict):
+                        initial_media_state_checked = True
+                        observation = result.get("observation")
+                        query = str(task_plan.get("query") or "").strip().lower()
+                        if isinstance(observation, list) and query:
+                            media_target_preexisting = any(
+                                str(item.get("process_name", "")).lower() == "cloudmusic.exe"
+                                and query in str(item.get("title", "")).lower()
+                                for item in observation if isinstance(item, dict)
+                            )
+                            if media_target_preexisting:
+                                self.log_event("media_target_preexisting", query=query)
+                    if name == "ui_double_click_window" and isinstance(result, dict):
+                        observation = result.get("observation")
+                        after_title = str(observation.get("after_title", "")) if isinstance(observation, dict) else ""
+                        title_changed = bool(observation.get("title_changed")) if isinstance(observation, dict) else False
+                        query = str(task_plan.get("query") or "").strip()
+                        if query and title_changed and query.lower() in after_title.lower():
+                            automated_media_target_verified = True
+                            self.log_event("automated_media_target_verified", query=query, after_title=after_title, tool=name)
+                    if name == "bilibili_open_favorite_video" and isinstance(result, dict):
+                        expected_index = int(task_plan.get("index") or 1)
+                        actual_index = int(result.get("favorite_index") or 0)
+                        bilibili_favorite_verified = bool(
+                            result.get("ok")
+                            and result.get("used_existing_browser") is True
+                            and actual_index == expected_index
+                            and re.fullmatch(r"BV[0-9A-Za-z]+", str(result.get("bvid", "")))
+                            and str(result.get("url", "")).lower().find(str(result.get("bvid", "")).lower()) >= 0
+                        )
+                        if bilibili_favorite_verified:
+                            bilibili_favorite_result = result
+                            self.log_event("bilibili_favorite_verified", folder=result.get("favorite_folder"), index=actual_index, bvid=result.get("bvid"), browser_pid=result.get("browser_pid"))
                     if name == "create_scheduled_task" and isinstance(result, dict) and result.get("ok"):
                         created_task_result = result
                     if name == "sing_song" and isinstance(result, dict) and result.get("ok"):
@@ -1421,6 +1524,16 @@ class HomeAgent:
         raise RuntimeError("工具调用轮次过多，已停止")
 
     async def _run_tool(self, name: str, args: dict[str, Any], confirm=None) -> Any:
+        if name == "bilibili_open_favorite_video":
+            plan = getattr(self, "current_task_plan", {})
+            folder_name = str(args.get("favorite_folder") or plan.get("favorite_folder") or "默认收藏夹").strip()
+            try:
+                index = int(args.get("index") or plan.get("index") or 1)
+            except (TypeError, ValueError):
+                return {"error": "收藏夹视频序号必须是正整数"}
+            if index < 1:
+                return {"error": "收藏夹视频序号必须从1开始"}
+            return await self._run_existing_browser_favorites(index, None, folder_name)
         if name == "long_term_memory":
             action = str(args.get("action", "")).strip().lower()
             try:
@@ -1490,6 +1603,55 @@ class HomeAgent:
             try: result = json.loads(output.splitlines()[-1])
             except (json.JSONDecodeError, IndexError): result = {"ok": False, "error": error or output[-1000:] or "唱歌脚本没有返回结果"}
             return result
+        if name == "ui_analyze_window":
+            if not self.config.get("vision_mcp", {}).get("enabled", False):
+                return {"error": "窗口分析服务未启用"}
+            title = str(args.get("title_contains", "")).strip()
+            question = str(args.get("question", "")).strip()
+            if not title or not question:
+                return {"error": "窗口标题和观察问题不能为空"}
+            script = ROOT / "Vision" / "analyze_window.py"
+            vision_python = ROOT / ".venv" / "Scripts" / "python.exe"
+            python_executable = str(vision_python if vision_python.exists() else Path(sys.executable))
+            proc = await asyncio.create_subprocess_exec(python_executable, str(script), "--title", title, "--prompt", question, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            out, err = await proc.communicate()
+            try: result = json.loads(out.decode("utf-8", "replace").splitlines()[-1])
+            except (json.JSONDecodeError, IndexError): result = {"ok": False, "error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
+            return result
+        vision_tool_map = {
+            "ui_inspect_target": ("inspect_active_target", lambda a: {}),
+            "ui_list_windows": ("list_windows", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
+            "ui_activate_window": ("activate_window", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
+            "ui_type_window": ("window_type_text", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "text": str(a.get("text", ""))}),
+            "ui_click_window": ("window_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", ""))}),
+            "ui_double_click_window": ("window_double_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", ""))}),
+            "ui_hotkey": ("desktop_hotkey", lambda a: {"keys": [str(key) for key in a.get("keys", [])]}),
+            "ui_type_active_text": ("desktop_type_active_text", lambda a: {"text": str(a.get("text", "")), "clear": bool(a.get("clear", True))}),
+            "web_read": ("web_read", lambda a: {"max_chars": max(1000, min(30000, int(a.get("max_chars", 12000))))}),
+            "web_navigate": ("navigate", lambda a: {"url": str(a.get("url", ""))}),
+            "web_fill": ("web_fill", lambda a: {"field": str(a.get("field", "")), "text": str(a.get("text", "")), "submit": bool(a.get("submit", False))}),
+            "web_click_text": ("web_click_text", lambda a: {"text": str(a.get("text", "")), "exact": bool(a.get("exact", False))}),
+            "web_play_media": ("web_play_media", lambda a: {}),
+            "web_get_url": ("get_url", lambda a: {}),
+        }
+        if name in vision_tool_map:
+            if not self.config.get("vision_mcp", {}).get("enabled", False):
+                return {"error": "网页/界面执行服务未启用"}
+            if not await asyncio.to_thread(self.ensure_vision_service, True):
+                return {"error": "网页/界面执行服务未就绪"}
+            tool_name, build_arguments = vision_tool_map[name]
+            arguments = build_arguments(args)
+            if name == "web_navigate" and not str(arguments.get("url", "")).lower().startswith(("http://", "https://")):
+                return {"error": "只允许导航到 HTTP/HTTPS 地址"}
+            try:
+                observation_raw = await self._vision_mcp_call(tool_name, arguments)
+                try:
+                    observation = ast.literal_eval(observation_raw)
+                except (ValueError, SyntaxError):
+                    observation = observation_raw
+                return {"ok": True, "observation": observation, "executed_tool": tool_name}
+            except Exception as exc:
+                return {"error": str(exc), "executed_tool": tool_name}
         if name == "codex_cli_task":
             return await self._run_codex_task(str(args.get("task", "")))
         if name == "mcp_task":
@@ -1556,6 +1718,10 @@ class HomeAgent:
             webbrowser.open(url); return {"ok": True, "opened": url}
         if name == "launch_app":
             app_name = str(args.get("name", "")); apps = self.config.get("computer_control", {}).get("applications", {})
+            task_policy = str(getattr(self, "current_task_plan", {}).get("browser_policy", ""))
+            browser_names = ("chrome", "chromium", "msedge", "microsoft edge", "edge", "firefox", "浏览器")
+            if task_policy == "existing_profile_only" and any(token in app_name.lower() for token in browser_names):
+                return {"error": "当前任务只允许接管现有浏览器登录会话，禁止启动新的浏览器实例"}
             command = apps.get(app_name)
             full = self.config.get("computer_control", {}).get("full_access", False)
             if not command and full:

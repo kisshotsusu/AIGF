@@ -155,7 +155,7 @@ _USER_AGENT = (
 )
 
 
-def ensure_browser(prefer_existing: bool = True, allow_launch: bool = True):
+def ensure_browser(prefer_existing: bool = True, allow_launch: bool = False):
     global _pw, _browser, _page, _owns_browser, _browser_source
     if (_page is not None and not _page.is_closed()
             and _browser is not None and _browser.is_connected()):
@@ -177,7 +177,7 @@ def ensure_browser(prefer_existing: bool = True, allow_launch: bool = True):
                 _page = None
     if not allow_launch:
         reset_browser()
-        raise RuntimeError("current browser DOM is unavailable; use browser/window vision fallback")
+        raise RuntimeError("current browser DOM is unavailable; new browser launch is forbidden, use existing browser window vision fallback")
     _browser = _pw.chromium.launch(
         headless=HEADLESS,
         args=[
@@ -548,6 +548,37 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
     time.sleep(0.3)
     return {"clicked": True, "pixel": [px, py], "window": window, "all_points": points}
+
+
+def window_double_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
+    """Ground a window element once, then double-click that exact point."""
+    window = _find_window(title_contains); activate_window(title_contains)
+    img = window_screenshot_pil(title_contains); points = ground_image(instruction, img, topk)
+    if not points: return {"clicked": False, "reason": "model returned no point", "window": window}
+    x, y = points[min(max(0, idx), len(points) - 1)]
+    left, top, _, _ = window["bounds"]
+    px = left + int(x * img.width); py = top + int(y * img.height)
+    ctypes.windll.user32.SetCursorPos(px, py)
+    for _ in range(2):
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(0.12)
+    time.sleep(1.5)
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(window["hwnd"])
+    title_buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+    user32.GetWindowTextW(window["hwnd"], title_buffer, len(title_buffer))
+    after_title = title_buffer.value.strip()
+    return {
+        "double_clicked": True,
+        "instruction": instruction,
+        "pixel": [px, py],
+        "window": window,
+        "before_title": window.get("title", ""),
+        "after_title": after_title,
+        "title_changed": bool(after_title and after_title != window.get("title", "")),
+        "all_points": points,
+    }
 
 
 def _set_clipboard_text(text: str):

@@ -49,10 +49,21 @@ Use the deterministic script for search-and-play tasks:
 
 The script emits JSON progress events and ends with `completed` only after the selected page and requested playback state are verified.
 
+For a request such as “打开收藏夹 二次元好看 的第三个视频”, keep semantic planning in the model but execute the fragile account operation through `bilibili_open_favorite_video(favorite_folder="二次元好看", index=3)` when that tool is available. Pass the planned folder and index without re-parsing them locally. Require all of these fields before reporting success:
+
+- `ok=true`
+- `used_existing_browser=true`
+- `favorite_index` equals the requested index
+- a valid `bvid`
+- the final URL contains that `bvid`
+
+This executor reads Bilibili's real favorite-folder order and navigates the user's already-open browser. Do not replace it with visual guesses such as opening the avatar, dynamic feed, or an assumed `/account/favorite` URL.
+
 ## Guardrails
 
 - Prefer live DOM/HTML because it exposes exact text, links, buttons, inputs, labels, and URLs.
 - DOM access to a normal Chrome/Edge session requires its CDP debugging endpoint. If unavailable, keep that browser session and fall back to window vision.
+- For tasks that depend on an existing login, never launch Playwright Chromium, a temporary profile, or a new Chrome/Edge/Firefox instance. If no normal browser window exists, stop and say that an existing browser is required.
 - Never close a user browser connected through CDP.
 - Do not use desktop vision when `inspect_active_target` reports `browser_dom` unless DOM operations fail twice or the relevant UI is canvas/video-only.
 - Do not use GUI-Actor, screenshots, coordinate clicks, or desktop/window image tools while GUI recognition is disabled.

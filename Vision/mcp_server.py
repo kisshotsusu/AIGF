@@ -181,6 +181,12 @@ def window_click(title_contains: str, instruction: str, topk: int = 3) -> str:
 
 
 @mcp.tool()
+def window_double_click(title_contains: str, instruction: str, topk: int = 3) -> str:
+    """激活目标窗口，在窗口截图内识别指定元素并双击。"""
+    return str(agent.window_double_click(title_contains, instruction, topk=topk))
+
+
+@mcp.tool()
 def window_type_text(title_contains: str, instruction: str, text: str) -> str:
     """在指定窗口内识别输入框、点击并输入文字。"""
     return str(agent.window_type_text(title_contains, instruction, text))

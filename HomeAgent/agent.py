@@ -22,8 +22,13 @@ import aiohttp
 import yaml
 from dotenv import dotenv_values
 
-ROOT = Path(r"E:\Doc\AI直播")
+ROOT = Path(__file__).resolve().parents[1]
 HOME_AGENT = ROOT / "HomeAgent"
+
+
+def project_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "Skill" / "schedule-home-task" / "scripts"))
 
@@ -822,7 +827,7 @@ class HomeAgent:
             if not await asyncio.to_thread(self.ensure_vision_service, True):
                 return {"error": "视觉 MCP 常驻服务启动超时，请检查 Vision/logs/vision-mcp.log"}
         codex_command = self._codex_command()
-        working_directory = Path(str(cfg.get("working_directory", ROOT))).expanduser().resolve()
+        working_directory = project_path(str(cfg.get("working_directory", ".")))
         if not working_directory.is_dir():
             return {"error": f"Codex 工作目录不存在：{working_directory}"}
         gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", False))
@@ -840,7 +845,7 @@ class HomeAgent:
             + (f"上一条确定性路径失败：{previous_failure}\n必须避免重复同一失败动作，改用不同策略继续。\n\n" if previous_failure else "")
             + ("本任务必须优先使用合适的 MCP 工具；若没有可用 MCP，请明确说明。\n\n" if require_mcp else "")
             + (f"本任务必须首先使用 `{preferred_mcp}` MCP。"
-               + ("这是网页任务且图像 GUI 已关闭：必须遵循 E:\\Doc\\AI直播\\Skill\\web-agent-operator\\SKILL.md，"
+               + ("这是网页任务且图像 GUI 已关闭：必须遵循项目内 Skill/web-agent-operator/SKILL.md，"
                   "只用 navigate/get_url/web_read/web_fill/web_click_text/web_press/web_play_media。"
                   "打开首页只是阶段一，绝不是完成；必须继续搜索、读取结果、选择匹配项、执行目标动作，并读取最终页面验证。"
                   "只有终态证据满足用户目标才能报告成功。\n\n" if not gui_enabled else
@@ -922,7 +927,7 @@ class HomeAgent:
         return result
 
     def list_skills(self) -> list[dict[str, str]]:
-        root = Path(self.config["agent"].get("skill_root", ROOT / "Skill")); result = []
+        root = project_path(self.config["agent"].get("skill_root", "Skill")); result = []
         if not root.exists(): return result
         for skill_md in root.glob("*/SKILL.md"):
             text = skill_md.read_text(encoding="utf-8")
@@ -1025,6 +1030,31 @@ class HomeAgent:
 
         await asyncio.gather(generate(), play_in_order())
         return paths
+
+    async def speak_progress_report(self, task: str, completed: list[str], current: str, elapsed_seconds: int) -> None:
+        """Summarize a long-running task and speak one short, non-blocking update."""
+        try:
+            provider, key = self._provider(); llm_cfg = self.project["llm"]
+            prompt = (
+                "把下面的任务进度改写成一句自然、简短的中文口语，最多45个汉字。"
+                "说明已经完成什么、现在正在做什么；不要声称任务已经全部完成，不要读秒数、路径或技术日志。\n"
+                f"用户任务：{task[:300]}\n已完成：{json.dumps(completed[-5:], ensure_ascii=False)}\n"
+                f"当前：{current}\n已运行：{elapsed_seconds}秒"
+            )
+            timeout = aiohttp.ClientTimeout(total=min(20, int(llm_cfg.get("timeout_seconds", 45))))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 100}
+                async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}) as response:
+                    raw = await response.text()
+                    if response.status >= 400: raise RuntimeError(f"progress LLM HTTP {response.status}")
+                    spoken = str(json.loads(raw)["choices"][0]["message"].get("content", "")).strip()
+                if spoken:
+                    await self._speak_home(session, spoken, None)
+                    self.log_event("task_progress_spoken", text=spoken, elapsed_seconds=elapsed_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log_event("task_progress_speech_failed", error=str(exc))
 
     async def chat(self, text: str, status=None, confirm=None) -> str:
         self._acknowledge_common_response(text)
@@ -1193,6 +1223,7 @@ class HomeAgent:
                     if name == "long_term_memory" and str(args.get("action", "")) == "store" and isinstance(result, dict) and result.get("ok"):
                         long_term_stored = True
                     self.log_event("tool_completed", tool=name, result=result)
+                    if status: status(f"已完成：工具 {name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
         raise RuntimeError("工具调用轮次过多，已停止")
 
@@ -1285,7 +1316,7 @@ class HomeAgent:
             return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"primary": None, "images": []}
         if name == "generate_character_image":
             if not self.config["agent"].get("allow_character_image_skill", True): return {"error": "角色图像技能已禁用"}
-            script = Path(self.config["agent"]["skill_root"]) / "ai-live-character-image" / "scripts" / "character_image_api.py"
+            script = project_path(self.config["agent"].get("skill_root", "Skill")) / "ai-live-character-image" / "scripts" / "character_image_api.py"
             cmd = [sys.executable, str(script), "--prompt", str(args.get("prompt", "")), "--operation", str(args.get("operation", "generate")), "--label", str(args.get("label", "家庭Agent生成")), "--tags", str(args.get("tags", "AI生成"))]
             if args.get("reference"): cmd += ["--reference", str(args["reference"])]
             if args.get("set_primary"): cmd.append("--set-primary")

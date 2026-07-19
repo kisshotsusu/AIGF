@@ -4,9 +4,10 @@
 import os
 import sys
 import time
+from pathlib import Path
 from PIL import Image, ImageDraw
 
-HERE = r"E:/Doc/AI直播/Vision"
+HERE = str(Path(__file__).resolve().parent)
 sys.path.insert(0, HERE)
 import agent  # 复用真实加载/推理路径
 

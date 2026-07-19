@@ -4,8 +4,9 @@
 截图保存到 logs/ 下，供用户查看。"""
 import os
 import sys
+from pathlib import Path
 
-HERE = r"E:/Doc/AI直播/Vision"
+HERE = str(Path(__file__).resolve().parent)
 sys.path.insert(0, HERE)
 import agent
 

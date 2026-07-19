@@ -2,12 +2,12 @@
 
 ## 目录约定
 
-- 技能：`E:\Doc\AI直播\Skill\ai-live-character-image`
-- 主项目：`E:\Doc\AI直播`
-- 角色设定：`E:\Doc\AI直播\workspace\CHARACTER.md`
-- 形象库：`E:\Doc\AI直播\workspace\character_images`
-- API 配置：`E:\Doc\AI直播\config.yaml` 的 `image_generation`
-- 密钥：`E:\Doc\AI直播\.env` 的 `IMAGE_API_KEY`
+- 技能：`Skill/ai-live-character-image`
+- 主项目：当前工作区根目录
+- 角色设定：`workspace/CHARACTER.md`
+- 形象库：`workspace/character_images`
+- API 配置：`config.yaml` 的 `image_generation`
+- 密钥：`.env` 的 `IMAGE_API_KEY`
 
 如主项目位于其他目录，设置环境变量 `AI_LIVE_ROOT` 后再运行脚本。
 
@@ -16,7 +16,7 @@
 在 PowerShell 执行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "E:\Doc\AI直播\Skill\ai-live-character-image\scripts\setup-cn.ps1"
+powershell -ExecutionPolicy Bypass -File "Skill\ai-live-character-image\scripts\setup-cn.ps1"
 ```
 
 该脚本使用清华 PyPI 镜像，不依赖访问境外 PyPI。模型 API 本身必须填写当前网络可以访问的国内或内网地址。
@@ -28,13 +28,13 @@ powershell -ExecutionPolicy Bypass -File "E:\Doc\AI直播\Skill\ai-live-characte
 另一 Agent 应先完整读取 `SKILL.md`，然后执行：
 
 ```powershell
-python "E:\Doc\AI直播\Skill\ai-live-character-image\scripts\character_image_api.py" --prompt "角色形象要求" --label "图片说明" --tags "立绘,默认"
+python "Skill\ai-live-character-image\scripts\character_image_api.py" --prompt "角色形象要求" --label "图片说明" --tags "立绘,默认"
 ```
 
 参考主形象编辑：
 
 ```powershell
-python "E:\Doc\AI直播\Skill\ai-live-character-image\scripts\character_image_api.py" --operation edit --reference primary --prompt "保持身份特征，修改服装" --label "服装变体"
+python "Skill\ai-live-character-image\scripts\character_image_api.py" --operation edit --reference primary --prompt "保持身份特征，修改服装" --label "服装变体"
 ```
 
 脚本输出单行 JSON，`path` 是生成图片的绝对路径。Agent 必须打开该图片进行视觉检查，再报告成功或继续编辑。

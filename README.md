@@ -1,4 +1,4 @@
-# AI 直播工具箱（E:\Doc\AI直播）
+# AI 直播工具箱
 
 一套围绕「B站 AI 直播弹幕助手」的本地 AI 工具集合，包含直播弹幕回复、角色管理、家庭桌宠、
 GUI 网页/桌面视觉控制、本地语音识别、长期记忆与子技能。所有组件**共享同一份 Python 环境**与
@@ -8,7 +8,7 @@ GUI 网页/桌面视觉控制、本地语音识别、长期记忆与子技能。
 
 | 目录 / 文件 | 功能 | 启动方式 |
 |------|------|------|
-| `main.py` / `manager.py` / `src/ai_live_assistant/` / `web/` | **B站 AI 直播弹幕助手**（主程序 + 可视化管理后台 :9888） | `启动管理页面.bat` |
+| `modules/live/`（根目录 `main.py` / `manager.py` 为兼容入口） | **B站 AI 直播弹幕助手**（主程序 + 可视化管理后台 :9888） | `启动管理页面.bat` |
 | `CharacterManager/` | **角色管理器**（Tkinter GUI，管理身份/记忆/人格/模型/语音/图片） | `启动角色管理器.bat` |
 | `HomeAgent/` | **家庭桌宠**（透明悬浮窗，语音对话、操控电脑、调度任务） | `HomeAgent\启动家庭Agent.bat` |
 | `Vision/` | **GUI 网页/桌面控制 Agent**（本地 GUI-Actor-2B 视觉 grounding，MCP 服务） | HTTP :8765（被 HomeAgent 托管） |
@@ -25,7 +25,7 @@ GUI 网页/桌面视觉控制、本地语音识别、长期记忆与子技能。
 ## 共享环境（重要）
 
 所有子项目（Vision、Sound、主程序、HomeAgent、CharacterManager）**都使用同一个 venv**：
-`E:\Doc\AI直播\.venv\Scripts\python.exe`（Python 3.12）。
+`.venv\Scripts\python.exe`（从项目根目录运行，Python 3.12）。
 
 该环境已安装：
 - 直播/角色：`aiohttp`、`PyYAML`、`python-dotenv`、`Pillow`、`sounddevice`、`numpy`
@@ -184,7 +184,7 @@ SQLite 数据库 `LongTermMemory/memory.db`，表 `memories` 字段：
 - `schedule-home-task`：家庭定时任务。
 - `sing-with-mimo`：用 MiMo 唱歌。
 
-HomeAgent 通过 `config.yaml` 的 `agent.skill_root`（`E:\Doc\AI直播\Skill`）按需调用。
+HomeAgent 通过 `HomeAgent/config.yaml` 的 `agent.skill_root`（默认 `Skill`）按需调用。
 
 ---
 

@@ -16,7 +16,7 @@ import aiohttp
 import yaml
 from dotenv import dotenv_values
 
-ROOT = Path(os.getenv("AI_LIVE_ROOT", r"E:\Doc\AI直播"))
+ROOT = Path(os.getenv("AI_LIVE_ROOT", str(Path(__file__).resolve().parents[3]))).resolve()
 CONFIG = ROOT / "config.yaml"
 
 

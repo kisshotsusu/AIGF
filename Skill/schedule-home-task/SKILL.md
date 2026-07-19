@@ -33,4 +33,4 @@ Never create a recurring schedule when the user requested a one-time reminder. N
 
 Wait one minute after each spoken reminder for acknowledgement. If none is received, speak again up to two additional times. Complete the current cycle after acknowledgement or after the third total reminder. Delete a completed one-time task; retain a recurring task and calculate its next scheduled occurrence.
 
-Task JSON files live in `E:\Doc\AI直播\Task`. The deterministic storage and recurrence implementation is in `scripts/task_manager.py`.
+Task JSON files live in the project-relative `Task/` directory. The deterministic storage and recurrence implementation is in `scripts/task_manager.py`.

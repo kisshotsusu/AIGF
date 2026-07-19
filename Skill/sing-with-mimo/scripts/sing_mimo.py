@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(r"E:\Doc\AI直播")
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 from src.ai_live_assistant.tts import cleanup_audio_files
 CONFIG = ROOT / "config.yaml"

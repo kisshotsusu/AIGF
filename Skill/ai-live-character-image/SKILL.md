@@ -1,6 +1,6 @@
 ---
 name: ai-live-character-image
-description: Generate, edit, inspect, and manage images for the local AI livestream character through a configurable multimodal or Images API. Use when asked to create the character's portrait, avatar, outfit, expression, pose, scene, visual variant, or edited image, or to register/set a generated result in the AI livestream character image library at E:\Doc\AI直播.
+description: Generate, edit, inspect, and manage images for the local AI livestream character through a configurable multimodal or Images API. Use when asked to create the character's portrait, avatar, outfit, expression, pose, scene, visual variant, or edited image, or to register/set a generated result in the current project's AI livestream character image library.
 ---
 
 # AI Live Character Image
@@ -9,9 +9,9 @@ Create and operate the livestream character's visual assets while preserving ide
 
 ## Workflow
 
-1. Read `E:\Doc\AI直播\workspace\CHARACTER.md` and `workspace\character_images\manifest.json`.
+1. Read project-relative `workspace/CHARACTER.md` and `workspace/character_images/manifest.json`.
 2. When a primary image exists, inspect it with `view_image` before composing a prompt. Use it as the default reference for edits and identity-preserving variants.
-3. Check `image_generation` in `E:\Doc\AI直播\config.yaml`. Read [provider-config.md](references/provider-config.md) only when configuration or provider adaptation is needed.
+3. Check `image_generation` in project-relative `config.yaml`. Read [provider-config.md](references/provider-config.md) only when configuration or provider adaptation is needed.
    In a new agent environment or a network without VPN, read [agent-handoff.md](references/agent-handoff.md) before the first call.
 4. Run `scripts/character_image_api.py`:
 

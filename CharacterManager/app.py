@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 import yaml
 from PIL import Image, ImageTk
 
-ROOT = Path(r"E:\Doc\AI直播")
+ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config.yaml"
 WORKSPACE = ROOT / "workspace"
 IDENTITY = WORKSPACE / "IDENTITY.yaml"

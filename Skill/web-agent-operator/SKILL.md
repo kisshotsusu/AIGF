@@ -39,7 +39,7 @@ If a state fails, retry with at most two sensible alternatives. Return the faile
 Use the deterministic script for search-and-play tasks:
 
 ```powershell
-E:\Doc\AI直播\.venv\Scripts\python.exe scripts\web_agent.py --site bilibili --query "hanser 芒种" --action play
+..\..\.venv\Scripts\python.exe scripts\web_agent.py --site bilibili --query "hanser 芒种" --action play
 ```
 
 The script emits JSON progress events and ends with `completed` only after the selected page and requested playback state are verified.

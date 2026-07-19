@@ -2,9 +2,9 @@
 
 ## 启动入口
 
-- 直播管理页：`E:\Doc\AI直播\启动管理页面.bat`
-- 角色管理器：`E:\Doc\AI直播\启动角色管理器.bat`
-- 家庭桌宠：`E:\Doc\AI直播\HomeAgent\启动家庭Agent.bat`
+- 直播管理页：`启动管理页面.bat`
+- 角色管理器：`启动角色管理器.bat`
+- 家庭桌宠：`HomeAgent\启动家庭Agent.bat`
 - 环境安装：`set_env.bat`
 - 模型下载：`down_model.bat`
 
@@ -12,7 +12,7 @@
 
 ## 修改后的最低验证
 
-- Python：使用 `E:\Doc\AI直播\.venv\Scripts\python.exe -m py_compile ...`。
+- Python：从项目根目录使用 `.venv\Scripts\python.exe -m py_compile ...`。
 - YAML：用 `yaml.safe_load` 读取根配置和 HomeAgent 配置。
 - MCP：检查 8765 监听，然后初始化会话并 `list_tools`。
 - 网页 Agent：运行 `Skill/web-agent-operator/scripts/web_agent.py` 做无截图端到端测试。
@@ -39,4 +39,3 @@
 - `audio/` 始终只保留最新 20 个音频，旧文件优先删除。
 - 家庭长文本分块：生成一段即入播放队列，同时生成下一段；播放严格按序且不重叠。
 - TTS 文本过滤不支持 GBK 的 emoji，避免把音乐符号等字符传给外部批处理。
-

@@ -1,6 +1,6 @@
 # Provider configuration
 
-Configure `image_generation` in `E:\Doc\AI直播\config.yaml` and place the key in `E:\Doc\AI直播\.env`.
+Configure `image_generation` in project-relative `config.yaml` and place the key in `.env`.
 
 ```yaml
 image_generation:
@@ -29,4 +29,3 @@ IMAGE_API_KEY=replace-me
 - Extracts an image from `choices[0].message.images`, `choices[0].message.content`, a data URI, or a direct response `data` item.
 
 Provider-specific fields can be added under `extra_body`; the script merges them into the request body.
-

@@ -18,9 +18,16 @@ reply:
   bot_names: ["小助手", "主播"]
   prefixes: ["!ai", "问一下"]
   ignore_users: []
+  ignore_masked_usernames: true
   cooldown_seconds: 2
   max_context_messages: 12
   max_memory_items: 8
+
+gift_reply:
+  enabled: true
+  cooldown_seconds: 8
+  min_total_coin: 0
+  template: "谢谢{username}送出的{gift_name}×{num}！"
 
 llm:
   provider: deepseek            # deepseek | mimo | custom

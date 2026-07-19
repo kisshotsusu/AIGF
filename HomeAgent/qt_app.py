@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QScrollArea, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from agent import HOME_AGENT, ROOT, HomeAgent
@@ -37,25 +38,61 @@ class Bridge(QObject):
     finished = Signal()
     transcription = Signal(str)
     confirm = Signal(str, object)
+    progress = Signal(object)
 
 
 class ChatWorker(QThread):
     def __init__(self, agent: HomeAgent, prompt: str, bridge: Bridge, confirm):
         super().__init__(); self.agent = agent; self.prompt = prompt; self.bridge = bridge; self.confirm = confirm
-        self.loop = None; self.task = None
+        self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.last_report_at = 0.0; self.report_count = 0
+
+    async def progress_clock(self):
+        while True:
+            await asyncio.sleep(5)
+            self.report_status(self.current_step or "正在处理任务…")
+
+    @staticmethod
+    async def drain_tasks(tasks):
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def report_status(self, text):
+        value = str(text).strip()
+        if not value: return
+        if self.current_step and self.current_step != value and self.current_step not in self.completed_steps:
+            self.completed_steps.append(self.current_step)
+            self.completed_steps = self.completed_steps[-8:]
+        if value.startswith("已完成："):
+            done = value.removeprefix("已完成：").strip()
+            if done and done not in self.completed_steps: self.completed_steps.append(done)
+        else: self.current_step = value
+        elapsed = max(0, int(time.monotonic() - self.started_at))
+        snapshot = {"current": self.current_step, "completed": list(self.completed_steps), "elapsed": elapsed, "state": "running"}
+        self.bridge.status.emit(value); self.bridge.progress.emit(snapshot)
+        cfg = self.agent.config.get("progress_reporting", {})
+        threshold = max(15, int(cfg.get("long_task_seconds", 60))); cooldown = max(30, int(cfg.get("tts_cooldown_seconds", 90))); limit = max(0, int(cfg.get("max_reports_per_task", 3)))
+        reportable = not any(word in value for word in ("语音", "播放", "录音", "识别"))
+        if cfg.get("enabled", True) and reportable and elapsed >= threshold and self.report_count < limit and time.monotonic() - self.last_report_at >= cooldown and self.loop:
+            self.last_report_at = time.monotonic(); self.report_count += 1
+            report = self.loop.create_task(self.agent.speak_progress_report(self.prompt, list(self.completed_steps), self.current_step, elapsed)); self.report_tasks.add(report); report.add_done_callback(self.report_tasks.discard)
 
     def run(self):
-        self.loop = asyncio.new_event_loop()
+        self.loop = asyncio.new_event_loop(); self.started_at = time.monotonic()
         try:
             asyncio.set_event_loop(self.loop)
-            self.task = self.loop.create_task(self.agent.chat(self.prompt, self.bridge.status.emit, self.confirm))
+            self.task = self.loop.create_task(self.agent.chat(self.prompt, self.report_status, self.confirm))
+            self.clock = self.loop.create_task(self.progress_clock())
             self.bridge.answer.emit(self.loop.run_until_complete(self.task))
         except asyncio.CancelledError:
             self.bridge.answer.emit("当前任务已停止。")
         except Exception as exc:
             self.bridge.error.emit(str(exc))
         finally:
-            self.task = None; self.loop.close(); self.bridge.finished.emit()
+            if self.clock:
+                self.clock.cancel(); self.loop.run_until_complete(self.drain_tasks([self.clock]))
+            if self.report_tasks:
+                for report in self.report_tasks: report.cancel()
+                self.loop.run_until_complete(self.drain_tasks(list(self.report_tasks))); self.report_tasks.clear()
+            self.task = None; self.clock = None; self.loop.close(); self.bridge.finished.emit()
 
     def cancel_task(self):
         self.agent.stop_current_task()
@@ -74,6 +111,18 @@ class MessageBubble(QFrame):
         if mine: outer.addStretch(); outer.addWidget(card)
         else: outer.addWidget(card); outer.addStretch()
         card.setObjectName(bubble_name)
+
+
+class TaskProgressCard(QFrame):
+    def __init__(self):
+        super().__init__(); self.setObjectName("progressCard"); layout=QVBoxLayout(self); layout.setContentsMargins(14,11,14,12); layout.setSpacing(5)
+        top=QHBoxLayout(); self.title=QLabel("任务进行中"); self.title.setObjectName("progressTitle"); self.elapsed=QLabel("0 秒"); self.elapsed.setObjectName("muted"); top.addWidget(self.title); top.addStretch(); top.addWidget(self.elapsed); layout.addLayout(top)
+        self.current=QLabel("正在分析任务…"); self.current.setWordWrap(True); self.current.setObjectName("progressCurrent"); layout.addWidget(self.current)
+        self.done=QLabel("已完成：等待第一个阶段"); self.done.setWordWrap(True); self.done.setObjectName("progressDone"); layout.addWidget(self.done); self.started=time.monotonic(); self.timer=QTimer(self); self.timer.timeout.connect(lambda:self.elapsed.setText(f"{int(time.monotonic()-self.started)} 秒")); self.timer.start(1000)
+    def update_progress(self, data):
+        self.elapsed.setText(f"{int(data.get('elapsed',0))} 秒"); self.current.setText("当前："+str(data.get("current") or "正在处理…")); completed=data.get("completed") or []; self.done.setText("已完成："+("  ·  ".join(map(str,completed[-5:])) if completed else "暂无"))
+    def finish(self, cancelled=False):
+        self.timer.stop(); self.title.setText("任务已停止" if cancelled else "任务已完成"); self.current.setText("已结束"); self.setProperty("finished",True); self.style().unpolish(self); self.style().polish(self)
 
 
 class SettingsDialog(QDialog):
@@ -105,6 +154,8 @@ class SettingsDialog(QDialog):
             if isinstance(widget, QLineEdit): widget.textChanged.connect(self.defer_save)
             else: widget.currentTextChanged.connect(self.save)
         tabs.addTab(stt_page, "语音识别")
+        progress_page=QWidget(); progress_form=QFormLayout(progress_page); progress_cfg=cfg.get("progress_reporting",{}); self.progress_enabled=QCheckBox("长任务自动进行语音进度汇报");self.progress_enabled.setChecked(bool(progress_cfg.get("enabled",True)));self.progress_seconds=QSpinBox();self.progress_seconds.setRange(15,1800);self.progress_seconds.setSuffix(" 秒");self.progress_seconds.setValue(int(progress_cfg.get("long_task_seconds",60)));self.progress_cooldown=QSpinBox();self.progress_cooldown.setRange(30,3600);self.progress_cooldown.setSuffix(" 秒");self.progress_cooldown.setValue(int(progress_cfg.get("tts_cooldown_seconds",90)));self.progress_reports=QSpinBox();self.progress_reports.setRange(0,10);self.progress_reports.setValue(int(progress_cfg.get("max_reports_per_task",3)));progress_form.addRow("进度播报",self.progress_enabled);progress_form.addRow("长任务判定",self.progress_seconds);progress_form.addRow("播报冷却",self.progress_cooldown);progress_form.addRow("单任务最多播报",self.progress_reports);tabs.addTab(progress_page,"任务进度")
+        self.progress_enabled.toggled.connect(self.save);self.progress_seconds.valueChanged.connect(self.save);self.progress_cooldown.valueChanged.connect(self.save);self.progress_reports.valueChanged.connect(self.save)
         close = QPushButton("完成"); close.setObjectName("primaryButton"); close.clicked.connect(self.accept); root.addWidget(close, 0, Qt.AlignRight)
         self.timer = QTimer(self); self.timer.setSingleShot(True); self.timer.timeout.connect(self.save)
 
@@ -120,6 +171,7 @@ class SettingsDialog(QDialog):
             control = cfg.setdefault("computer_control", {}); control["enabled"] = self.control.isChecked(); control["full_access"] = self.full_access.isChecked(); control["confirm_before_action"] = self.confirm_file.isChecked(); control["confirm_launch_app"] = self.confirm_app.isChecked()
             cfg.setdefault("codex_cli", {})["enabled"] = self.codex.isChecked()
             stt = cfg.setdefault("stt", {}); stt["mode"] = self.stt_mode.currentText(); stt["api_url"] = self.stt_url.text().strip(); stt["model"] = self.stt_model.text().strip(); stt["language"] = self.stt_language.text().strip() or "auto"
+            progress=cfg.setdefault("progress_reporting",{});progress["enabled"]=self.progress_enabled.isChecked();progress["long_task_seconds"]=self.progress_seconds.value();progress["tts_cooldown_seconds"]=self.progress_cooldown.value();progress["max_reports_per_task"]=self.progress_reports.value()
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
             self.agent.config = cfg; self.owner.apply_always_on_top(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
         except Exception as exc: self.status.setText(f"保存失败：{exc}")
@@ -142,7 +194,7 @@ class InspectorDialog(QDialog):
 
 class HomeAgentWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None
+        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
         self.setWindowTitle(f"{self.agent.character_name} · Home Agent"); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window); self.setAttribute(Qt.WA_TranslucentBackground); self.resize(860, 380); self.setMinimumSize(640, 300)
         self._build(); self._connect(); self.apply_always_on_top()
         self.scheduler = QTimer(self); self.scheduler.timeout.connect(self.poll_tasks); self.scheduler.start(10000)
@@ -167,23 +219,28 @@ class HomeAgentWindow(QMainWindow):
 
     def _connect(self):
         self.send_btn.clicked.connect(self.send); self.stop_btn.clicked.connect(self.stop_task); self.voice_btn.clicked.connect(self.toggle_record); QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self.send)
-        self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
+        self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.progress.connect(self.update_task_progress); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
 
     def append_message(self, role, name, text):
         self.message_layout.insertWidget(self.message_layout.count() - 1, MessageBubble(role, name, str(text)))
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
 
     def set_status(self, text): self.status.setText(str(text))
+    def update_task_progress(self, data):
+        if self.progress_card: self.progress_card.update_progress(data)
+        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
     def send(self):
         text = self.input.toPlainText().strip()
         if not text or (self.worker and self.worker.isRunning()): return
-        self.input.clear(); self.append_message("user", self.agent.config.get("home", {}).get("user_name", "你"), text); self.agent.begin_task(); self.send_btn.setEnabled(False); self.stop_btn.setEnabled(True); self.set_status("正在思考…")
+        self.input.clear(); self.append_message("user", self.agent.config.get("home", {}).get("user_name", "你"), text); self.progress_card=TaskProgressCard(); self.message_layout.insertWidget(self.message_layout.count()-1,self.progress_card); self.task_cancelled=False; self.agent.begin_task(); self.send_btn.setEnabled(False); self.stop_btn.setEnabled(True); self.set_status("正在思考…")
         self.worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action); self.worker.start()
 
     def stop_task(self):
-        if self.worker and self.worker.isRunning(): self.worker.cancel_task(); self.set_status("正在停止…")
+        if self.worker and self.worker.isRunning(): self.task_cancelled=True; self.worker.cancel_task(); self.set_status("正在停止…")
 
-    def finish_task(self): self.send_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.set_status("就绪"); self.input.setFocus()
+    def finish_task(self):
+        if self.progress_card:self.progress_card.finish(self.task_cancelled)
+        self.send_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.set_status("就绪"); self.input.setFocus()
 
     def confirm_action(self, description):
         request = {"event": threading.Event(), "ok": False}
@@ -303,6 +360,7 @@ QMainWindow {{ background: transparent; }}
 QScrollArea {{ background: {COLORS['window']}; }} QScrollArea > QWidget > QWidget {{ background: {COLORS['window']}; }}
 #bubbleAgent {{ background: {COLORS['panel']}; border: 1px solid {COLORS['line']}; border-radius: 15px; }} #bubbleUser {{ background: {COLORS['accent']}; border-radius: 15px; }} #bubbleError {{ background: #FFF0EF; border: 1px solid #F5C9C7; border-radius: 15px; }}
 #bubbleUser QLabel {{ color: white; }} #bubbleName {{ font-size: 11px; font-weight: 700; color: {COLORS['muted']}; }} #bubbleText {{ font-size: 14px; }}
+#progressCard {{ background: #EDF7F4; border: 1px solid #9BCDC2; border-radius: 14px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #F4F7F6; border-color: #CCD9D6; }} #progressTitle {{ color: #115F59; font-size: 14px; font-weight: 700; }} #progressCurrent {{ color: #173D37; font-weight: 600; }} #progressDone {{ color: #425C56; font-size: 12px; }}
 #composer {{ background: {COLORS['panel']}; border-top: 1px solid {COLORS['line']}; border-bottom-left-radius: 22px; border-bottom-right-radius: 22px; }}
 #input, QLineEdit, QComboBox, QTextBrowser {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 12px; padding: 10px; selection-background-color: {COLORS['accent']}; }} #input:focus, QLineEdit:focus {{ border: 1px solid {COLORS['accent']}; }}
 QPushButton {{ min-height: 34px; padding: 0 15px; border-radius: 10px; font-weight: 600; }} #primaryButton {{ background: {COLORS['accent']}; color: white; border: 0; }} #primaryButton:hover {{ background: {COLORS['accent_hover']}; }} #softButton {{ background: {COLORS['soft']}; color: {COLORS['accent']}; border: 0; }} #stopButton {{ background: white; color: {COLORS['danger']}; border: 1px solid #EBC1BF; }} #stopButton:disabled {{ color: #AAB4B5; border-color: {COLORS['line']}; }}

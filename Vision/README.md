@@ -16,7 +16,7 @@ Vision/
 ├── timed_baidu.py / demo_baidu.py / smoke_test.py  # 验证/演示脚本
 └── logs/                      # 日志
 ```
-> 注意：本目录**不再单独持有 venv**，统一使用父级共享环境 `E:\Doc\AI直播\.venv`
+> 注意：本目录**不再单独持有 venv**，统一使用项目根目录的共享环境 `.venv`
 > （Python 3.12 + torch cu128，详见父目录 README「共享环境」一节）。
 
 ## 运行方式（两种）
@@ -31,18 +31,18 @@ HomeAgent 的 `config.yaml` 中 `vision_mcp.auto_start: true` 会自动拉起本
 ```bat
 set VISION_MCP_TRANSPORT=http
 set VISION_PRELOAD_MODEL=1
-E:\Doc\AI直播\.venv\Scripts\python.exe E:\Doc\AI直播\Vision\mcp_server.py
+.venv\Scripts\python.exe Vision\mcp_server.py
 ```
 
 ### 方式 B：注册到 WorkBuddy 作为 stdio 工具
 在 `~/.workbuddy/mcp.json` 增加：
 ```json
 "vision-gui": {
-  "command": "E:\\Doc\\AI直播\\.venv\\Scripts\\python.exe",
-  "args": ["E:\\Doc\\AI直播\\Vision\\mcp_server.py"],
+  "command": ".venv\\Scripts\\python.exe",
+  "args": ["Vision\\mcp_server.py"],
   "env": {
-    "GUI_ACTOR_MODEL": "E:\\Doc\\AI直播\\Vision\\models\\GUI-Actor-2B-Qwen2-VL",
-    "GUI_ACTOR_REPO": "E:\\Doc\\AI直播\\Vision\\GUI-Actor"
+    "GUI_ACTOR_MODEL": "Vision\\models\\GUI-Actor-2B-Qwen2-VL",
+    "GUI_ACTOR_REPO": "Vision\\GUI-Actor"
   }
 }
 ```

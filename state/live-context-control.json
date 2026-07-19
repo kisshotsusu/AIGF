@@ -3,6 +3,7 @@
   "token": "1784344768254114100",
   "requested_at": "2026-07-18T11:19:28",
   "source": "home-agent",
-  "status": "storage_cleared",
-  "removed_messages": 0
+  "status": "completed",
+  "removed_messages": 0,
+  "completed_at": "2026-07-18T23:52:03"
 }

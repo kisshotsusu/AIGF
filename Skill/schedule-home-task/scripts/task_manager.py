@@ -176,7 +176,7 @@ class TaskStore:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default=r"E:\Doc\AI直播\Task")
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[3] / "Task"))
     parser.add_argument("command", choices=["list"])
     args = parser.parse_args()
     print(json.dumps(TaskStore(args.root).list(), ensure_ascii=False, indent=2))

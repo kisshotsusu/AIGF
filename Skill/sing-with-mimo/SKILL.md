@@ -9,7 +9,7 @@ Generate and play a short WAV by default through the existing local character TT
 
 ## Workflow
 
-1. Read `E:\Doc\AI直播\workspace\IDENTITY.yaml` and the `singing`/`tts` sections in `E:\Doc\AI直播\config.yaml`.
+1. Read project-relative `workspace/IDENTITY.yaml` and the `singing`/`tts` sections in `config.yaml`.
 2. Prepare at most ten short lyric lines:
    - Use lyrics supplied by the user, explicitly licensed lyrics, or public-domain lyrics when available.
    - For a named commercial song without supplied rights-cleared lyrics, do not search for or reproduce its lyrics. Write ten new lines matching the requested topic or mood, and state that they are original rather than the song's original lyrics.

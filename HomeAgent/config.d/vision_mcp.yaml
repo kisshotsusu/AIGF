@@ -1,7 +1,7 @@
 enabled: true
 server_name: vision-gui
 auto_start: true
-preload_model: true
+preload_model: false
 gui_enabled: true
 host: 127.0.0.1
 port: 8765

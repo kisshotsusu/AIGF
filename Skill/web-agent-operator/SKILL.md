@@ -1,6 +1,6 @@
 ---
 name: web-agent-operator
-description: Complete outcome-oriented, multi-step webpage tasks through DOM and text tools without image GUI recognition. Use whenever the user asks to open or visit a website and then search, find, select, compare, navigate, play media, fill a form, click, submit, or verify something. Prevents stopping after merely opening a homepage; especially use for Bilibili search-and-play requests.
+description: Complete outcome-oriented webpage tasks by reading and operating the current browser page DOM/HTML first, then falling back to browser-window vision or desktop vision only when DOM access is unavailable or the active program is not a webpage. Use for website search, selection, navigation, media, forms, clicks, submission, and verification, especially tasks that must preserve the user's signed-in browser session.
 ---
 
 # Web Agent Operator
@@ -21,12 +21,15 @@ Never reinterpret a multi-step request as open-only. Never call `open_url` and r
 ## Workflow
 
 1. Extract `site`, `query`, qualifiers, requested action, and observable success condition. If the query cannot be extracted, ask instead of opening an empty homepage.
-2. Navigate directly to a safe search URL when the site supports one; otherwise `navigate` to the site, `web_read`, locate the search input, then `web_fill(..., submit=true)`.
-3. Verify the search actually happened with `get_url` and `web_read`. The URL, input value, page title, or result text must contain the query or unmistakably relevant results.
-4. Rank results using all meaningful query terms. Prefer a candidate matching more qualifiers; do not blindly select the first item.
-5. Open the selected result with `web_click_text` or `navigate`, then verify the URL/title/body changed to the intended destination.
-6. Perform the requested final action such as `web_play_media`, form fill, click, or submit.
-7. Call `get_url` and `web_read` after the final action. Report success only with observable evidence.
+2. Call `inspect_active_target` before acting.
+   - `browser_dom`: call `web_read` immediately and operate the current signed-in page through DOM/text tools.
+   - `browser_visual`: keep the existing browser and use `window_screenshot`, `window_click`, and `window_type_text`; do not launch another browser merely to obtain DOM access.
+   - `desktop_visual`: the active program is not a supported webpage; use window/desktop vision tools.
+3. Navigate directly to a safe search URL only when the current page cannot reach the requested site; otherwise locate the current page search input from `web_read`, then `web_fill(..., submit=true)`.
+4. Verify the search actually happened with `get_url` and `web_read` when DOM is available; otherwise verify from a fresh window screenshot.
+5. Rank results using all meaningful query terms. Prefer a candidate matching more qualifiers; do not blindly select the first item.
+6. Open the selected result with DOM tools when available, then verify the URL/title/body changed. Use visual coordinates only in a visual fallback mode.
+7. Perform the requested final action and verify its resulting state. Report success only with observable evidence.
 
 Use this state sequence and do not skip states:
 
@@ -46,6 +49,10 @@ The script emits JSON progress events and ends with `completed` only after the s
 
 ## Guardrails
 
+- Prefer live DOM/HTML because it exposes exact text, links, buttons, inputs, labels, and URLs.
+- DOM access to a normal Chrome/Edge session requires its CDP debugging endpoint. If unavailable, keep that browser session and fall back to window vision.
+- Never close a user browser connected through CDP.
+- Do not use desktop vision when `inspect_active_target` reports `browser_dom` unless DOM operations fail twice or the relevant UI is canvas/video-only.
 - Do not use GUI-Actor, screenshots, coordinate clicks, or desktop/window image tools while GUI recognition is disabled.
 - Do not stop after `navigate` unless opening the page is the complete request.
 - Do not treat a browser process launch, tab creation, HTTP 200, or homepage title as evidence that search or selection finished.

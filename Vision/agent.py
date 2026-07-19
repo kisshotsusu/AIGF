@@ -19,6 +19,8 @@ import ctypes
 import ctypes.wintypes
 import subprocess
 import time
+import json
+import urllib.request
 
 import torch
 from PIL import Image, ImageGrab
@@ -52,6 +54,83 @@ _tokenizer = None
 _pw = None
 _browser = None
 _page = None
+_owns_browser = False
+_browser_source = "none"
+
+_BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe", "firefox.exe"}
+_CDP_ENDPOINTS = tuple(
+    item.strip() for item in os.environ.get(
+        "BROWSER_CDP_ENDPOINTS", "http://127.0.0.1:9222,http://127.0.0.1:9223,http://127.0.0.1:9333"
+    ).split(",") if item.strip()
+)
+
+
+def _foreground_window():
+    """Return the active Windows window without loading the vision model."""
+    if os.name != "nt":
+        return {"title": "", "pid": 0, "process_name": "", "is_browser": False}
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    length = user32.GetWindowTextLengthW(hwnd)
+    title = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, title, length + 1)
+    pid = ctypes.wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    process_name = ""
+    try:
+        import psutil
+        process_name = psutil.Process(pid.value).name().lower()
+    except Exception:
+        pass
+    return {
+        "title": title.value,
+        "pid": int(pid.value),
+        "process_name": process_name,
+        "is_browser": process_name in _BROWSER_PROCESSES,
+    }
+
+
+def _available_cdp_endpoint():
+    for endpoint in _CDP_ENDPOINTS:
+        try:
+            with urllib.request.urlopen(endpoint.rstrip("/") + "/json/version", timeout=0.35) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+            if payload.get("webSocketDebuggerUrl"):
+                return endpoint
+        except Exception:
+            continue
+    return None
+
+
+def _select_existing_page(browser, foreground_title: str = ""):
+    pages = [p for context in browser.contexts for p in context.pages if not p.is_closed()]
+    usable = [p for p in pages if p.url and not p.url.startswith(("devtools://", "chrome-extension://"))]
+    pages = usable or pages
+    if not pages:
+        return None
+    needle = foreground_title.casefold()
+    if needle:
+        for page in reversed(pages):
+            try:
+                title = page.title().casefold()
+                if title and (title in needle or needle in title):
+                    return page
+            except Exception:
+                continue
+    return pages[-1]
+
+
+def inspect_active_target():
+    """Classify the active target and report whether its live DOM is readable."""
+    window = _foreground_window()
+    endpoint = _available_cdp_endpoint() if window["is_browser"] else None
+    if window["is_browser"] and endpoint:
+        mode, reason = "browser_dom", "active browser exposes a CDP DOM"
+    elif window["is_browser"]:
+        mode, reason = "browser_visual", "active browser does not expose a CDP DOM"
+    else:
+        mode, reason = "desktop_visual", "active program is not a supported browser page"
+    return {**window, "mode": mode, "cdp_endpoint": endpoint or "", "reason": reason}
 
 
 def load_model():
@@ -76,13 +155,29 @@ _USER_AGENT = (
 )
 
 
-def ensure_browser():
-    global _pw, _browser, _page
+def ensure_browser(prefer_existing: bool = True, allow_launch: bool = True):
+    global _pw, _browser, _page, _owns_browser, _browser_source
     if (_page is not None and not _page.is_closed()
             and _browser is not None and _browser.is_connected()):
         return _page
     reset_browser()
     _pw = sync_playwright().start()
+    if prefer_existing:
+        endpoint = _available_cdp_endpoint()
+        if endpoint:
+            try:
+                _browser = _pw.chromium.connect_over_cdp(endpoint)
+                _page = _select_existing_page(_browser, _foreground_window().get("title", ""))
+                if _page is not None:
+                    _owns_browser = False
+                    _browser_source = "existing_cdp"
+                    return _page
+            except PlaywrightError:
+                _browser = None
+                _page = None
+    if not allow_launch:
+        reset_browser()
+        raise RuntimeError("current browser DOM is unavailable; use browser/window vision fallback")
     _browser = _pw.chromium.launch(
         headless=HEADLESS,
         args=[
@@ -97,6 +192,8 @@ def ensure_browser():
         user_agent=_USER_AGENT,
     )
     _page = ctx.new_page()
+    _owns_browser = True
+    _browser_source = "playwright_new"
     # 抹掉 webdriver 标记, 降低被风控识别的概率
     _page.add_init_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -106,13 +203,13 @@ def ensure_browser():
 
 def reset_browser():
     """Dispose a stale Playwright session without affecting the MCP server."""
-    global _pw, _browser, _page
+    global _pw, _browser, _page, _owns_browser, _browser_source
     try:
-        if _page is not None and not _page.is_closed(): _page.context.close()
+        if _owns_browser and _page is not None and not _page.is_closed(): _page.context.close()
     except Exception:
         pass
     try:
-        if _browser is not None and _browser.is_connected(): _browser.close()
+        if _owns_browser and _browser is not None and _browser.is_connected(): _browser.close()
     except Exception:
         pass
     try:
@@ -120,6 +217,7 @@ def reset_browser():
     except Exception:
         pass
     _page = None; _browser = None; _pw = None
+    _owns_browser = False; _browser_source = "none"
 
 
 def _adopt_latest_page(page):
@@ -309,6 +407,8 @@ def web_read(max_chars: int = 12000):
       inputs: [...document.querySelectorAll('input,textarea,[contenteditable=true]')].slice(0,80).map((e, i) => ({i, type:e.type||'', name:e.name||'', placeholder:e.placeholder||'', aria:e.getAttribute('aria-label')||''}))
     })""")
     data["text"] = str(data.get("text", ""))[:max(1000, min(int(max_chars), 30000))]
+    data["browser_source"] = _browser_source
+    data["dom_available"] = True
     return data
 
 

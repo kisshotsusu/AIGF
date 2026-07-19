@@ -40,6 +40,12 @@ async def _web_call(function, *args):
 
 
 @mcp.tool()
+async def inspect_active_target() -> str:
+    """Classify the active window before acting: browser_dom, browser_visual, or desktop_visual."""
+    return str(await _web_call(agent.inspect_active_target))
+
+
+@mcp.tool()
 async def navigate(url: str) -> str:
     """打开一个网页 URL。返回最终跳转后的地址。"""
     return await _web_call(agent.navigate, url)

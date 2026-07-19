@@ -458,6 +458,10 @@ class HomeAgent:
             "GUI_ACTOR_MODEL": str(ROOT / "Vision" / "models" / "GUI-Actor-2B-Qwen2-VL"),
             "GUI_ACTOR_REPO": str(ROOT / "Vision" / "GUI-Actor"),
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "BROWSER_CDP_ENDPOINTS": ",".join(str(item) for item in cfg.get(
+                "existing_browser_cdp_endpoints",
+                ["http://127.0.0.1:9222", "http://127.0.0.1:9223", "http://127.0.0.1:9333"],
+            )),
         })
         try:
             flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS) if os.name == "nt" else 0
@@ -846,10 +850,14 @@ class HomeAgent:
             + ("本任务必须优先使用合适的 MCP 工具；若没有可用 MCP，请明确说明。\n\n" if require_mcp else "")
             + (f"本任务必须首先使用 `{preferred_mcp}` MCP。"
                + ("这是网页任务且图像 GUI 已关闭：必须遵循项目内 Skill/web-agent-operator/SKILL.md，"
-                  "只用 navigate/get_url/web_read/web_fill/web_click_text/web_press/web_play_media。"
+                  "网页操作前先调用 inspect_active_target。若 mode=browser_dom，优先读取当前网页的 web_read DOM/HTML，"
+                  "并只用 get_url/web_read/web_fill/web_click_text/web_press/web_play_media 操作现有页面；"
+                  "若 mode 不是 browser_dom，因为图像 GUI 已关闭，应明确返回当前页面 DOM 不可用，不能调用视觉工具。"
+                  "不要为了读取 DOM 强制新开浏览器。"
                   "打开首页只是阶段一，绝不是完成；必须继续搜索、读取结果、选择匹配项、执行目标动作，并读取最终页面验证。"
                   "只有终态证据满足用户目标才能报告成功。\n\n" if not gui_enabled else
-                  "先拆解用户请求中的全部动作并建立完成清单。网页优先使用 navigate/web_read/web_fill/web_click_text/web_press；"
+                  "先拆解用户请求中的全部动作并建立完成清单。先调用 inspect_active_target 判定目标；"
+                  "browser_dom 优先使用当前页 HTML/DOM，browser_visual 使用浏览器窗口视觉，desktop_visual 使用桌面视觉；"
                   "需要图像定位时，视觉点击输入框后用 type_active_text 输入，禁止为同一输入框重复定位。"
                   "原生应用先用 list_windows 检测目标窗口，再用 window_screenshot/window_click/window_type_text。"
                   "每次点击、输入、搜索、选择后必须重新读取或截图验证；清单中任何动作未完成时不得结束或报告成功。"

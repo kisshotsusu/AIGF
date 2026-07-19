@@ -286,7 +286,7 @@ class ModelPage(QWidget):
         try:
             old=self.s.get_config_section("llm");old["provider"]=self.current.currentText();old.setdefault("providers",{})
             for k,(a,b) in self.tuning.items():old[k]={"temperature":a.value(),"max_tokens":b.value()}
-            for name,(base,model,env,secret,status) in self.providers.items():old["providers"][name]={"base_url":base.text().strip(),"model":model.text().strip(),"api_key_env":env.text().strip()};self.s.save_secret(env.text().strip(),secret.text().strip());secret.clear()
+            for name,(base,model,env,secret,status) in self.providers.items():entry=dict(old["providers"].get(name,{}) or {});entry.update({"base_url":base.text().strip(),"model":model.text().strip(),"api_key_env":env.text().strip()});old["providers"][name]=entry;self.s.save_secret(env.text().strip(),secret.text().strip());secret.clear()
             self.s.save_config_section("llm",old);self.load();toast(self,"模型 API 设置已保存")
         except Exception as exc:alert(self,exc)
 
@@ -336,11 +336,13 @@ class ImageApiPage(QWidget):
     def __init__(self,s):
         super().__init__();self.s=s;lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("图片 API","配置角色图片生成接口，密钥安全保存到项目 .env。"));box=QGroupBox("图像生成服务");f=QFormLayout(box);self.mode=QComboBox();self.mode.addItems(["images","chat_multimodal"]);self.base=QLineEdit();self.model=QLineEdit();self.size=QComboBox();self.size.setEditable(True);self.size.addItems(["1024x1024","1536x1024","1024x1536"]);self.timeout=QSpinBox();self.timeout.setRange(10,1800);self.env=QLineEdit();self.key=QLineEdit();self.key.setEchoMode(QLineEdit.Password);self.key.setPlaceholderText("留空则保留现有密钥")
         for label,w in (("接口模式",self.mode),("Base URL",self.base),("模型名称",self.model),("输出尺寸",self.size),("超时秒数",self.timeout),("密钥环境变量",self.env),("API Key",self.key)):f.addRow(label,w)
-        lay.addWidget(box);lay.addStretch();row=QHBoxLayout();row.addStretch();row.addWidget(button("保存图片 API",self.save,primary=True));lay.addLayout(row);self.load()
+        lay.addWidget(box);ubox=QGroupBox("MiMo 图像理解服务");uf=QFormLayout(ubox);self.ubase=QLineEdit();self.umodel=QLineEdit();self.uenv=QLineEdit();self.ukey=QLineEdit();self.ukey.setEchoMode(QLineEdit.Password);self.ukey.setPlaceholderText("留空则保留现有密钥");self.utimeout=QSpinBox();self.utimeout.setRange(10,600)
+        for label,w in (("Base URL",self.ubase),("多模态模型",self.umodel),("超时秒数",self.utimeout),("密钥环境变量",self.uenv),("API Key",self.ukey)):uf.addRow(label,w)
+        note=QLabel("MiMo 在 chat/completions 中提供图片理解并返回文字，不替代上方的图片生成/编辑服务。");note.setWordWrap(True);uf.addRow(note);lay.addWidget(ubox);lay.addStretch();row=QHBoxLayout();row.addStretch();row.addWidget(button("保存图片 API",self.save,primary=True));lay.addLayout(row);self.load()
     def load(self):
-        c=self.s.get_config_section("image_generation");self.mode.setCurrentText(str(c.get("mode","images")));self.base.setText(str(c.get("base_url","")));self.model.setText(str(c.get("model","")));self.size.setCurrentText(str(c.get("size","1024x1024")));self.timeout.setValue(int(c.get("timeout_seconds",180)));self.env.setText(str(c.get("api_key_env","IMAGE_API_KEY")))
+        c=self.s.get_config_section("image_generation");self.mode.setCurrentText(str(c.get("mode","images")));self.base.setText(str(c.get("base_url","")));self.model.setText(str(c.get("model","")));self.size.setCurrentText(str(c.get("size","1024x1024")));self.timeout.setValue(int(c.get("timeout_seconds",180)));self.env.setText(str(c.get("api_key_env","IMAGE_API_KEY")));u=self.s.get_config_section("image_understanding");self.ubase.setText(str(u.get("base_url","https://api.xiaomimimo.com/v1")));self.umodel.setText(str(u.get("model","mimo-v2.5")));self.utimeout.setValue(int(u.get("timeout_seconds",60)));self.uenv.setText(str(u.get("api_key_env","MIMO_API_KEY")))
     def save(self):
-        try:self.s.save_config_section("image_generation",{"mode":self.mode.currentText(),"base_url":self.base.text().strip(),"model":self.model.text().strip(),"size":self.size.currentText().strip(),"timeout_seconds":self.timeout.value(),"api_key_env":self.env.text().strip()});self.s.save_secret(self.env.text().strip(),self.key.text().strip());self.key.clear();toast(self,"图片 API 设置已保存")
+        try:self.s.save_config_section("image_generation",{"mode":self.mode.currentText(),"base_url":self.base.text().strip(),"model":self.model.text().strip(),"size":self.size.currentText().strip(),"timeout_seconds":self.timeout.value(),"api_key_env":self.env.text().strip()});self.s.save_secret(self.env.text().strip(),self.key.text().strip());self.s.save_config_section("image_understanding",{"provider":"mimo","base_url":self.ubase.text().strip(),"model":self.umodel.text().strip(),"timeout_seconds":self.utimeout.value(),"api_key_env":self.uenv.text().strip(),"auth_header":"api-key","max_tokens_field":"max_completion_tokens","max_completion_tokens":1024,"extra_body":{"thinking":{"type":"disabled"}}});self.s.save_secret(self.uenv.text().strip(),self.ukey.text().strip());self.key.clear();self.ukey.clear();toast(self,"图片 API 设置已保存")
         except Exception as exc:alert(self,exc)
 
 

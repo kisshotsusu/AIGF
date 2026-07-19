@@ -43,6 +43,11 @@ llm:
       base_url: "https://api.xiaomimimo.com/v1"
       api_key_env: MIMO_API_KEY
       model: mimo-v2.5
+      auth_header: api-key
+      max_tokens_field: max_completion_tokens
+      extra_body:
+        thinking:
+          type: disabled
     custom:
       base_url: "http://127.0.0.1:8000/v1"
       api_key_env: CUSTOM_API_KEY
@@ -89,6 +94,21 @@ image_generation:
   model: your-image-model
   size: 1024x1024
   timeout_seconds: 180
+
+# MiMo provides multimodal understanding through chat/completions. It does not
+# replace the image generation/editing service configured above.
+image_understanding:
+  provider: mimo
+  base_url: https://api.xiaomimimo.com/v1
+  api_key_env: MIMO_API_KEY
+  model: mimo-v2.5
+  auth_header: api-key
+  max_tokens_field: max_completion_tokens
+  max_completion_tokens: 1024
+  timeout_seconds: 60
+  extra_body:
+    thinking:
+      type: disabled
 
 workspace:
   path: workspace

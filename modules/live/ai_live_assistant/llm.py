@@ -23,10 +23,20 @@ class LLMClient:
         payload = {
             "model": provider["model"], "messages": messages,
             "temperature": tuning.get("temperature", self.cfg.get("temperature", 0.55)),
-            "max_tokens": tuning.get("max_tokens", self.cfg.get("max_tokens", 160)), "stream": False,
+            "stream": False,
         }
+        is_mimo = "xiaomimimo" in str(provider.get("base_url", "")).lower() or str(provider.get("model", "")).lower().startswith("mimo-")
+        token_field = str(provider.get("max_tokens_field") or ("max_completion_tokens" if is_mimo else "max_tokens"))
+        payload[token_field] = int(tuning.get("max_tokens", self.cfg.get("max_tokens", 160)))
+        extra = provider.get("extra_body", {})
+        if isinstance(extra, dict):
+            payload.update(extra)
+        if is_mimo:
+            payload.setdefault("thinking", {"type": "disabled"})
+        auth_header = str(provider.get("auth_header") or ("api-key" if is_mimo else "Authorization"))
+        auth_value = f"Bearer {key}" if auth_header.lower() == "authorization" else key
         timeout = aiohttp.ClientTimeout(total=self.cfg.get("timeout_seconds", 45))
-        async with self.session.post(url, json=payload, headers={"Authorization": f"Bearer {key}"}, timeout=timeout) as r:
+        async with self.session.post(url, json=payload, headers={auth_header: auth_value}, timeout=timeout) as r:
             body = await r.text()
             if r.status >= 400:
                 raise RuntimeError(f"LLM HTTP {r.status}: {body[:500]}")

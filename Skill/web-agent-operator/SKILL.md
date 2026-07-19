@@ -20,7 +20,9 @@ Never reinterpret a multi-step request as open-only. Never call `open_url` and r
 
 ## Workflow
 
-1. Extract `site`, `query`, qualifiers, requested action, and observable success condition. If the query cannot be extracted, ask instead of opening an empty homepage.
+1. Use the semantic task plan to obtain `site`, `query`, qualifiers, requested action, and observable success condition. Application code may validate these fields but must not re-extract the target with site-specific regular expressions. If the semantic plan cannot provide the query, ask instead of opening an empty homepage.
+   - Parse action chains such as “搜索并播放 X” as `query=X`; never return connectors such as “并/然后/再” as the query.
+   - Preserve titles containing connector characters. Only treat a connector as syntax when it is directly attached to another action verb.
 2. Call `inspect_active_target` before acting.
    - `browser_dom`: call `web_read` immediately and operate the current signed-in page through DOM/text tools.
    - `browser_visual`: keep the existing browser and use `window_screenshot`, `window_click`, and `window_type_text`; do not launch another browser merely to obtain DOM access.

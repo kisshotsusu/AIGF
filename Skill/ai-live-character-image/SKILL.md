@@ -11,12 +11,18 @@ Create and operate the livestream character's visual assets while preserving ide
 
 1. Read project-relative `workspace/CHARACTER.md` and `workspace/character_images/manifest.json`.
 2. When a primary image exists, inspect it with `view_image` before composing a prompt. Use it as the default reference for edits and identity-preserving variants.
-3. Check `image_generation` in project-relative `config.yaml`. Read [provider-config.md](references/provider-config.md) only when configuration or provider adaptation is needed.
+3. For generation/editing, check `image_generation` in project-relative `config.yaml`. For image content recognition, OCR, or visual questions, check `image_understanding`. Read [provider-config.md](references/provider-config.md) only when configuration or provider adaptation is needed.
    In a new agent environment or a network without VPN, read [agent-handoff.md](references/agent-handoff.md) before the first call.
 4. Run `scripts/character_image_api.py`:
 
 ```powershell
 python scripts/character_image_api.py --prompt "完整画面要求" --label "图片说明" --tags "立绘,默认服装"
+```
+
+For MiMo image understanding (text response, no image is generated):
+
+```powershell
+python scripts/image_understanding_api.py --image primary --prompt "描述主体、服装、场景和可见文字"
 ```
 
 For an identity-preserving edit or variant:
@@ -45,7 +51,8 @@ python scripts/character_image_api.py --prompt "..." --set-primary
 
 - **Generate**: create a new image from text, optionally allowing the provider to use no reference.
 - **Edit/variant**: send the primary or explicitly named reference image to the configured multimodal endpoint.
-- **Inspect**: always use `view_image` on the actual saved output before reporting success.
+- **Understand**: use `image_understanding_api.py` when semantic analysis or OCR should be handled by MiMo. This returns text and never registers a new image.
+- **Inspect generated output**: always use `view_image` on the actual saved output before reporting success.
 - **Manage**: register all outputs in `manifest.json`; preserve original images; use the management UI for later relabeling or deletion.
 
 The script prints a JSON result with the saved path, library id, and primary status. Never expose the API key in output or logs.

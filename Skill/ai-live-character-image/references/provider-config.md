@@ -29,3 +29,28 @@ IMAGE_API_KEY=replace-me
 - Extracts an image from `choices[0].message.images`, `choices[0].message.content`, a data URI, or a direct response `data` item.
 
 Provider-specific fields can be added under `extra_body`; the script merges them into the request body.
+
+## MiMo image understanding
+
+MiMo's multimodal model analyzes an input image and returns text through `chat/completions`. It is separate from `image_generation` and must not be configured as an image generation/editing provider.
+
+```yaml
+image_understanding:
+  provider: mimo
+  base_url: https://api.xiaomimimo.com/v1
+  api_key_env: MIMO_API_KEY
+  model: mimo-v2.5
+  auth_header: api-key
+  max_tokens_field: max_completion_tokens
+  max_completion_tokens: 1024
+  timeout_seconds: 60
+  extra_body:
+    thinking:
+      type: disabled
+```
+
+```dotenv
+MIMO_API_KEY=replace-me
+```
+
+Run `scripts/image_understanding_api.py --image primary --prompt "..."`. Local paths are encoded as an `image_url` data URI and sent to MiMo only when this command or the HomeAgent `analyze_image` tool is invoked.

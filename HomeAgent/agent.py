@@ -170,6 +170,25 @@ class HomeAgent:
         if not key: raise RuntimeError(f"缺少 {provider.get('api_key_env')}，请在主项目 .env 中设置")
         return provider, key
 
+    @staticmethod
+    def _provider_headers(provider: dict[str, Any], key: str) -> dict[str, str]:
+        is_mimo = "xiaomimimo" in str(provider.get("base_url", "")).lower() or str(provider.get("model", "")).lower().startswith("mimo-")
+        header = str(provider.get("auth_header") or ("api-key" if is_mimo else "Authorization")).strip()
+        value = f"Bearer {key}" if header.lower() == "authorization" else key
+        return {header: value}
+
+    @staticmethod
+    def _set_token_limit(payload: dict[str, Any], provider: dict[str, Any], value: int) -> None:
+        is_mimo = "xiaomimimo" in str(provider.get("base_url", "")).lower() or str(provider.get("model", "")).lower().startswith("mimo-")
+        field = str(provider.get("max_tokens_field") or ("max_completion_tokens" if is_mimo else "max_tokens")).strip()
+        payload[field] = int(value)
+        extra = provider.get("extra_body", {})
+        if isinstance(extra, dict):
+            for key, option in extra.items():
+                payload.setdefault(str(key), option)
+        if is_mimo:
+            payload.setdefault("thinking", {"type": "disabled"})
+
     def _system_prompt(self) -> str:
         home = self.config["home"]
         scene = ROOT / home.get("scene_file", "workspace/HOME.md")
@@ -291,41 +310,28 @@ class HomeAgent:
         value = str(text).strip(); lowered = value.lower(); context_value = str(context); context_lower = context_value.lower()
         implicit_bilibili_favorite = "收藏夹" in value and "视频" in value
         explicit_bilibili = any(word in lowered for word in ("bilibili", "哔哩哔哩", "b站"))
+        explicit_cloudmusic = any(word in lowered for word in ("网易云", "网易云音乐", "cloudmusic"))
         continuation = any(word in value for word in ("收藏夹", "第", "这个", "那个", "上一个", "下一个", "换成", "播放", "打开", "点击"))
-        inherited_bilibili = not explicit_bilibili and continuation and any(word in context_lower for word in ("bilibili", "哔哩哔哩", "b站", "收藏夹"))
-        is_bilibili = explicit_bilibili or implicit_bilibili_favorite or inherited_bilibili
-        is_cloudmusic = any(word in lowered for word in ("网易云", "cloudmusic"))
-        is_web = is_bilibili or any(word in lowered for word in (
+        inherited_bilibili = not explicit_bilibili and not explicit_cloudmusic and continuation and any(word in context_lower for word in ("bilibili", "哔哩哔哩", "b站", "收藏夹"))
+        is_bilibili = explicit_bilibili or (not explicit_cloudmusic and (implicit_bilibili_favorite or inherited_bilibili))
+        is_cloudmusic = explicit_cloudmusic
+        is_web = is_bilibili or is_cloudmusic or any(word in lowered for word in (
             "网页", "网站", "浏览器", "http://", "https://", "百度", "淘宝", "天猫", "京东", "知乎", "微博", "github",
         ))
         context_favorite = inherited_bilibili and "收藏夹" in context_value and any(word in value for word in ("第", "这个", "那个", "上一个", "下一个", "换成", "视频"))
         favorite = is_bilibili and ("收藏夹" in value or context_favorite or ("收藏" in value and any(word in value for word in ("我的", "默认", "第"))))
         folder_name = ""
-        if favorite:
-            compact = value.replace(" ", "")
-            matches = list(re.finditer(r"(?:打开)?(?:我的)?(?:(?:bilibili|哔哩哔哩|B站)的?)?([^\n：:]{1,30}?)收藏夹", compact, re.I))
-            if not matches and context_favorite:
-                compact_context = context_value.replace(" ", "")
-                matches = list(re.finditer(r"(?:打开)?(?:我的)?(?:(?:bilibili|哔哩哔哩|B站)的?)?([^\n：:]{1,30}?)收藏夹", compact_context, re.I))
-            folder_match = matches[-1] if matches else None
-            raw_folder_name = str(folder_match.group(1) if folder_match else "默认")
-            folder_name = HomeAgent._normalize_favorite_folder_name(raw_folder_name)
         action_words = [word for word in ("打开", "换成", "搜索", "查找", "找", "点击", "选择", "播放", "填写", "提交", "登录", "下载") if word in value]
-        query = HomeAgent._visual_search_query(value) if (is_bilibili or is_cloudmusic) else ""
-        if inherited_bilibili and query in {"这个", "那个", "它", "这一个", "那一个"}:
-            inherited_query = HomeAgent._visual_search_query(context_value.splitlines()[-1] if context_value.splitlines() else context_value)
-            if inherited_query: query = inherited_query
-        if not query and is_web:
-            generic_query = re.search(r"(?:搜索|搜一下|搜|查找|找一下|找)\s*[《\"“]?(.+?)[》\"”]?(?:然后|并且|并|再|选择|点击|打开|播放|$)", value, re.I)
-            if generic_query:
-                query = generic_query.group(1).strip(" ，,。.!！?？")[:80]
-        number_map = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-        ordinal = re.search(r"第\s*(\d+|[一二两三四五六七八九十])\s*个", value)
-        index = int(ordinal.group(1)) if ordinal and ordinal.group(1).isdigit() else number_map.get(ordinal.group(1), 1) if ordinal else None
+        # Object/query semantics belong to the LLM planner. This deterministic
+        # pass only supplies coarse routing and safety hints; it must not guess
+        # a song, video, folder, person, or other user-supplied object.
+        query = ""
+        index = None
         handler = None
         if favorite: handler = "bilibili_favorites"
         elif is_bilibili and query: handler = "bilibili_search"
         elif is_cloudmusic and query: handler = "cloudmusic_search"
+        elif is_cloudmusic and action_words: handler = "cloudmusic_control"
         steps = []
         if is_web: steps.append("打开或接管目标网站，并确认登录态/页面地址")
         if favorite: steps.append(f"进入“{folder_name}”")
@@ -344,6 +350,100 @@ class HomeAgent:
             "context_evidence": "recent_bilibili_or_favorite_task" if inherited_bilibili else "",
             "success_criteria": steps[-1] if steps else "给出准确、直接的回答",
         }
+
+    async def _plan_task(self, text: str, context: str = "") -> dict[str, Any]:
+        """Use the LLM for semantic planning, then enforce deterministic safety invariants."""
+        fallback = self._analyze_task(text, context)
+        cfg = self.config.get("semantic_planner", {})
+        if not fallback.get("actionable"):
+            fallback["planner"] = "deterministic"
+            return fallback
+        if not cfg.get("enabled", True):
+            fallback["planner"] = "disabled"
+            if fallback.get("requires_mcp"):
+                fallback["handler"] = None
+                fallback["requires_clarification"] = True
+                fallback["success_criteria"] = "先确认目标对象，禁止猜测后执行"
+            return fallback
+        try:
+            provider, key = self._provider()
+            prompt = (
+                "你是电脑任务规划器。结合当前请求和最近上下文，输出一个JSON对象，不要输出解释或Markdown。"
+                "当前消息明确指定的平台、软件和对象必须覆盖历史上下文；不要把泛称‘音乐/歌曲/视频’当作具体搜索词。"
+                "query必须是用户真正指定的目标对象原文（例如标题、人名或关键词），不能包含操作动词或连接词，不能自行截短或改写；"
+                "一句话含多个动作时要理解动作之间的关系，不要把动作之间的文字误当成目标。"
+                "只负责理解和规划，不得声称任务已经完成。字段："
+                "domain(conversation/web/desktop), site(bilibili/cloudmusic/空), "
+                "operation(open/search/play/control/favorites/form/file/code/conversation), handler, query, "
+                "favorite_folder, index(整数或null), actionable, multi_step, requires_mcp, browser_policy, "
+                "steps(字符串数组), success_criteria, confidence(0到1), reasoning_short。\n"
+                f"最近上下文：{context[-1200:]}\n当前请求：{text}"
+            )
+            timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+                self._set_token_limit(payload, provider, 500)
+                async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers=self._provider_headers(provider, key)) as response:
+                    raw = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"planner HTTP {response.status}: {raw[:300]}")
+            content = str(json.loads(raw)["choices"][0]["message"].get("content", "")).strip()
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                raise ValueError("planner did not return JSON")
+            proposed = json.loads(match.group(0))
+            if not isinstance(proposed, dict) or float(proposed.get("confidence", 0)) < float(cfg.get("minimum_confidence", 0.55)):
+                raise ValueError("planner confidence is too low")
+
+            plan = dict(fallback)
+            allowed_handlers = {None, "", "bilibili_favorites", "bilibili_search", "cloudmusic_search", "cloudmusic_control"}
+            for key_name in ("domain", "site", "operation", "query", "favorite_folder", "browser_policy", "success_criteria", "reasoning_short"):
+                if key_name in proposed:
+                    plan[key_name] = str(proposed.get(key_name) or "").strip()
+            for key_name in ("actionable", "multi_step", "requires_mcp"):
+                if key_name in proposed:
+                    plan[key_name] = bool(proposed[key_name])
+            if isinstance(proposed.get("steps"), list):
+                plan["steps"] = [str(item).strip() for item in proposed["steps"] if str(item).strip()][:10]
+            try:
+                plan["index"] = int(proposed["index"]) if proposed.get("index") is not None else None
+            except (TypeError, ValueError):
+                plan["index"] = fallback.get("index")
+            proposed_handler = proposed.get("handler")
+            plan["handler"] = proposed_handler if proposed_handler in allowed_handlers else fallback.get("handler")
+            plan["actionable"] = bool(fallback.get("actionable") or plan.get("actionable"))
+
+            lowered = text.lower()
+            explicit_bilibili = any(word in lowered for word in ("bilibili", "哔哩哔哩", "b站"))
+            explicit_cloudmusic = any(word in lowered for word in ("网易云", "网易云音乐", "cloudmusic"))
+            if explicit_cloudmusic:
+                plan["site"] = "cloudmusic"
+                plan["context_inherited"] = False
+                if plan.get("operation") in {"play", "control", "open"} and plan.get("query", "").strip() in {"音乐", "歌曲", "歌", "一首歌", "当前音乐", "随便一首歌"}:
+                    plan["query"] = ""
+                plan["handler"] = "cloudmusic_search" if plan.get("query") else "cloudmusic_control"
+            elif explicit_bilibili:
+                plan["site"] = "bilibili"
+                plan["context_inherited"] = False
+                if fallback.get("handler") == "bilibili_favorites":
+                    plan["handler"] = "bilibili_favorites"
+                    plan["index"] = fallback.get("index") or plan.get("index") or 1
+                    plan["favorite_folder"] = plan.get("favorite_folder") or fallback.get("favorite_folder") or "默认收藏夹"
+                elif plan.get("query"):
+                    plan["handler"] = "bilibili_search"
+            plan["planner"] = "llm_validated"
+            plan["planner_confidence"] = round(float(proposed.get("confidence", 0)), 3)
+            return plan
+        except Exception as exc:
+            fallback["planner"] = "deterministic_fallback"
+            fallback["planner_error"] = str(exc)[:500]
+            if fallback.get("requires_mcp"):
+                fallback["handler"] = None
+                fallback["requires_clarification"] = True
+                fallback["success_criteria"] = "先确认目标对象，禁止猜测后执行"
+            self.log_event("semantic_planner_fallback", error=str(exc), fallback=fallback)
+            return fallback
 
     @staticmethod
     def _normalize_tool_result(name: str, result: Any) -> Any:
@@ -613,27 +713,12 @@ class HomeAgent:
         return str(payload.get("text", ""))
 
     @staticmethod
-    def _visual_search_query(text: str) -> str:
-        patterns = (
-            r"(?:找找|找到|找一下|找|搜索|搜一下|搜|播放|听)\s*[《\"“]?([^《》\"”]+?)[》\"”]?(?:然后|并且|并|播放|的视频|$)",
-            r"[《\"“]([^《》\"”]+)[》\"”]",
-        )
-        for pattern in patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                query = match.group(1).strip(" ，,。.!！?？")
-                query = re.sub(r"\s*(?:唱的|演唱的|的歌)\s*", " ", query).strip()
-                query = re.sub(r"\s+的\s*", " ", query).strip()
-                if query: return query[:80]
-        return ""
-
-    @staticmethod
     def _is_direct_visual_media_request(text: str) -> bool:
         lowered = text.lower()
         target = any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站", "网易云", "cloudmusic"))
         return target and any(x in text for x in ("找", "搜", "播放", "视频", "听"))
 
-    async def _run_direct_visual_media(self, text: str, status=None) -> dict[str, Any] | None:
+    async def _run_direct_visual_media(self, text: str, status=None, task_plan: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Fast deterministic path for common Bilibili/CloudMusic search-and-play tasks."""
         lowered = text.lower(); is_bili = any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站"))
         is_cloud = any(x in lowered for x in ("网易云", "cloudmusic"))
@@ -641,8 +726,12 @@ class HomeAgent:
             return None
         if not await asyncio.to_thread(self.ensure_vision_service, True):
             return {"error": "视觉服务未就绪"}
-        query = self._visual_search_query(text)
-        if not query: return None
+        query = str((task_plan or {}).get("query") or "").strip()
+        if not query and is_cloud:
+            return {"error": "任务规划器没有给出明确的歌曲或搜索对象，已停止执行以避免误操作"}
+        if is_cloud and "播放" in text and not any(word in text for word in ("搜索", "查找", "找一首", "搜一首")) and query.strip() in {"音乐", "歌曲", "歌", "一首歌", "当前音乐", "随便一首歌"}:
+            query = ""
+        if not query and not is_cloud: return None
         self.log_event("direct_vision_started", target="bilibili" if is_bili else "cloudmusic", query=query)
         try:
             if is_bili:
@@ -653,19 +742,25 @@ class HomeAgent:
             raw = await asyncio.wait_for(self._vision_mcp_call("list_windows", {}), timeout=15)
             try: windows = ast.literal_eval(raw)
             except (ValueError, SyntaxError): windows = []
-            preferred = ("哔哩", "bilibili", "chrome", "edge") if is_bili else ("网易云", "cloudmusic")
-            window = next((item for key in preferred for item in windows if key.lower() in str(item.get("title", "")).lower()), None)
+            if is_cloud:
+                window = next((item for item in windows if str(item.get("process_name", "")).lower() == "cloudmusic.exe"), None)
+                if window is None:
+                    window = next((item for item in windows if any(key in str(item.get("title", "")).lower() for key in ("网易云", "cloudmusic"))), None)
+            else:
+                preferred = ("哔哩", "bilibili", "chrome", "edge")
+                window = next((item for key in preferred for item in windows if key.lower() in str(item.get("title", "")).lower()), None)
             if not window: return {"error": "没有检测到目标软件窗口"}
             title = str(window["title"])
-            if is_cloud:
+            if is_cloud and query:
                 if status: status("正在识别搜索框并输入…")
                 await asyncio.wait_for(self._vision_mcp_call("window_type_text", {"title_contains": title, "instruction": "网易云音乐顶部的搜索框", "text": query}), timeout=90)
                 await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]}); await asyncio.sleep(3)
-            if status: status("正在识别并播放第一项…")
-            instruction = "Bilibili搜索结果中的第一个视频封面" if is_bili else "搜索结果中第一首歌曲对应的播放按钮"
+            if status: status("正在识别并播放第一项…" if query else "正在操作网易云音乐播放控制…")
+            instruction = "Bilibili搜索结果中的第一个视频封面" if is_bili else ("搜索结果中第一首歌曲对应的播放按钮" if query else "网易云音乐窗口底部播放控制栏中央的播放按钮")
             await asyncio.wait_for(self._vision_mcp_call("window_click", {"title_contains": title, "instruction": instruction}), timeout=90)
             self.log_event("direct_vision_completed", target="bilibili" if is_bili else "cloudmusic", query=query, window=title)
-            return {"ok": True, "answer": f"找到啦，我已经在{'Bilibili' if is_bili else '网易云音乐'}里帮你点开 {query} 了。"}
+            target_text = query if query else "当前音乐"
+            return {"ok": True, "answer": f"找到啦，我已经在{'Bilibili' if is_bili else '网易云音乐'}里帮你播放 {target_text} 了。"}
         except asyncio.TimeoutError:
             self.log_event("direct_vision_timeout", query=query)
             return {"error": "视觉识别步骤超时"}
@@ -679,7 +774,7 @@ class HomeAgent:
         implicit_favorite = plan.get("handler") == "bilibili_favorites"
         if not any(x in lowered for x in ("bilibili", "哔哩哔哩", "b站")) and not implicit_favorite: return None
         favorite_mode = plan.get("handler") == "bilibili_favorites"
-        query = self._visual_search_query(text)
+        query = str(plan.get("query") or "").strip()
         if not query and not favorite_mode: return {"error": "没有识别出要搜索的内容"}
         if favorite_mode:
             ordinal = re.search(r"第\s*(\d+|[一二两三四五六七八九十])\s*个", text)
@@ -855,13 +950,14 @@ class HomeAgent:
         try:
             provider, key = self._provider(); llm_cfg = self.project["llm"]
             url = provider["base_url"].rstrip("/") + "/chat/completions"
-            payload = {"model": provider["model"], "temperature": 0.55, "max_tokens": 100, "messages": [
+            payload = {"model": provider["model"], "temperature": 0.55, "messages": [
                 {"role": "system", "content": self._system_prompt() + "\n请用符合角色性格的自然口语说明一次电脑操作失败。只说一到两句，不要责怪用户，不要虚构成功。"},
                 {"role": "user", "content": f"用户请求：{request}\n失败原因：{reason}"},
             ]}
             timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers={"Authorization": f"Bearer {key}"}) as response:
+                self._set_token_limit(payload, provider, 100)
+                async with session.post(url, json=payload, headers=self._provider_headers(provider, key)) as response:
                     raw = await response.text()
                     if response.status >= 400: return fallback
                     data = json.loads(raw); answer = str(data["choices"][0]["message"]["content"]).strip()
@@ -1017,6 +1113,7 @@ class HomeAgent:
             {"type": "function", "function": {"name": "list_skills", "description": "列出本地可用技能", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "list_character_images", "description": "列出角色形象库和主形象", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "generate_character_image", "description": "调用 ai-live-character-image 技能生成或编辑角色形象", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "operation": {"type": "string", "enum": ["generate", "edit"]}, "reference": {"type": "string", "description": "编辑时使用 primary 或图片路径"}, "label": {"type": "string"}, "tags": {"type": "string"}, "set_primary": {"type": "boolean"}}, "required": ["prompt"]}}},
+            {"type": "function", "function": {"name": "analyze_image", "description": "使用 MiMo 多模态 API 理解图片内容、识别画面细节或文字；不用于生成图片", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片路径，或 primary 表示角色主形象"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
             {"type": "function", "function": {"name": "sing_song", "description": "当用户要求唱歌、唱一首、哼唱或朗读歌词时调用。默认使用角色当前本地 TTS/SVC 音色朗读最多十行歌词；MiMo 唱歌仅作为已关闭的备用分支。", "parameters": {"type": "object", "properties": {"song": {"type": "string", "description": "歌曲名称或演唱主题"}, "lyrics": {"type": "string", "description": "最多十行需要朗读的歌词或测试文本"}, "style": {"type": "string", "description": "演唱或朗读情绪"}, "voice": {"type": "string", "description": "仅备用 MiMo 分支使用"}}, "required": ["song", "lyrics"]}}},
             {"type": "function", "function": {"name": "create_scheduled_task", "description": "创建TTS语音提醒或闹钟。一次性任务成功执行后自动删除；重复任务会保留并等待下一次。必须根据当前本地时间解析用户的自然语言时间。", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "message": {"type": "string", "description": "触发时由TTS播放的文本"}, "recurrence": {"type": "string", "enum": ["once", "daily", "weekdays", "weekly"]}, "scheduled_at": {"type": "string", "description": "仅once使用，本地ISO时间，如2026-07-17T15:00"}, "time": {"type": "string", "description": "重复任务使用的24小时HH:MM"}, "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 7}, "description": "仅weekly使用，周一为1、周日为7"}, "action": {"type": "string", "enum": ["tts"]}}, "required": ["title", "message", "recurrence"]}}},
             {"type": "function", "function": {"name": "list_scheduled_tasks", "description": "列出当前所有提醒、闹钟和重复任务", "parameters": {"type": "object", "properties": {}}}},
@@ -1118,8 +1215,9 @@ class HomeAgent:
             )
             timeout = aiohttp.ClientTimeout(total=min(20, int(llm_cfg.get("timeout_seconds", 45))))
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 100}
-                async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}) as response:
+                payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
+                self._set_token_limit(payload, provider, 100)
+                async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers=self._provider_headers(provider, key)) as response:
                     raw = await response.text()
                     if response.status >= 400: raise RuntimeError(f"progress LLM HTTP {response.status}")
                     spoken = str(json.loads(raw)["choices"][0]["message"].get("content", "")).strip()
@@ -1137,8 +1235,16 @@ class HomeAgent:
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
         self.log_event("user_message", message=text, history_messages=len(self.history))
         recent_task_context = "\n".join(str(item.get("content", "")) for item in self.history[:-1][-6:] if item.get("role") == "user")
-        task_plan = self._analyze_task(text, recent_task_context)
+        if status: status("正在理解任务并制定执行计划…")
+        task_plan = await self._plan_task(text, recent_task_context)
         self.log_event("task_plan_created", task_plan=task_plan)
+        if task_plan.get("requires_clarification"):
+            answer = "我没能可靠识别这次操作的目标对象，所以没有执行，避免搜索或点击错误内容。请再说一次目标名称。"
+            self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            async with aiohttp.ClientSession() as session:
+                if self.config["home"].get("auto_speak", True):
+                    await self._speak_home(session, answer, status)
+            return answer
         recalled_memories = []
         if self._is_memory_recall_request(text):
             query_tags = self._memory_query_tags(text)
@@ -1184,7 +1290,7 @@ class HomeAgent:
                 is_bilibili = task_plan.get("site") == "bilibili"
                 # Bilibili has deterministic DOM verification and must not be
                 # downgraded to a single visual click merely because GUI is on.
-                operation = self._run_direct_web_media(text, status, task_plan) if is_bilibili or not gui_enabled else self._run_direct_visual_media(text, status)
+                operation = self._run_direct_web_media(text, status, task_plan) if is_bilibili or not gui_enabled else self._run_direct_visual_media(text, status, task_plan)
                 direct_visual = await asyncio.wait_for(operation, timeout=operation_timeout)
             except asyncio.TimeoutError:
                 self.stop_current_task()
@@ -1271,8 +1377,9 @@ class HomeAgent:
             for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
-                payload = {"model": provider["model"], "messages": messages, "tools": self._tools(), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7)), "max_tokens": int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600)))}
-                async with session.post(url, json=payload, headers={"Authorization": f"Bearer {key}"}) as response:
+                payload = {"model": provider["model"], "messages": messages, "tools": self._tools(), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
+                self._set_token_limit(payload, provider, int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600))))
+                async with session.post(url, json=payload, headers=self._provider_headers(provider, key)) as response:
                     raw = await response.text()
                     if response.status >= 400: raise RuntimeError(f"LLM HTTP {response.status}: {raw[:600]}")
                     choice = json.loads(raw)["choices"][0]["message"]
@@ -1409,6 +1516,15 @@ class HomeAgent:
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             out, err = await proc.communicate()
             if proc.returncode: return {"error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
+            try: return json.loads(out.decode("utf-8").splitlines()[-1])
+            except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}
+        if name == "analyze_image":
+            script = project_path(self.config["agent"].get("skill_root", "Skill")) / "ai-live-character-image" / "scripts" / "image_understanding_api.py"
+            cmd = [sys.executable, str(script), "--image", str(args.get("image", "primary")), "--prompt", str(args.get("prompt", "请描述图片内容"))]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await proc.communicate()
+            if proc.returncode:
+                return {"error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
             try: return json.loads(out.decode("utf-8").splitlines()[-1])
             except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}
         if name in {"web_agent_task", "web_agent_operator", "web-agent-operator"}:
@@ -1566,10 +1682,11 @@ class HomeAgent:
                     "彻底丢弃寒暄、玩笑、重复表达、临时闲聊和已经结束的小事。输出简洁中文Markdown摘要，不要解释过程。\n\n"
                     f"旧摘要：\n{previous or '无'}\n\n短期对话：\n{json.dumps(snapshot, ensure_ascii=False)}"
                 )
-                payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": tuning.get("temperature", 0.2), "max_tokens": int(tuning.get("max_tokens", 180))}
+                payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": tuning.get("temperature", 0.2)}
+                self._set_token_limit(payload, provider, int(tuning.get("max_tokens", 180)))
                 timeout = aiohttp.ClientTimeout(total=llm_cfg.get("timeout_seconds", 45))
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}) as response:
+                    async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers=self._provider_headers(provider, key)) as response:
                         raw = await response.text()
                         if response.status >= 400: raise RuntimeError(f"上下文压缩 LLM HTTP {response.status}: {raw[:500]}")
                         summary = str(json.loads(raw)["choices"][0]["message"].get("content", "")).strip()
@@ -1646,8 +1763,9 @@ class HomeAgent:
             )
             try:
                 tuning = self.project.get("llm", {}).get("memory", {})
-                payload = {"model": provider["model"], "messages": [{"role": "system", "content": "只输出合法JSON，不要Markdown。"}, {"role": "user", "content": prompt}], "temperature": tuning.get("temperature", 0.2), "max_tokens": int(tuning.get("max_tokens", 180))}
-                async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers={"Authorization": f"Bearer {key}"}) as response:
+                payload = {"model": provider["model"], "messages": [{"role": "system", "content": "只输出合法JSON，不要Markdown。"}, {"role": "user", "content": prompt}], "temperature": tuning.get("temperature", 0.2)}
+                self._set_token_limit(payload, provider, int(tuning.get("max_tokens", 180)))
+                async with session.post(provider["base_url"].rstrip("/") + "/chat/completions", json=payload, headers=self._provider_headers(provider, key)) as response:
                     raw = await response.text()
                     if response.status < 400:
                         content = json.loads(raw)["choices"][0]["message"].get("content", ""); match = re.search(r"\{.*\}", content, re.S)

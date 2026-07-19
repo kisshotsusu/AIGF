@@ -235,12 +235,146 @@ class HomeAgent:
             raise RuntimeError("找不到 Codex CLI，请在设置中填写 codex.exe 路径")
         return [executable]
 
+    def _codex_home_path(self) -> Path:
+        if self._codex_config().get("isolated_home", True):
+            return HOME_AGENT / "state" / "codex-home"
+        return Path.home() / ".codex"
+
+    def _prepare_codex_home(self) -> Path:
+        """Isolate CLI cache/plugins from the newer desktop build while sharing login."""
+        target_home = self._codex_home_path()
+        if target_home == Path.home() / ".codex":
+            return target_home
+        target_home.mkdir(parents=True, exist_ok=True)
+        source_home = Path.home() / ".codex"
+        source_auth = source_home / "auth.json"
+        target_auth = target_home / "auth.json"
+        if source_auth.is_file():
+            try:
+                same = target_auth.exists() and os.path.samefile(source_auth, target_auth)
+            except OSError:
+                same = False
+            if not same:
+                try:
+                    if target_auth.exists(): target_auth.unlink()
+                    os.link(source_auth, target_auth)
+                    auth_mode = "hardlink"
+                except OSError:
+                    shutil.copy2(source_auth, target_auth)
+                    try: os.chmod(target_auth, 0o600)
+                    except OSError: pass
+                    auth_mode = "copy"
+                self.log_event("codex_isolated_auth_synced", mode=auth_mode, target=target_auth)
+        source_config = source_home / "config.toml"
+        source_text = source_config.read_text(encoding="utf-8") if source_config.is_file() else ""
+        def top_value(name: str, default: str) -> str:
+            match = re.search(rf'(?m)^{re.escape(name)}\s*=\s*"([^"]+)"', source_text)
+            return match.group(1) if match else default
+        model = top_value("model", "gpt-5.6-sol")
+        effort = top_value("model_reasoning_effort", "low")
+        tier = top_value("service_tier", "default")
+        vision_url = str(self.config.get("vision_mcp", {}).get("url", "http://127.0.0.1:8765/mcp"))
+        minimal_config = (
+            f'model = {json.dumps(model)}\n'
+            f'model_reasoning_effort = {json.dumps(effort)}\n'
+            f'service_tier = {json.dumps(tier)}\n\n'
+            '[features]\n'
+            'apps = false\n'
+            'plugins = false\n'
+            'remote_plugin = false\n'
+            'shell_snapshot = false\n\n'
+            '[mcp_servers.vision-gui]\n'
+            f'url = {json.dumps(vision_url)}\n'
+        )
+        config_path = target_home / "config.toml"
+        if not config_path.exists() or config_path.read_text(encoding="utf-8") != minimal_config:
+            temporary = config_path.with_suffix(".tmp")
+            temporary.write_text(minimal_config, encoding="utf-8")
+            os.replace(temporary, config_path)
+        return target_home
+
     def _codex_environment(self, command: list[str]) -> dict[str, str]:
+        codex_home = self._prepare_codex_home()
+        self._repair_codex_models_cache(codex_home)
         env = os.environ.copy()
         node_dir = str(Path(command[0]).parent) if Path(command[0]).name.lower() == "node.exe" else ""
         if node_dir:
             env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")
+        env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1", "CODEX_HOME": str(codex_home)})
         return env
+
+    def _codex_package_version(self) -> str:
+        package = HOME_AGENT / "cli" / "node_modules" / "@openai" / "codex" / "package.json"
+        try:
+            return str(json.loads(package.read_text(encoding="utf-8")).get("version", "")).strip()
+        except (OSError, json.JSONDecodeError):
+            return ""
+
+    def _repair_codex_models_cache(self, codex_home: Path | None = None) -> dict[str, Any]:
+        """Backfill fields required by the bundled CLI without discarding desktop cache data."""
+        path = (codex_home or self._codex_home_path()) / "models_cache.json"
+        result = {"path": str(path), "changed": False, "cache_client_version": "", "cli_package_version": self._codex_package_version()}
+        try:
+            if not path.is_file():
+                return result
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            result["cache_client_version"] = str(payload.get("client_version", ""))
+            models = payload.get("models") or []
+            changed = False
+            responses_lite_disabled = 0
+            cli_version = str(result.get("cli_package_version") or "").strip()
+            if cli_version and str(payload.get("client_version", "")).strip() != cli_version:
+                payload["client_version"] = cli_version
+                changed = True
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                if "supports_reasoning_summaries" not in model:
+                    summary = str(model.get("default_reasoning_summary", "")).strip().lower()
+                    model["supports_reasoning_summaries"] = summary not in {"", "none", "disabled", "off"}
+                    changed = True
+                # Desktop 0.145 cache enables Responses Lite, but standalone
+                # CLI 0.144.x does not always emit reasoning.context=all_turns
+                # for tool/MCP requests. Use the standard Responses transport.
+                if cli_version.startswith("0.144.") and model.get("use_responses_lite") is True:
+                    model["use_responses_lite"] = False
+                    responses_lite_disabled += 1
+                    changed = True
+            if changed:
+                temporary = path.with_name(f"{path.name}.home-agent-{os.getpid()}.tmp")
+                temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+                os.replace(temporary, path)
+                result["changed"] = True
+                result["effective_client_version"] = str(payload.get("client_version", ""))
+                result["responses_lite_disabled"] = responses_lite_disabled
+                self.log_event("codex_models_cache_compatibility_repaired", result=result)
+            return result
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            result["error"] = str(exc)
+            self.log_event("codex_models_cache_compatibility_failed", error=str(exc), path=path)
+            return result
+
+    def _codex_task_timeout(self, preferred_mcp: str = "") -> int:
+        if preferred_mcp:
+            return max(30, int(self.config.get("vision_mcp", {}).get("task_timeout_seconds", 180)))
+        return max(30, int(self._codex_config().get("timeout_seconds", 600)))
+
+    @staticmethod
+    def _codex_progress_text(event: dict[str, Any]) -> str:
+        event_type = str(event.get("type", ""))
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = str(item.get("type", "")).lower()
+        name = str(item.get("name") or item.get("tool") or item.get("command") or "").strip()
+        if event_type == "thread.started": return "Codex 已建立任务，正在分析…"
+        if event_type == "turn.started": return "Codex 正在制定执行步骤…"
+        if event_type == "error": return "Codex 网络响应异常，正在重试…"
+        if "mcp" in item_type:
+            return f"Codex 正在调用 MCP：{name or item_type}"
+        if any(token in item_type for token in ("command", "shell", "exec")):
+            return f"Codex 正在执行命令：{name[:60]}" if name else "Codex 正在执行本地命令…"
+        if item_type == "agent_message": return "Codex 已完成执行，正在整理结果…"
+        if event_type == "turn.completed": return "Codex 执行完成，正在验证结果…"
+        return ""
 
     def _should_route_to_codex(self, text: str) -> bool:
         cfg = self._codex_config()
@@ -667,6 +801,7 @@ class HomeAgent:
         """检查 CLI 版本和已配置 MCP 服务，不执行 Agent 任务。"""
         codex_command = self._codex_command()
         env = self._codex_environment(codex_command)
+        compatibility = self._repair_codex_models_cache(Path(env["CODEX_HOME"]))
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         version_proc = await asyncio.create_subprocess_exec(
             *codex_command, "--version", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -683,6 +818,8 @@ class HomeAgent:
             "executable": " ".join(codex_command),
             "version": (version_out or version_err).decode("utf-8", "replace").strip(),
             "mcp_servers": (mcp_out or mcp_err).decode("utf-8", "replace").strip(),
+            "models_cache_compatibility": compatibility,
+            "local_tools_preferred": bool(self.config.get("agent", {}).get("prefer_local_tools", True)),
         }
 
     async def _vision_mcp_call(self, tool_name: str, arguments: dict[str, Any] | None = None):
@@ -769,6 +906,100 @@ class HomeAgent:
         except Exception as exc:
             self.log_event("direct_vision_failed", query=query, error=str(exc))
             return {"error": str(exc)}
+
+    async def _run_cloudmusic_search_and_play(self, query: str, status=None) -> dict[str, Any]:
+        """Search and select a CloudMusic result with bounded, evidence-driven retries."""
+        query = str(query or "").strip()
+        if not query: return {"error": "没有明确的歌曲名", "failure_stage": "task_plan"}
+        if not await asyncio.to_thread(self.ensure_vision_service, True):
+            return {"error": "视觉服务未就绪", "failure_stage": "vision_start"}
+        retry_rounds = max(2, min(8, int(self.config.get("agent", {}).get("operation_retry_rounds", 4))))
+        failures: list[dict[str, Any]] = []
+
+        def parse(raw: str, default: Any):
+            try: return ast.literal_eval(raw)
+            except (ValueError, SyntaxError): return default
+
+        async def cloud_window() -> dict[str, Any] | None:
+            rows = parse(await self._vision_mcp_call("list_windows", {}), [])
+            return next((item for item in rows if str(item.get("process_name", "")).lower() == "cloudmusic.exe"), None)
+
+        window = await cloud_window()
+        if not window:
+            executable = Path(r"C:\Program Files\Netease\CloudMusic\cloudmusic.exe")
+            configured = self.config.get("computer_control", {}).get("applications", {})
+            configured_path = configured.get("网易云音乐") or configured.get("cloudmusic")
+            if configured_path: executable = Path(str(configured_path))
+            if not executable.is_file():
+                return {"error": f"没有检测到网易云音乐窗口，且程序路径不存在：{executable}", "failure_stage": "launch"}
+            if status: status("没有检测到网易云窗口，正在启动本地网易云音乐…")
+            subprocess.Popen([str(executable)], creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            for _ in range(15):
+                await asyncio.sleep(1); window = await cloud_window()
+                if window: break
+        if not window:
+            return {"error": "网易云音乐已启动，但15秒内没有出现可操作窗口", "failure_stage": "window_wait"}
+
+        title = str(window.get("title", ""))
+        if query.casefold() in title.casefold():
+            return {"ok": True, "answer": f"网易云音乐当前已经选中并播放《{query}》。", "query": query, "title": title, "attempts": 0, "used_local_tools": True, "already_playing": True}
+        if status: status(f"正在网易云音乐中搜索《{query}》…")
+        try:
+            await self._vision_mcp_call("activate_window", {"title_contains": title})
+            await self._vision_mcp_call("window_type_text", {"title_contains": title, "instruction": "网易云音乐窗口顶部的搜索框", "text": query})
+            await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]})
+            await asyncio.sleep(3)
+        except Exception as exc:
+            return {"error": f"搜索提交失败：{exc}", "failure_stage": "search_submit"}
+
+        instructions = [
+            f'搜索结果“单曲”列表中歌曲名为“{query}”的第一条结果的歌曲名称文字；不要点歌手名、页面标题或底部播放栏',
+            f'搜索结果列表中“{query}”这一行左侧的歌曲标题文字；不要点右侧歌手名',
+            f'单曲结果中同时匹配歌曲“{query}”和其歌手的那一整行中央空白区域；不要点底部全局播放按钮',
+            f'搜索结果中的第一首“{query}”歌曲标题；不是下方相似歌曲或歌单',
+        ]
+        for attempt in range(1, retry_rounds + 1):
+            if self.cancel_event.is_set(): raise asyncio.CancelledError
+            current = await cloud_window()
+            if not current:
+                failures.append({"attempt": attempt, "stage": "window", "reason": "网易云窗口消失"}); break
+            title = str(current.get("title", title))
+            instruction = instructions[(attempt - 1) % len(instructions)]
+            candidate_index = (attempt - 1) % 3
+            if status: status(f"正在尝试播放《{query}》（第 {attempt}/{retry_rounds} 次：精确选择结果）…")
+            try:
+                clicked = parse(await self._vision_mcp_call("window_double_click", {
+                    "title_contains": title, "instruction": instruction, "topk": 3, "idx": candidate_index,
+                }), {})
+                await asyncio.sleep(2)
+                current = await cloud_window(); after_title = str((current or {}).get("title", ""))
+                if query.casefold() in after_title.casefold():
+                    result = {"ok": True, "answer": f"已经在网易云音乐中搜索并播放《{query}》。", "query": query, "title": after_title, "attempts": attempt, "strategy": "double_click_result", "candidate_index": candidate_index, "used_local_tools": True, "failures": failures}
+                    self.log_event("cloudmusic_search_play_completed", result=result); return result
+                reason = f"双击后窗口标题仍为“{after_title or title}”"
+                failures.append({"attempt": attempt, "stage": "double_click", "reason": reason, "pixel": clicked.get("pixel"), "candidate_index": candidate_index})
+                if status: status(f"第 {attempt} 次未播放成功：{reason}；正在尝试对已选中结果按 Enter…")
+                await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]}); await asyncio.sleep(2)
+                current = await cloud_window(); after_enter = str((current or {}).get("title", ""))
+                if query.casefold() in after_enter.casefold():
+                    result = {"ok": True, "answer": f"已经在网易云音乐中搜索并播放《{query}》。", "query": query, "title": after_enter, "attempts": attempt, "strategy": "select_then_enter", "candidate_index": candidate_index, "used_local_tools": True, "failures": failures}
+                    self.log_event("cloudmusic_search_play_completed", result=result); return result
+                failures.append({"attempt": attempt, "stage": "enter_selected", "reason": f"按 Enter 后仍为“{after_enter or title}”"})
+            except Exception as exc:
+                failures.append({"attempt": attempt, "stage": "result_select", "reason": str(exc)})
+            if attempt < retry_rounds:
+                reason = failures[-1]["reason"]
+                if status: status(f"第 {attempt} 次失败：{reason}；正在重新搜索并更换识别锚点…")
+                self.log_event("cloudmusic_search_play_retry", query=query, attempt=attempt, failure=failures[-1])
+                current = await cloud_window(); title = str((current or {}).get("title", title))
+                try:
+                    await self._vision_mcp_call("window_type_text", {"title_contains": title, "instruction": "网易云音乐窗口顶部的搜索框", "text": query})
+                    await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]}); await asyncio.sleep(3)
+                except Exception as exc:
+                    failures.append({"attempt": attempt, "stage": "research", "reason": str(exc)})
+        reason_summary = "；".join(f"第{x['attempt']}次/{x['stage']}：{x['reason']}" for x in failures[-6:])
+        self.log_event("cloudmusic_search_play_failed", query=query, attempts=retry_rounds, failures=failures)
+        return {"error": f"尝试 {retry_rounds} 轮后仍未能确认《{query}》开始播放。{reason_summary}", "failure_stage": "play_verification", "query": query, "attempts": retry_rounds, "failures": failures, "next_action": "保留当前搜索结果，不点击底部全局播放按钮；可根据失败记录继续更换结果锚点"}
 
     async def _run_direct_web_media(self, text: str, status=None, task_plan: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Operate Bilibili through DOM/text only; never loads the GUI vision model."""
@@ -1041,58 +1272,126 @@ class HomeAgent:
         env = self._codex_environment(codex_command)
         proc = await asyncio.create_subprocess_exec(
             *command, cwd=str(working_directory), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, creationflags=creationflags, env=env,
+            stderr=asyncio.subprocess.PIPE, stdin=subprocess.DEVNULL,
+            creationflags=creationflags, env=env,
         )
         with self.active_process_lock:
             self.active_process = proc
         if self.cancel_event.is_set():
             self.stop_current_task()
             raise asyncio.CancelledError
+
+        log_dir = HOME_AGENT / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = log_dir / "codex-last.jsonl"
+        stderr_path = log_dir / "codex-last.stderr.log"
+        events: list[dict[str, Any]] = []
+        stderr_lines: list[str] = []
+        answer = ""
+        mcp_calls: list[str] = []
+        codex_errors: list[str] = []
+        turn_completed = False
+        last_progress = ""
+
+        async def read_stdout() -> None:
+            nonlocal answer, turn_completed, last_progress
+            assert proc.stdout is not None
+            with stdout_path.open("w", encoding="utf-8", newline="\n") as output:
+                while True:
+                    raw_line = await proc.stdout.readline()
+                    if not raw_line: break
+                    line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                    output.write(line + "\n"); output.flush()
+                    try: event = json.loads(line)
+                    except json.JSONDecodeError: continue
+                    events.append(event)
+                    if event.get("type") == "thread.started":
+                        self.codex_thread_id = event.get("thread_id")
+                    if event.get("type") == "turn.completed":
+                        turn_completed = True
+                    if event.get("type") == "error":
+                        codex_errors.append(str(event.get("message", "Codex error")))
+                    if event.get("type") == "turn.failed":
+                        failure = event.get("error") if isinstance(event.get("error"), dict) else {}
+                        codex_errors.append(str(failure.get("message") or event.get("error") or "Codex turn failed"))
+                    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+                    item_type = str(item.get("type", "")).lower()
+                    if event.get("type") == "item.completed" and item_type == "agent_message":
+                        answer = str(item.get("text", "")).strip()
+                    if event.get("type") == "item.completed" and item_type == "error":
+                        codex_errors.append(str(item.get("message", "Codex item error")))
+                    if "mcp" in item_type:
+                        server = str(item.get("server") or item.get("server_name") or "").strip()
+                        tool = str(item.get("name") or item.get("tool") or item.get("tool_name") or item_type).strip()
+                        call_name = ".".join(value for value in (server, tool) if value)
+                        if call_name and call_name not in mcp_calls: mcp_calls.append(call_name)
+                    progress = self._codex_progress_text(event)
+                    if progress and progress != last_progress:
+                        last_progress = progress
+                        if status: status(progress)
+                        self.log_event("codex_task_progress", progress=progress, event_type=event.get("type"), item_type=item_type)
+
+        async def read_stderr() -> None:
+            assert proc.stderr is not None
+            with stderr_path.open("w", encoding="utf-8", newline="\n") as output:
+                while True:
+                    raw_line = await proc.stderr.readline()
+                    if not raw_line: break
+                    line = raw_line.decode("utf-8", "replace").rstrip("\r\n")
+                    stderr_lines.append(line)
+                    output.write(line + "\n"); output.flush()
+
+        stdout_task = asyncio.create_task(read_stdout())
+        stderr_task = asyncio.create_task(read_stderr())
         try:
-            task_timeout = int(self.config.get("vision_mcp", {}).get("task_timeout_seconds", 150)) if preferred_mcp else int(cfg.get("timeout_seconds", 600))
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=task_timeout)
+            task_timeout = self._codex_task_timeout(preferred_mcp)
+            await asyncio.wait_for(asyncio.gather(proc.wait(), stdout_task, stderr_task), timeout=task_timeout)
         except asyncio.CancelledError:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            await proc.communicate()
+            await proc.wait()
+            for reader in (stdout_task, stderr_task):
+                if not reader.done(): reader.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             with self.active_process_lock:
                 if self.active_process is proc:
                     self.active_process = None
             self.log_event("codex_task_cancelled")
             raise
         except asyncio.TimeoutError:
-            proc.kill(); out, err = await proc.communicate()
-            detail = err.decode("utf-8", "replace").strip()[-1200:]
+            proc.kill(); await proc.wait()
+            for reader in (stdout_task, stderr_task):
+                if not reader.done(): reader.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            detail = "\n".join(stderr_lines).strip()[-1200:]
             self.log_event("codex_task_timeout", detail=detail)
             return {"error": "Codex CLI 执行超时。请检查网络、登录状态和 MCP 服务。" + (f"\n{detail}" if detail else "")}
-        with self.active_process_lock:
-            if self.active_process is proc:
-                self.active_process = None
-        stdout = out.decode("utf-8", "replace")
-        stderr = err.decode("utf-8", "replace")
-        log_dir = HOME_AGENT / "logs"; log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "codex-last.jsonl").write_text(stdout, encoding="utf-8")
-        (log_dir / "codex-last.stderr.log").write_text(stderr, encoding="utf-8")
-        answer = ""; events: list[dict[str, Any]] = []; mcp_calls: list[str] = []
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            events.append(event)
-            if event.get("type") == "thread.started":
-                self.codex_thread_id = event.get("thread_id")
-            item = event.get("item") or {}
-            if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-                answer = str(item.get("text", "")).strip()
-            if "mcp" in str(item.get("type", "")).lower():
-                mcp_calls.append(str(item.get("name") or item.get("tool") or item.get("type")))
+        finally:
+            with self.active_process_lock:
+                if self.active_process is proc:
+                    self.active_process = None
+            # The desktop app may refresh the shared cache with a newer schema
+            # while this older standalone CLI is running. Restore compatibility
+            # for the next invocation without deleting any model entries.
+            self._repair_codex_models_cache()
+        stderr = "\n".join(stderr_lines)
         if proc.returncode != 0:
-            self.log_event("codex_task_failed", exit_code=proc.returncode, error=(stderr or stdout)[-2000:])
-            return {"error": (stderr or stdout)[-2000:], "exit_code": proc.returncode}
-        result = {"ok": True, "answer": answer or "Codex CLI 已完成任务。", "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events)}
+            event_detail = "\n".join(codex_errors)
+            error = (event_detail or stderr or "Codex CLI 未返回错误详情")[-2000:]
+            self.log_event("codex_task_failed", exit_code=proc.returncode, error=error)
+            return {"error": error, "exit_code": proc.returncode, "mcp_calls": mcp_calls}
+        if not turn_completed or not answer:
+            detail = "；".join(codex_errors[-3:]) or "没有收到完整的 turn.completed 与 agent_message"
+            self.log_event("codex_task_incomplete", detail=detail, event_count=len(events), mcp_calls=mcp_calls)
+            return {"error": f"Codex CLI 未返回完整结果：{detail}", "mcp_calls": mcp_calls, "event_count": len(events)}
+        if require_mcp and not mcp_calls:
+            self.log_event("codex_required_mcp_missing", preferred_mcp=preferred_mcp, answer=answer, codex_errors=codex_errors)
+            return {"error": f"Codex 没有实际调用所要求的 MCP{f'（{preferred_mcp}）' if preferred_mcp else ''}，已拒绝把文字回答判定为成功。", "answer": answer, "mcp_calls": [], "event_count": len(events)}
+        if preferred_mcp and not any(preferred_mcp.lower() in call.lower() for call in mcp_calls):
+            self.log_event("codex_preferred_mcp_missing", preferred_mcp=preferred_mcp, mcp_calls=mcp_calls)
+            return {"error": f"Codex 调用了 MCP，但没有调用指定的 {preferred_mcp}。", "answer": answer, "mcp_calls": mcp_calls, "event_count": len(events)}
+        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:]}
         self.log_event("codex_task_completed", result=result)
         return result
 
@@ -1123,12 +1422,13 @@ class HomeAgent:
         if self.config.get("vision_mcp", {}).get("enabled", False) and self.config.get("agent", {}).get("model_driven_computer_actions", True):
             tools += [
                 {"type": "function", "function": {"name": "bilibili_open_favorite_video", "description": "在用户已经打开且已登录的普通浏览器中，按B站收藏夹真实数据顺序打开指定收藏夹第N个视频。B站收藏夹任务应优先调用；不会创建Chrome、Chromium或临时浏览器。", "parameters": {"type": "object", "properties": {"favorite_folder": {"type": "string", "description": "用户说出的收藏夹名称，例如二次元好看或默认收藏夹"}, "index": {"type": "integer", "minimum": 1, "description": "从1开始的视频序号"}}, "required": ["favorite_folder", "index"]}}},
+                {"type": "function", "function": {"name": "cloudmusic_search_and_play", "description": "在本地网易云音乐客户端搜索并播放指定歌曲，内置多轮精确选择、Enter备用策略和窗口标题验证。网易云指定歌曲播放任务必须优先调用，禁止用底部全局播放按钮代替选择搜索结果。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "任务计划给出的准确歌曲名"}}, "required": ["query"]}}},
                 {"type": "function", "function": {"name": "ui_inspect_target", "description": "观察当前活动目标，判断是可读DOM网页、视觉网页还是原生程序。任何网页/界面任务第一步调用。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "ui_list_windows", "description": "读取当前可见窗口标题和进程，用于找到并验证目标程序以及媒体播放标题。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}}}},
                 {"type": "function", "function": {"name": "ui_activate_window", "description": "激活一个已经打开的窗口，不启动新浏览器。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}, "required": ["title_contains"]}}},
                 {"type": "function", "function": {"name": "ui_type_window", "description": "在指定原生窗口中按语义定位输入框并输入文字。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "text": {"type": "string"}}, "required": ["title_contains", "target", "text"]}}},
-                {"type": "function", "function": {"name": "ui_click_window", "description": "在指定原生窗口中定位并单击目标。目标描述必须包含当前任务对象，不能用它代替播放指定搜索结果。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}}, "required": ["title_contains", "target"]}}},
-                {"type": "function", "function": {"name": "ui_double_click_window", "description": "在指定原生窗口中定位并双击目标，适合选择并播放搜索结果行。必须明确描述目标标题，禁止描述底部全局播放按钮。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}}, "required": ["title_contains", "target"]}}},
+                {"type": "function", "function": {"name": "ui_click_window", "description": "在指定原生窗口中定位并单击目标。目标描述必须包含当前任务对象，不能用它代替播放指定搜索结果。失败重试时可用candidate_index切换视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
+                {"type": "function", "function": {"name": "ui_double_click_window", "description": "在指定原生窗口中定位并双击目标，适合选择并播放搜索结果行。必须明确描述目标标题，禁止描述底部全局播放按钮。若标题未变化，用candidate_index 1或2重试其他视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
                 {"type": "function", "function": {"name": "ui_analyze_window", "description": "使用 MiMo 图像理解读取指定窗口当前画面并返回文字观察。搜索提交后、选择结果前以及最终验证时调用。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "question": {"type": "string"}}, "required": ["title_contains", "question"]}}},
                 {"type": "function", "function": {"name": "ui_hotkey", "description": "向当前活动窗口发送按键组合。", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}, "required": ["keys"]}}},
                 {"type": "function", "function": {"name": "ui_type_active_text", "description": "向现有活动窗口已聚焦的输入框输入文字；浏览器无DOM时可在Ctrl+L后填写网址，绝不启动新浏览器。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "clear": {"type": "boolean"}}, "required": ["text"]}}},
@@ -1141,8 +1441,8 @@ class HomeAgent:
             ]
         if self._codex_config().get("enabled", False):
             tools += [
-                {"type": "function", "function": {"name": "codex_cli_task", "description": "调用 Codex CLI 完成复杂的本机命令、文件、编程或多步骤任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
-                {"type": "function", "function": {"name": "mcp_task", "description": "通过 Codex CLI 调用已配置的 MCP 服务完成任务", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
+                {"type": "function", "function": {"name": "codex_cli_task", "description": "仅在本地白名单工具无法完成的复杂编程、终端或自升级任务中调用 Codex CLI。普通网页、视觉和电脑控制必须优先使用本地工具。", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
+                {"type": "function", "function": {"name": "mcp_task", "description": "仅当本地工具没有所需能力时，才通过 Codex CLI 调用其他 MCP；网络不稳定，禁止把它作为网页和视觉任务首选。", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
                 {"type": "function", "function": {"name": "web_agent_task", "description": "完成多步骤网页任务。只要请求包含搜索、查找、选择、点击、播放、填写或提交，就必须使用本工具，不能仅调用 open_url。", "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}},
                 {"type": "function", "function": {"name": "list_mcp_servers", "description": "检查 Codex CLI 和已配置的 MCP 服务", "parameters": {"type": "object", "properties": {}}}},
             ]
@@ -1333,7 +1633,7 @@ class HomeAgent:
                 if status: status("固定流程未完成，正在切换通用 Agent 继续处理…")
                 preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui"))
                 try:
-                    fallback_timeout = max(120, int(self.config.get("vision_mcp", {}).get("task_timeout_seconds", 150)))
+                    fallback_timeout = self._codex_task_timeout(preferred) + 10
                     direct_visual = await asyncio.wait_for(
                         self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred, task_plan=task_plan, previous_failure=previous_failure),
                         timeout=fallback_timeout,
@@ -1352,19 +1652,18 @@ class HomeAgent:
             return answer
         web_route = self._is_multistep_web_request(text) or self._has_recent_web_context(text)
         vision_route = self._should_route_to_vision(text)
-        if web_route or vision_route or self._should_route_to_codex(text):
-            route = "web_agent" if web_route else ("vision_mcp" if vision_route else "codex_cli")
+        prefer_local_tools = bool(self.config.get("agent", {}).get("prefer_local_tools", True))
+        codex_requested = self._should_route_to_codex(text)
+        delegate_ui_to_codex = (web_route or vision_route) and not prefer_local_tools
+        if codex_requested or delegate_ui_to_codex:
+            route = "web_agent" if web_route and delegate_ui_to_codex else ("vision_mcp" if vision_route and delegate_ui_to_codex else "codex_cli")
             reason = "multi_step_web" if web_route else ("vision_priority" if vision_route else "trigger_mode_or_keyword")
             self.log_event("route_selected", route=route, reason=reason)
             preferred = str(self.config.get("vision_mcp", {}).get("server_name", "vision-gui")) if (web_route or vision_route) else ""
             if web_route or vision_route:
                 async with aiohttp.ClientSession() as session:
                     if self.config["home"].get("auto_speak", True): await self._speak_home(session, "好呀，我来看一下屏幕，很快就好。", status)
-                operation_timeout = max(90 if web_route else 5, int(self.config.get("vision_mcp", {}).get("direct_operation_timeout_seconds", 20)))
-                try:
-                    result = await asyncio.wait_for(self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred, task_plan=task_plan), timeout=operation_timeout)
-                except asyncio.TimeoutError:
-                    self.stop_current_task(); result = {"error": f"超过{operation_timeout}秒仍未执行成功，操作已超时停止"}
+                result = await self._run_codex_task(text, require_mcp=True, status=status, preferred_mcp=preferred, task_plan=task_plan)
             else:
                 result = await self._run_codex_task(text, require_mcp=False, status=status, preferred_mcp="", task_plan=task_plan)
             if result.get("error"):
@@ -1382,7 +1681,7 @@ class HomeAgent:
                 if self.config["home"].get("auto_speak", True) and answer:
                     await self._speak_home(session, answer, status)
             return answer
-        self.log_event("route_selected", route="llm_tool_loop")
+        self.log_event("route_selected", route="llm_tool_loop", local_tools_preferred=prefer_local_tools, web_route=web_route, vision_route=vision_route)
         provider, key = self._provider(); llm_cfg = self.project["llm"]
         memory_context = ""
         if recalled_memories:
@@ -1394,10 +1693,16 @@ class HomeAgent:
             operation_contract = (
                 "\n\n【当前操作任务计划】\n" + json.dumps(task_plan, ensure_ascii=False) +
                 "\n你负责根据观察结果逐步决定并调用白名单工具，本地代码只执行你的工具调用。"
+                "网页、视觉、窗口、文件和已提供的专用站点工具必须优先在本地执行；只有本地工具明确缺少能力时才可调用 Codex。"
                 "每次工具返回后重新判断下一步，不得跳过选择目标和终态验证。"
+                "点击、输入、快捷键和滚动工具会自动等待并重新截图；必须读取 state_changed、post_action_verified 和 next_action。"
+                "若返回 status=uncertain 或 state_changed=false，不得继续假设操作成功，必须重新识别、切换候选点或使用另一种操作方式。"
                 + ("当前是B站收藏夹任务：直接调用 bilibili_open_favorite_video，并把任务计划中的 favorite_folder 和 index 原样传入。"
                    "该工具会读取真实收藏夹顺序、复用现有登录浏览器并验证最终BV地址；不要用截图猜收藏夹入口。"
                    if task_plan.get("handler") == "bilibili_favorites" else "") +
+                ("当前是网易云指定歌曲任务：直接调用 cloudmusic_search_and_play，并把任务计划中的 query 原样传入。"
+                 "该工具会在本地客户端进行多轮选择与标题验证；禁止自行点击底部全局播放按钮。"
+                 if task_plan.get("handler") == "cloudmusic_search" else "") +
                 "网页先调用 ui_inspect_target；若是 browser_dom，优先 web_read/web_fill/web_click_text。"
                 "若是 browser_visual，必须保持现有浏览器，用 ui_hotkey Ctrl+L、ui_type_active_text、Enter 和窗口视觉工具操作。"
                 "禁止调用 launch_app 启动 Chrome/Edge/Firefox，也禁止为了DOM能力创建新浏览器。"
@@ -1421,10 +1726,12 @@ class HomeAgent:
             created_task_result = None
             long_term_stored = False
             automated_media_target_verified = False
+            cloudmusic_verified_result = None
             bilibili_favorite_verified = False
             bilibili_favorite_result = None
             initial_media_state_checked = False
             media_target_preexisting = False
+            tool_failures: list[dict[str, str]] = []
             for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
@@ -1465,6 +1772,8 @@ class HomeAgent:
                         # 收藏夹执行器已经验证浏览器、序号和最终 BV；不要让模型
                         # 在完成措辞中额外声称“正在播放”等未经验证的状态。
                         answer = str(bilibili_favorite_result.get("answer") or answer)
+                    if cloudmusic_verified_result:
+                        answer = str(cloudmusic_verified_result.get("answer") or answer)
                     self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
                     self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
                     if not long_term_stored:
@@ -1478,7 +1787,15 @@ class HomeAgent:
                     except json.JSONDecodeError: args = {}
                     if status: status(f"正在调用工具：{name}")
                     self.log_event("tool_started", tool=name, arguments=args)
-                    result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm))
+                    result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
+                    if isinstance(result, dict) and result.get("status") == "failed":
+                        failure_reason = str(result.get("error") or result.get("reason") or "未知原因")
+                        tool_failures.append({"tool": name, "reason": failure_reason[:500]})
+                        if status: status(f"步骤失败：{name}：{failure_reason[:120]}；正在判断重试方案…")
+                    elif isinstance(result, dict) and result.get("status") == "uncertain":
+                        uncertain_reason = str(result.get("warning") or result.get("next_action") or "操作后画面没有明显变化")
+                        tool_failures.append({"tool": name, "reason": uncertain_reason[:500]})
+                        if status: status(f"操作尚未确认：{uncertain_reason[:120]}；正在重新识别或更换操作方式…")
                     if name == "ui_list_windows" and not initial_media_state_checked and isinstance(result, dict):
                         initial_media_state_checked = True
                         observation = result.get("observation")
@@ -1499,6 +1816,13 @@ class HomeAgent:
                         if query and title_changed and query.lower() in after_title.lower():
                             automated_media_target_verified = True
                             self.log_event("automated_media_target_verified", query=query, after_title=after_title, tool=name)
+                    if name == "cloudmusic_search_and_play" and isinstance(result, dict):
+                        query = str(task_plan.get("query") or "").strip()
+                        title = str(result.get("title") or "")
+                        if result.get("ok") and query and query.casefold() in title.casefold() and result.get("used_local_tools") is True:
+                            automated_media_target_verified = True
+                            cloudmusic_verified_result = result
+                            self.log_event("automated_media_target_verified", query=query, after_title=title, tool=name, attempts=result.get("attempts"), strategy=result.get("strategy"))
                     if name == "bilibili_open_favorite_video" and isinstance(result, dict):
                         expected_index = int(task_plan.get("index") or 1)
                         actual_index = int(result.get("favorite_index") or 0)
@@ -1521,9 +1845,22 @@ class HomeAgent:
                     self.log_event("tool_completed", tool=name, result=result)
                     if status: status(f"已完成：工具 {name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
-        raise RuntimeError("工具调用轮次过多，已停止")
+        failure_summary = "；".join(f"{row['tool']}：{row['reason']}" for row in tool_failures[-6:])
+        rounds = int(self.config["agent"].get("max_tool_rounds", 8))
+        last_reason = tool_failures[-1]["reason"] if tool_failures else "执行过程中始终没有取得可验证的完成证据"
+        answer = f"这次任务在尝试 {rounds} 轮后仍未完成，我已经停下来了。最后失败原因是：{last_reason[:180]}。没有把未验证的操作当作成功。"
+        self.log_event("tool_round_limit_reached", rounds=rounds, failures=tool_failures, failure_summary=failure_summary, answer=answer)
+        if status: status(f"任务失败：{last_reason[:120]}")
+        self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+        if self.config["home"].get("auto_speak", True):
+            await self._speak_home(session, answer, status, ignore_cancel=True)
+        return answer
 
-    async def _run_tool(self, name: str, args: dict[str, Any], confirm=None) -> Any:
+    async def _run_tool(self, name: str, args: dict[str, Any], confirm=None, status=None) -> Any:
+        if name == "cloudmusic_search_and_play":
+            plan = getattr(self, "current_task_plan", {})
+            query = str(args.get("query") or plan.get("query") or "").strip()
+            return await self._run_cloudmusic_search_and_play(query, status)
         if name == "bilibili_open_favorite_video":
             plan = getattr(self, "current_task_plan", {})
             folder_name = str(args.get("favorite_folder") or plan.get("favorite_folder") or "默认收藏夹").strip()
@@ -1613,7 +1950,8 @@ class HomeAgent:
             script = ROOT / "Vision" / "analyze_window.py"
             vision_python = ROOT / ".venv" / "Scripts" / "python.exe"
             python_executable = str(vision_python if vision_python.exists() else Path(sys.executable))
-            proc = await asyncio.create_subprocess_exec(python_executable, str(script), "--title", title, "--prompt", question, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            analysis_env = os.environ.copy(); analysis_env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+            proc = await asyncio.create_subprocess_exec(python_executable, str(script), "--title", title, "--prompt", question, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, env=analysis_env)
             out, err = await proc.communicate()
             try: result = json.loads(out.decode("utf-8", "replace").splitlines()[-1])
             except (json.JSONDecodeError, IndexError): result = {"ok": False, "error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
@@ -1623,8 +1961,8 @@ class HomeAgent:
             "ui_list_windows": ("list_windows", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
             "ui_activate_window": ("activate_window", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
             "ui_type_window": ("window_type_text", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "text": str(a.get("text", ""))}),
-            "ui_click_window": ("window_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", ""))}),
-            "ui_double_click_window": ("window_double_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", ""))}),
+            "ui_click_window": ("window_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "topk": 3, "idx": max(0, min(2, int(a.get("candidate_index", 0))))}),
+            "ui_double_click_window": ("window_double_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "topk": 3, "idx": max(0, min(2, int(a.get("candidate_index", 0))))}),
             "ui_hotkey": ("desktop_hotkey", lambda a: {"keys": [str(key) for key in a.get("keys", [])]}),
             "ui_type_active_text": ("desktop_type_active_text", lambda a: {"text": str(a.get("text", "")), "clear": bool(a.get("clear", True))}),
             "web_read": ("web_read", lambda a: {"max_chars": max(1000, min(30000, int(a.get("max_chars", 12000))))}),
@@ -1649,7 +1987,13 @@ class HomeAgent:
                     observation = ast.literal_eval(observation_raw)
                 except (ValueError, SyntaxError):
                     observation = observation_raw
-                return {"ok": True, "observation": observation, "executed_tool": tool_name}
+                result = {"ok": True, "observation": observation, "executed_tool": tool_name}
+                if isinstance(observation, dict) and "state_changed" in observation:
+                    changed = bool(observation.get("state_changed"))
+                    result.update({"post_action_verified": changed, "status": "success" if changed else "uncertain", "next_action": observation.get("next_action")})
+                    if not changed:
+                        result["warning"] = "操作已发送，但等待后重新截图未观察到明显状态变化"
+                return result
             except Exception as exc:
                 return {"error": str(exc), "executed_tool": tool_name}
         if name == "codex_cli_task":

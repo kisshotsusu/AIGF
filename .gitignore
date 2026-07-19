@@ -38,6 +38,7 @@ config.yaml
 # ---- Runtime logs ----
 **/logs/
 *.log
+HomeAgent/state/codex-home/
 
 # ---- Generated audio ----
 audio/*.wav

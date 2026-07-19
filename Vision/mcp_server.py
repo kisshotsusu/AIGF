@@ -175,15 +175,15 @@ def window_screenshot(title_contains: str) -> MCPImage:
 
 
 @mcp.tool()
-def window_click(title_contains: str, instruction: str, topk: int = 3) -> str:
+def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0) -> str:
     """激活目标窗口，在窗口截图内识别控件并点击。"""
-    return str(agent.window_click(title_contains, instruction, topk=topk))
+    return str(agent.window_click(title_contains, instruction, topk=topk, idx=idx))
 
 
 @mcp.tool()
-def window_double_click(title_contains: str, instruction: str, topk: int = 3) -> str:
+def window_double_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0) -> str:
     """激活目标窗口，在窗口截图内识别指定元素并双击。"""
-    return str(agent.window_double_click(title_contains, instruction, topk=topk))
+    return str(agent.window_double_click(title_contains, instruction, topk=topk, idx=idx))
 
 
 @mcp.tool()

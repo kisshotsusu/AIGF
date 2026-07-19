@@ -23,7 +23,7 @@ import json
 import urllib.request
 
 import torch
-from PIL import Image, ImageGrab
+from PIL import Image, ImageChops, ImageGrab, ImageStat
 
 # ---- 路径(可通过环境变量覆盖) ----
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -82,11 +82,15 @@ def _foreground_window():
         process_name = psutil.Process(pid.value).name().lower()
     except Exception:
         pass
+    rect = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
     return {
+        "hwnd": int(hwnd),
         "title": title.value,
         "pid": int(pid.value),
         "process_name": process_name,
         "is_browser": process_name in _BROWSER_PROCESSES,
+        "bounds": [rect.left, rect.top, rect.right, rect.bottom],
     }
 
 
@@ -536,6 +540,62 @@ def window_screenshot_pil(title_contains: str) -> Image.Image:
     return ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
 
 
+def _capture_window_info(window: dict) -> Image.Image:
+    left, top, right, bottom = window["bounds"]
+    if right <= left or bottom <= top: raise RuntimeError("target window has invalid bounds")
+    return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
+
+
+def _window_title_by_hwnd(hwnd: int) -> str:
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(hwnd)
+    buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+    user32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return buffer.value.strip()
+
+
+def _visual_change_evidence(before: Image.Image, after: Image.Image, before_title: str = "", after_title: str = "") -> dict:
+    """Compare two screenshots cheaply; this does not invoke the vision model again."""
+    target = (320, 180)
+    left = before.convert("L").resize(target)
+    right = after.convert("L").resize(target)
+    difference = ImageChops.difference(left, right)
+    mean_delta = float(ImageStat.Stat(difference).mean[0]) / 255.0
+    histogram = difference.histogram()
+    changed_pixels = sum(histogram[12:])
+    change_ratio = changed_pixels / float(target[0] * target[1])
+    title_changed = bool(after_title and after_title != before_title)
+    state_changed = bool(title_changed or change_ratio >= 0.0015 or mean_delta >= 0.001)
+    return {
+        "post_screenshot_captured": True,
+        "waited_ms": max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))),
+        "state_changed": state_changed,
+        "title_changed": title_changed,
+        "visual_change_ratio": round(change_ratio, 6),
+        "visual_mean_delta": round(mean_delta, 6),
+        "execution_likely_succeeded": state_changed,
+        "next_action": (
+            "操作后画面已变化；重新读取当前页面或窗口语义，再根据新状态继续下一步"
+            if state_changed else
+            "操作后画面没有明显变化；不要假设成功，应重新识别目标、切换候选点或改用其他操作方式"
+        ),
+    }
+
+
+def _wait_and_compare_window(window: dict, before: Image.Image, before_title: str = "", wait_ms: int | None = None) -> dict:
+    delay = max(100, int(wait_ms if wait_ms is not None else os.environ.get("GUI_POST_ACTION_WAIT_MS", "550")))
+    time.sleep(delay / 1000.0)
+    try:
+        after = _capture_window_info(window)
+        after_title = _window_title_by_hwnd(int(window["hwnd"]))
+        evidence = _visual_change_evidence(before, after, before_title, after_title)
+        evidence["waited_ms"] = delay
+        evidence["after_title"] = after_title
+        return evidence
+    except Exception as exc:
+        return {"post_screenshot_captured": False, "waited_ms": delay, "state_changed": True, "execution_likely_succeeded": True, "reason": f"目标窗口在操作后已关闭或变化：{exc}", "next_action": "目标窗口结构已变化；重新列出窗口并读取新状态"}
+
+
 def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
     window = _find_window(title_contains); activate_window(title_contains)
     img = window_screenshot_pil(title_contains); points = ground_image(instruction, img, topk)
@@ -546,8 +606,8 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-    time.sleep(0.3)
-    return {"clicked": True, "pixel": [px, py], "window": window, "all_points": points}
+    evidence = _wait_and_compare_window(window, img, str(window.get("title", "")))
+    return {"clicked": True, "pixel": [px, py], "window": window, "all_points": points, **evidence}
 
 
 def window_double_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
@@ -563,12 +623,8 @@ def window_double_click(title_contains: str, instruction: str, topk: int = 3, id
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
         time.sleep(0.12)
-    time.sleep(1.5)
-    user32 = ctypes.windll.user32
-    length = user32.GetWindowTextLengthW(window["hwnd"])
-    title_buffer = ctypes.create_unicode_buffer(max(1, length + 1))
-    user32.GetWindowTextW(window["hwnd"], title_buffer, len(title_buffer))
-    after_title = title_buffer.value.strip()
+    evidence = _wait_and_compare_window(window, img, str(window.get("title", "")), wait_ms=max(800, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))))
+    after_title = str(evidence.get("after_title", ""))
     return {
         "double_clicked": True,
         "instruction": instruction,
@@ -578,6 +634,7 @@ def window_double_click(title_contains: str, instruction: str, topk: int = 3, id
         "after_title": after_title,
         "title_changed": bool(after_title and after_title != window.get("title", "")),
         "all_points": points,
+        **evidence,
     }
 
 
@@ -627,11 +684,15 @@ def desktop_read_clipboard():
 def window_type_text(title_contains: str, instruction: str, text: str):
     result = window_click(title_contains, instruction)
     if not result.get("clicked"): return {"typed": False, **result}
-    desktop_hotkey(["ctrl", "a"])
-    desktop_hotkey(["backspace"])
+    window = result["window"]
+    before = _capture_window_info(window)
+    before_title = _window_title_by_hwnd(int(window["hwnd"]))
+    _desktop_hotkey_raw(["ctrl", "a"])
+    _desktop_hotkey_raw(["backspace"])
     _set_clipboard_text(text)
-    desktop_hotkey(["ctrl", "v"])
-    return {"typed": True, "text_length": len(str(text)), **result}
+    _desktop_hotkey_raw(["ctrl", "v"])
+    evidence = _wait_and_compare_window(window, before, before_title)
+    return {"typed": True, "text_length": len(str(text)), **result, **evidence}
 
 
 def desktop_click(instruction: str, topk: int = 3, idx: int = 0):
@@ -641,15 +702,16 @@ def desktop_click(instruction: str, topk: int = 3, idx: int = 0):
     px = left + int(max(0.0, min(1.0, x)) * width); py = top + int(max(0.0, min(1.0, y)) * height)
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0); ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-    time.sleep(0.4)
-    return {"clicked": True, "instruction": instruction, "pixel": [px, py], "primary_screen": [width, height], "all_points": points}
+    delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
+    after = desktop_screenshot_pil(); evidence = _visual_change_evidence(img, after); evidence["waited_ms"] = delay
+    return {"clicked": True, "instruction": instruction, "pixel": [px, py], "primary_screen": [width, height], "all_points": points, **evidence}
 
 
 def _key_event(vk: int, up: bool = False):
     ctypes.windll.user32.keybd_event(vk, 0, 0x0002 if up else 0, 0)
 
 
-def desktop_hotkey(keys: list[str]):
+def _desktop_hotkey_raw(keys: list[str]):
     mapping = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "win": 0x5B, "enter": 0x0D, "esc": 0x1B, "tab": 0x09, "space": 0x20, "backspace": 0x08, "delete": 0x2E}
     codes = []
     for key in keys:
@@ -661,27 +723,59 @@ def desktop_hotkey(keys: list[str]):
     return {"pressed": keys}
 
 
+def desktop_hotkey(keys: list[str]):
+    window = _foreground_window()
+    try: before = _capture_window_info(window)
+    except Exception: before = desktop_screenshot_pil()
+    result = _desktop_hotkey_raw(keys)
+    if window.get("hwnd") and window.get("bounds"):
+        evidence = _wait_and_compare_window(window, before, str(window.get("title", "")))
+    else:
+        delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
+        evidence = _visual_change_evidence(before, desktop_screenshot_pil()); evidence["waited_ms"] = delay
+    return {**result, **evidence}
+
+
 def desktop_type_text(instruction: str, text: str):
     clicked = desktop_click(instruction)
     if not clicked.get("clicked"): return {"typed": False, **clicked}
+    before = desktop_screenshot_pil()
     _set_clipboard_text(text)
-    desktop_hotkey(["ctrl", "v"])
-    return {"typed": True, "pixel": clicked["pixel"], "text_length": len(str(text))}
+    _desktop_hotkey_raw(["ctrl", "v"])
+    delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
+    evidence = _visual_change_evidence(before, desktop_screenshot_pil()); evidence["waited_ms"] = delay
+    return {"typed": True, "pixel": clicked["pixel"], "text_length": len(str(text)), **evidence}
 
 
 def desktop_type_active_text(text: str, clear: bool = True):
     """Paste text into the currently focused native control without visual relocation."""
+    window = _foreground_window()
+    try: before = _capture_window_info(window)
+    except Exception: before = desktop_screenshot_pil()
     if clear:
-        desktop_hotkey(["ctrl", "a"]); desktop_hotkey(["backspace"])
+        _desktop_hotkey_raw(["ctrl", "a"]); _desktop_hotkey_raw(["backspace"])
     _set_clipboard_text(text)
-    desktop_hotkey(["ctrl", "v"])
-    return {"typed": True, "focused": True, "cleared": bool(clear), "text_length": len(str(text))}
+    _desktop_hotkey_raw(["ctrl", "v"])
+    if window.get("hwnd") and window.get("bounds"):
+        evidence = _wait_and_compare_window(window, before, str(window.get("title", "")))
+    else:
+        delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
+        evidence = _visual_change_evidence(before, desktop_screenshot_pil()); evidence["waited_ms"] = delay
+    return {"typed": True, "focused": True, "cleared": bool(clear), "text_length": len(str(text)), **evidence}
 
 
 def desktop_scroll(direction: str = "down", amount: int = 600):
+    window = _foreground_window()
+    try: before = _capture_window_info(window)
+    except Exception: before = desktop_screenshot_pil()
     delta = -120 * max(1, abs(int(amount)) // 120) if direction.lower() == "down" else 120 * max(1, abs(int(amount)) // 120)
     ctypes.windll.user32.mouse_event(0x0800, 0, 0, delta, 0)
-    return {"scrolled": direction, "amount": abs(int(amount))}
+    if window.get("hwnd") and window.get("bounds"):
+        evidence = _wait_and_compare_window(window, before, str(window.get("title", "")))
+    else:
+        delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
+        evidence = _visual_change_evidence(before, desktop_screenshot_pil()); evidence["waited_ms"] = delay
+    return {"scrolled": direction, "amount": abs(int(amount)), **evidence}
 
 
 def close():

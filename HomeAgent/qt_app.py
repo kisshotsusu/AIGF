@@ -126,14 +126,90 @@ class MessageBubble(QFrame):
 
 class TaskProgressCard(QFrame):
     def __init__(self):
-        super().__init__(); self.setObjectName("progressCard"); layout=QVBoxLayout(self); layout.setContentsMargins(14,11,14,12); layout.setSpacing(5)
-        top=QHBoxLayout(); self.title=QLabel("任务进行中"); self.title.setObjectName("progressTitle"); self.elapsed=QLabel("0 秒"); self.elapsed.setObjectName("muted"); top.addWidget(self.title); top.addStretch(); top.addWidget(self.elapsed); layout.addLayout(top)
-        self.current=QLabel("正在分析任务…"); self.current.setWordWrap(True); self.current.setObjectName("progressCurrent"); layout.addWidget(self.current)
-        self.done=QLabel("已完成：等待第一个阶段"); self.done.setWordWrap(True); self.done.setObjectName("progressDone"); layout.addWidget(self.done); self.started=time.monotonic(); self.timer=QTimer(self); self.timer.timeout.connect(lambda:self.elapsed.setText(f"{int(time.monotonic()-self.started)} 秒")); self.timer.start(1000)
+        super().__init__()
+        self.setObjectName("progressCard")
+        self._expanded = False
+        self._completed_count = 0
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 7, 12, 8)
+        layout.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.setSpacing(7)
+        self.toggle = QPushButton("›")
+        self.toggle.setObjectName("progressToggle")
+        self.toggle.setFixedSize(22, 22)
+        self.toggle.setToolTip("展开任务进度")
+        self.toggle.clicked.connect(self.toggle_details)
+        self.title = QLabel("正在执行任务")
+        self.title.setObjectName("progressTitle")
+        self.summary = QLabel("正在分析任务…")
+        self.summary.setObjectName("progressSummary")
+        self.summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.elapsed = QLabel("0 秒")
+        self.elapsed.setObjectName("progressElapsed")
+        top.addWidget(self.toggle)
+        top.addWidget(self.title)
+        top.addWidget(self.summary, 1)
+        top.addWidget(self.elapsed)
+        layout.addLayout(top)
+
+        self.details = QFrame()
+        self.details.setObjectName("progressDetails")
+        detail_layout = QVBoxLayout(self.details)
+        detail_layout.setContentsMargins(29, 2, 4, 2)
+        detail_layout.setSpacing(5)
+        self.current = QLabel("当前：正在分析任务…")
+        self.current.setWordWrap(True)
+        self.current.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.current.setObjectName("progressCurrent")
+        self.done = QLabel("已完成：暂无")
+        self.done.setWordWrap(True)
+        self.done.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.done.setObjectName("progressDone")
+        detail_layout.addWidget(self.current)
+        detail_layout.addWidget(self.done)
+        layout.addWidget(self.details)
+        self.details.hide()
+
+        self.started = time.monotonic()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(lambda: self.elapsed.setText(f"{int(time.monotonic()-self.started)} 秒"))
+        self.timer.start(1000)
+
+    @staticmethod
+    def _compact(text, limit=72):
+        value = " ".join(str(text or "").split()) or "正在处理…"
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
+    def toggle_details(self):
+        self._expanded = not self._expanded
+        self.details.setVisible(self._expanded)
+        self.toggle.setText("⌄" if self._expanded else "›")
+        self.toggle.setToolTip("收起任务进度" if self._expanded else "展开任务进度")
+
     def update_progress(self, data):
-        self.elapsed.setText(f"{int(data.get('elapsed',0))} 秒"); self.current.setText("当前："+str(data.get("current") or "正在处理…")); completed=data.get("completed") or []; self.done.setText("已完成："+("  ·  ".join(map(str,completed[-5:])) if completed else "暂无"))
+        current = str(data.get("current") or "正在处理…")
+        completed = data.get("completed") or []
+        self._completed_count = len(completed)
+        self.elapsed.setText(f"{int(data.get('elapsed', 0))} 秒")
+        self.summary.setText(self._compact(current))
+        self.summary.setToolTip(current if len(current) > 72 else "")
+        self.current.setText("当前：" + current)
+        self.done.setText("已完成：" + ("\n".join(f"• {item}" for item in completed[-8:]) if completed else "暂无"))
+
     def finish(self, cancelled=False):
-        self.timer.stop(); self.title.setText("任务已停止" if cancelled else "任务已完成"); self.current.setText("已结束"); self.setProperty("finished",True); self.style().unpolish(self); self.style().polish(self)
+        self.timer.stop()
+        self.title.setText("任务已停止" if cancelled else "任务已完成")
+        if cancelled:
+            self.summary.setText("已停止")
+        else:
+            count_text = f" · {self._completed_count} 个步骤" if self._completed_count else ""
+            self.summary.setText("执行完成" + count_text)
+        self.current.setText("当前：已结束")
+        self.setProperty("finished", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
 
 class SettingsDialog(QDialog):
@@ -399,7 +475,7 @@ QMainWindow {{ background: transparent; }}
 QScrollArea {{ background: {COLORS['window']}; }} QScrollArea > QWidget > QWidget {{ background: {COLORS['window']}; }}
 #bubbleAgent {{ background: {COLORS['panel']}; border: 1px solid {COLORS['line']}; border-radius: 15px; }} #bubbleUser {{ background: {COLORS['accent']}; border-radius: 15px; }} #bubbleError {{ background: #FFF0EF; border: 1px solid #F5C9C7; border-radius: 15px; }}
 #bubbleUser QLabel {{ color: white; }} #bubbleName {{ font-size: 11px; font-weight: 700; color: {COLORS['muted']}; }} #bubbleText {{ font-size: 14px; }}
-#progressCard {{ background: #EDF7F4; border: 1px solid #9BCDC2; border-radius: 14px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #F4F7F6; border-color: #CCD9D6; }} #progressTitle {{ color: #115F59; font-size: 14px; font-weight: 700; }} #progressCurrent {{ color: #173D37; font-weight: 600; }} #progressDone {{ color: #425C56; font-size: 12px; }}
+#progressCard {{ background: #F7F9F9; border: 1px solid #DFE7E7; border-radius: 12px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #FAFBFB; border-color: #E4EAEA; }} #progressToggle {{ min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #526568; font-size: 19px; font-weight: 500; }} #progressToggle:hover {{ background: #E7EFEE; color: #16766F; }} #progressTitle {{ color: #263638; font-size: 13px; font-weight: 700; }} #progressSummary {{ color: #657578; font-size: 12px; }} #progressElapsed {{ color: #809093; font-size: 11px; }} #progressDetails {{ border-top: 1px solid #E4EAEA; }} #progressCurrent {{ color: #34484B; font-size: 12px; }} #progressDone {{ color: #657578; font-size: 12px; }}
 #composer {{ background: {COLORS['panel']}; border-top: 1px solid {COLORS['line']}; border-bottom-left-radius: 22px; border-bottom-right-radius: 22px; }}
 #input, QLineEdit, QComboBox, QTextBrowser {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 12px; padding: 10px; selection-background-color: {COLORS['accent']}; }} #input:focus, QLineEdit:focus {{ border: 1px solid {COLORS['accent']}; }}
 QPushButton {{ min-height: 34px; padding: 0 15px; border-radius: 10px; font-weight: 600; }} #primaryButton {{ background: {COLORS['accent']}; color: white; border: 0; }} #primaryButton:hover {{ background: {COLORS['accent_hover']}; }} #softButton {{ background: {COLORS['soft']}; color: {COLORS['accent']}; border: 0; }} #stopButton {{ background: white; color: {COLORS['danger']}; border: 1px solid #EBC1BF; }} #stopButton:disabled {{ color: #AAB4B5; border-color: {COLORS['line']}; }}

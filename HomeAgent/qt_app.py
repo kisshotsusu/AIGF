@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 import wave
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from agent import HOME_AGENT, ROOT, HomeAgent
+from home_modules.system_startup import AUTOSTART_ARGUMENT, run_network_guard, set_windows_autostart
 
 
 COLORS = {
@@ -221,7 +223,7 @@ class SettingsDialog(QDialog):
         self.status = QLabel("所有修改都会实时保存"); self.status.setObjectName("muted"); root.addWidget(self.status)
         tabs = QTabWidget(); root.addWidget(tabs, 1)
         general = QWidget(); form = QFormLayout(general); form.setContentsMargins(18, 18, 18, 18); form.setSpacing(14)
-        cfg = self.agent.config; mic = cfg.get("microphone", {}); control = cfg.get("computer_control", {}); codex = cfg.get("codex_cli", {})
+        cfg = self.agent.config; mic = cfg.get("microphone", {}); control = cfg.get("computer_control", {}); codex = cfg.get("codex_cli", {}); startup = cfg.get("system_startup", {})
         self.always_top = QCheckBox("窗口始终置顶"); self.always_top.setChecked(bool(cfg.get("desktop_pet", {}).get("always_on_top", True)))
         self.auto_send = QCheckBox("语音识别完成后自动发送"); self.auto_send.setChecked(bool(mic.get("auto_send_after_transcription", True)))
         self.control = QCheckBox("允许 Home Agent 使用电脑工具"); self.control.setChecked(bool(control.get("enabled", True)))
@@ -229,8 +231,19 @@ class SettingsDialog(QDialog):
         self.confirm_file = QCheckBox("打开文件和网页前请求确认"); self.confirm_file.setChecked(bool(control.get("confirm_before_action", True)))
         self.confirm_app = QCheckBox("启动应用前请求确认"); self.confirm_app.setChecked(bool(control.get("confirm_launch_app", False)))
         self.codex = QCheckBox("启用 Codex CLI / MCP"); self.codex.setChecked(bool(codex.get("enabled", False)))
-        for label, widget in (("界面", self.always_top), ("语音", self.auto_send), ("电脑控制", self.control), ("权限", self.full_access), ("确认", self.confirm_file), ("确认", self.confirm_app), ("自动化", self.codex)):
+        self.system_autostart = QCheckBox("跟随 Windows 自动启动"); self.system_autostart.setChecked(bool(startup.get("enabled", False)))
+        self.network_restart = QCheckBox("自动启动时持续断网则重启电脑"); self.network_restart.setChecked(bool(startup.get("restart_on_network_failure", False)))
+        self.network_attempts = QSpinBox(); self.network_attempts.setRange(1, 5); self.network_attempts.setValue(min(5, max(1, int(startup.get("max_restart_attempts", 5))))); self.network_attempts.setSuffix(" 次")
+        self.network_note = QLabel("仅在系统自动启动时检测；Bilibili、百度、腾讯均不可达才计为断网。")
+        self.network_note.setWordWrap(True); self.network_note.setObjectName("muted")
+        for label, widget in (("界面", self.always_top), ("语音", self.auto_send), ("电脑控制", self.control), ("权限", self.full_access), ("确认", self.confirm_file), ("确认", self.confirm_app), ("自动化", self.codex), ("系统启动", self.system_autostart), ("断网保护", self.network_restart)):
             form.addRow(label, widget); widget.toggled.connect(self.save)
+        form.addRow("最多重启", self.network_attempts)
+        form.addRow("说明", self.network_note)
+        self.network_attempts.valueChanged.connect(self.save)
+        self.system_autostart.toggled.connect(self._sync_startup_controls)
+        self.network_restart.toggled.connect(self._sync_startup_controls)
+        self._sync_startup_controls()
         tabs.addTab(general, "常规")
 
         stt_page = QWidget(); stt_form = QFormLayout(stt_page); stt_form.setContentsMargins(18, 18, 18, 18); stt = cfg.get("stt", {})
@@ -255,6 +268,11 @@ class SettingsDialog(QDialog):
 
     def defer_save(self): self.status.setText("正在保存…"); self.timer.start(450)
 
+    def _sync_startup_controls(self):
+        enabled = self.system_autostart.isChecked()
+        self.network_restart.setEnabled(enabled)
+        self.network_attempts.setEnabled(enabled and self.network_restart.isChecked())
+
     def save(self):
         if self._saving: return
         self._saving = True
@@ -264,10 +282,13 @@ class SettingsDialog(QDialog):
             cfg.setdefault("microphone", {})["auto_send_after_transcription"] = self.auto_send.isChecked()
             control = cfg.setdefault("computer_control", {}); control["enabled"] = self.control.isChecked(); control["full_access"] = self.full_access.isChecked(); control["confirm_before_action"] = self.confirm_file.isChecked(); control["confirm_launch_app"] = self.confirm_app.isChecked()
             cfg.setdefault("codex_cli", {})["enabled"] = self.codex.isChecked()
+            startup = cfg.setdefault("system_startup", {}); startup["enabled"] = self.system_autostart.isChecked(); startup["restart_on_network_failure"] = self.network_restart.isChecked(); startup["max_restart_attempts"] = min(5, self.network_attempts.value())
             stt = cfg.setdefault("stt", {}); stt["mode"] = self.stt_mode.currentText(); stt["api_url"] = self.stt_url.text().strip(); stt["model"] = self.stt_model.text().strip(); stt["language"] = self.stt_language.text().strip() or "auto"
             progress=cfg.setdefault("progress_reporting",{});progress["enabled"]=self.progress_enabled.isChecked();progress["long_task_seconds"]=self.progress_seconds.value();progress["tts_cooldown_seconds"]=self.progress_cooldown.value();progress["max_reports_per_task"]=self.progress_reports.value()
             upgrade = cfg.setdefault("self_upgrade", {}); upgrade["enabled"] = self.upgrade_enabled.isChecked(); upgrade["auto_restart"] = self.upgrade_restart.isChecked(); upgrade["require_validation"] = self.upgrade_validation.isChecked(); upgrade["max_restart_attempts"] = self.upgrade_attempts.value()
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
+            set_windows_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")
+            self._sync_startup_controls()
             self.agent.config = cfg; self.owner.apply_always_on_top(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
         except Exception as exc: self.status.setText(f"保存失败：{exc}")
         finally: self._saving = False
@@ -499,4 +520,13 @@ def run():
         if families: app.setFont(QFont(families[0], 10))
     app.setStyle("Fusion"); app.setStyleSheet(STYLE)
     window = HomeAgentWindow(); pet = DesktopPetWindow(window); window.pet = pet; pet.show()
+    startup_cfg = window.agent.config.get("system_startup", {})
+    if AUTOSTART_ARGUMENT in sys.argv:
+        threading.Thread(
+            target=run_network_guard,
+            args=(startup_cfg, HOME_AGENT / "state" / "network-startup.json"),
+            kwargs={"is_autostart": True},
+            daemon=True,
+            name="network-startup-guard",
+        ).start()
     return app.exec()

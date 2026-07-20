@@ -12,7 +12,7 @@ if exist "..\.venv\Scripts\pythonw.exe" (
 %PYTHON% -c "import aiohttp,yaml,dotenv,sounddevice,numpy,PySide6" >nul 2>nul
 if errorlevel 1 goto missing_deps
 if not exist logs mkdir logs
-start "" /b %PYTHONW% app.py >>logs\home-agent-windowless.log 2>&1
+start "" /b %PYTHONW% app.py %* >>logs\home-agent-windowless.log 2>&1
 exit /b
 
 :missing_deps

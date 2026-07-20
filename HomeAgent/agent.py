@@ -380,8 +380,9 @@ class HomeAgent:
         cfg = self._codex_config()
         if not cfg.get("enabled", False):
             return False
-        if self.self_upgrade.is_upgrade_request(text):
-            return True
+        if self.self_upgrade.code_editor.is_code_task(text) and self.config.get("agent", {}).get("prefer_local_code_tools", True):
+            lowered = str(text).lower()
+            return any(word in lowered for word in ("codex", "调用cli", "调用 cli", "使用cli", "使用 cli"))
         mode = str(cfg.get("trigger_mode", "auto")).lower()
         if mode == "always":
             return True
@@ -1214,7 +1215,7 @@ class HomeAgent:
         self.log_event("live_context_clear_requested", token=token)
         return payload
 
-    async def _run_codex_task(self, task: str, require_mcp: bool = False, status=None, preferred_mcp: str = "", task_plan: dict[str, Any] | None = None, previous_failure: str = "") -> dict[str, Any]:
+    async def _run_codex_task(self, task: str, require_mcp: bool = False, status=None, preferred_mcp: str = "", task_plan: dict[str, Any] | None = None, previous_failure: str = "", code_retry_round: int = 0) -> dict[str, Any]:
         if self.cancel_event.is_set():
             raise asyncio.CancelledError
         cfg = self._codex_config()
@@ -1230,11 +1231,12 @@ class HomeAgent:
         gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", False))
         plan = task_plan or self._analyze_task(task)
         self_code_task = self.self_upgrade.is_upgrade_request(task)
+        code_task = self.self_upgrade.code_editor.is_code_task(task)
         self_code_contract = ""
-        if self_code_task:
-            if status: status("正在读取工程文档并检查自编程约束…")
-            self_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract()
-            self.log_event("self_code_documents_loaded", documents=loaded_documents)
+        if code_task:
+            if status: status("正在准备代码工程和自动测试约束…")
+            self_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract(self_edit=self_code_task)
+            self.log_event("code_task_prepared", self_edit=self_code_task, documents=loaded_documents)
         prompt = (
             "你是家庭 AI 助手的执行代理。请使用可用的 CLI、文件和 MCP 工具完成任务，"
             "最后用简洁中文给出适合语音朗读的结果。不要输出密钥。\n"
@@ -1399,12 +1401,31 @@ class HomeAgent:
             self.log_event("codex_preferred_mcp_missing", preferred_mcp=preferred_mcp, mcp_calls=mcp_calls)
             return {"error": f"Codex 调用了 MCP，但没有调用指定的 {preferred_mcp}。", "answer": answer, "mcp_calls": mcp_calls, "event_count": len(events)}
         code_validation = None
-        if self_code_task:
+        autonomous_tests = None
+        if code_task:
             code_validation = self.self_upgrade.validate_current_changes(require_changes=True)
-            self.log_event("self_code_validation", result=code_validation)
+            self.log_event("code_validation", self_edit=self_code_task, result=code_validation)
             if not code_validation.get("ok"):
-                return {"error": f"自编程任务未通过本地校验：{code_validation.get('error', 'unknown error')}", "answer": answer, "validation": code_validation, "event_count": len(events)}
-        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:], "validation": code_validation}
+                max_repairs = max(0, min(4, int(self.config.get("agent", {}).get("code_test_retry_rounds", 2))))
+                if code_retry_round < max_repairs:
+                    failure = f"本地文件校验失败：{code_validation.get('error', 'unknown error')}"
+                    if status: status(f"代码校验失败，正在自主修复（第 {code_retry_round + 1}/{max_repairs} 轮）…")
+                    self.log_event("code_repair_retry", stage="validation", round=code_retry_round + 1, failure=failure)
+                    return await self._run_codex_task(task, require_mcp, status, preferred_mcp, plan, failure, code_retry_round + 1)
+                return {"error": f"代码任务未通过本地校验：{code_validation.get('error', 'unknown error')}", "answer": answer, "validation": code_validation, "event_count": len(events)}
+            if status: status("代码已写入，正在由本地模块独立运行测试…")
+            autonomous_tests = await asyncio.to_thread(self.self_upgrade.code_editor.run_autonomous_tests, code_validation.get("changed", []))
+            self.log_event("code_autonomous_tests", result=autonomous_tests)
+            if not autonomous_tests.get("ok"):
+                max_repairs = max(0, min(4, int(self.config.get("agent", {}).get("code_test_retry_rounds", 2))))
+                if code_retry_round < max_repairs:
+                    failed_output = "\n".join(str(row.get("output") or row.get("error") or "") for row in autonomous_tests.get("failed", []))[-5000:]
+                    failure = f"本地自主测试失败：\n{failed_output}"
+                    if status: status(f"自动测试失败，正在自主修复（第 {code_retry_round + 1}/{max_repairs} 轮）…")
+                    self.log_event("code_repair_retry", stage="tests", round=code_retry_round + 1, failure=failure)
+                    return await self._run_codex_task(task, require_mcp, status, preferred_mcp, plan, failure, code_retry_round + 1)
+                return {"error": f"代码已生成，但自主测试未通过：{autonomous_tests.get('error', 'unknown error')}", "answer": answer, "validation": code_validation, "tests": autonomous_tests, "event_count": len(events)}
+        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:], "validation": code_validation, "tests": autonomous_tests}
         self.log_event("codex_task_completed", result=result)
         return result
 
@@ -1432,6 +1453,15 @@ class HomeAgent:
             {"type": "function", "function": {"name": "acknowledge_scheduled_task", "description": "当用户明确回应刚才的提醒、表示知道了或已经完成时，确认最近一个待回应任务并停止本轮重复提醒。无关回复不要调用。", "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "description": "可选；不填时确认最近的待回应任务"}, "response": {"type": "string", "description": "用户的原始确认回复"}}}}},
             {"type": "function", "function": {"name": "long_term_memory", "description": "结构化长期记忆指令。高价值信息用store；用户询问过去经历或‘你记得吗’时必须先用retrieve。普通闲聊禁止store。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["store", "retrieve"]}, "tags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 5}, "summary": {"type": "string", "maxLength": 20}, "detail": {"type": "string"}, "category": {"type": "string", "enum": ["health", "emotion", "major_event", "preference", "habit", "relationship", "agreement"]}, "importance": {"type": "integer", "minimum": 70, "maximum": 100}, "query_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8}}, "required": ["action"]}}},
         ]
+        if getattr(self, "current_code_task", False) and self.config.get("agent", {}).get("prefer_local_code_tools", True):
+            tools += [
+                {"type": "function", "function": {"name": "code_list_files", "description": "列出当前代码任务允许目录中的文件。独立项目只能访问 Projects；自修改任务可访问工程源码区。", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "工程根目录相对路径"}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}}}},
+                {"type": "function", "function": {"name": "code_read_file", "description": "读取代码文本。修改现有文件前必须先读取；禁止密钥、日志、模型、缓存和运行状态。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer", "minimum": 1000, "maximum": 100000}}, "required": ["path"]}}},
+                {"type": "function", "function": {"name": "code_search_text", "description": "在允许的代码目录中搜索文本并返回文件、行号和内容，用于先定位再修改。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": ["query"]}}},
+                {"type": "function", "function": {"name": "code_write_file", "description": "原子创建或完整写入一个代码/测试/README 文件。独立项目写到 Projects/<name>/。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+                {"type": "function", "function": {"name": "code_replace_text", "description": "在已读取文件中精确替换原文，适合小范围修改，找不到原文会失败。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["path", "old", "new"]}}},
+                {"type": "function", "function": {"name": "code_validate_project", "description": "扫描本任务真实变更并由 HomeAgent 本地执行语法检查和自动测试。代码任务完成前必须调用且必须返回ok=true。", "parameters": {"type": "object", "properties": {}}}},
+            ]
         if self.config.get("vision_mcp", {}).get("enabled", False) and self.config.get("agent", {}).get("model_driven_computer_actions", True):
             tools += [
                 {"type": "function", "function": {"name": "bilibili_open_favorite_video", "description": "在用户已经打开且已登录的普通浏览器中，按B站收藏夹真实数据顺序打开指定收藏夹第N个视频。B站收藏夹任务应优先调用；不会创建Chrome、Chromium或临时浏览器。", "parameters": {"type": "object", "properties": {"favorite_folder": {"type": "string", "description": "用户说出的收藏夹名称，例如二次元好看或默认收藏夹"}, "index": {"type": "integer", "minimum": 1, "description": "从1开始的视频序号"}}, "required": ["favorite_folder", "index"]}}},
@@ -1472,6 +1502,8 @@ class HomeAgent:
         if self.config.get("agent", {}).get("model_driven_computer_actions", True):
             delegated = {"web_agent_task", "vision_gui_task"}
             tools = [item for item in tools if item.get("function", {}).get("name") not in delegated]
+        if getattr(self, "current_code_task", False) and self.config.get("agent", {}).get("prefer_local_code_tools", True):
+            tools = [item for item in tools if item.get("function", {}).get("name") != "codex_cli_task"]
         return tools
 
     def _home_tts_chunks(self, text: str) -> list[str]:
@@ -1577,6 +1609,9 @@ class HomeAgent:
         if status: status("正在理解任务并制定执行计划…")
         task_plan = await self._plan_task(text, recent_task_context)
         self.current_task_plan = task_plan
+        code_task = self.self_upgrade.code_editor.is_code_task(text)
+        self.current_code_task = code_task
+        self.current_code_self_edit = self.self_upgrade.is_upgrade_request(text)
         self.log_event("task_plan_created", task_plan=task_plan)
         if task_plan.get("requires_clarification"):
             answer = "我没能可靠识别这次操作的目标对象，所以没有执行，避免搜索或点击错误内容。请再说一次目标名称。"
@@ -1741,6 +1776,15 @@ class HomeAgent:
                 "原生音乐列表优先双击准确的歌曲行。禁止直接点击底部或全局播放按钮来代替选择目标。"
                 "操作后必须再次读取网页、URL或窗口标题验证实际目标已打开/播放；没有证据不得报告成功。"
             )
+        if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True):
+            local_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract(self_edit=self.current_code_self_edit)
+            self.log_event("local_code_task_prepared", self_edit=self.current_code_self_edit, documents=loaded_documents)
+            operation_contract += (
+                "\n\n【本地代码工具主路径】\n" + local_code_contract +
+                "必须优先使用 code_list_files、code_read_file、code_search_text、code_write_file、code_replace_text 完成编辑。"
+                "完成后必须调用 code_validate_project；只有它返回 ok=true 才能结束。"
+                "不要主动调用 Codex，网络执行器仅由主程序在本地工具彻底失败后低优先级回退。"
+            )
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt() + memory_context + operation_contract}, *self.history]
         url = provider["base_url"].rstrip("/") + "/chat/completions"
         timeout = aiohttp.ClientTimeout(total=llm_cfg.get("timeout_seconds", 45))
@@ -1755,6 +1799,7 @@ class HomeAgent:
             initial_media_state_checked = False
             media_target_preexisting = False
             tool_failures: list[dict[str, str]] = []
+            local_code_verified = False
             for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
@@ -1768,6 +1813,10 @@ class HomeAgent:
                 calls = choice.get("tool_calls") or []
                 if not calls:
                     answer = (choice.get("content") or "").strip()
+                    if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True) and not local_code_verified:
+                        self.log_event("unverified_local_code_answer_rejected", answer=answer, round=round_index)
+                        messages.append({"role": "system", "content": "代码任务还没有通过本地验证。继续调用本地 code_* 工具实际写入代码，最后调用 code_validate_project；没有 ok=true 的测试证据不得回答完成。"})
+                        continue
                     requires_automated_media_proof = bool(
                         task_plan.get("site") == "cloudmusic"
                         and task_plan.get("handler") == "cloudmusic_search"
@@ -1866,12 +1915,27 @@ class HomeAgent:
                         singing_performed = True
                     if name == "long_term_memory" and str(args.get("action", "")) == "store" and isinstance(result, dict) and result.get("ok"):
                         long_term_stored = True
+                    if name == "code_validate_project" and isinstance(result, dict) and result.get("ok") is True:
+                        local_code_verified = True
                     self.log_event("tool_completed", tool=name, result=result)
                     if status: status(f"已完成：工具 {name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
         failure_summary = "；".join(f"{row['tool']}：{row['reason']}" for row in tool_failures[-6:])
         rounds = int(self.config["agent"].get("max_tool_rounds", 8))
         last_reason = tool_failures[-1]["reason"] if tool_failures else "执行过程中始终没有取得可验证的完成证据"
+        if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True) and self.config.get("agent", {}).get("codex_code_fallback", True) and self._codex_config().get("enabled", False):
+            if status: status("本地代码工具未能完成验证，正在低优先级尝试 Codex 后备…")
+            self.log_event("local_code_fallback_to_codex", reason=last_reason, rounds=rounds)
+            result = await self._run_codex_task(text, require_mcp=False, status=status, task_plan=task_plan, previous_failure=f"HomeAgent 本地代码工具在 {rounds} 轮内未完成：{failure_summary or last_reason}")
+            if result.get("error"):
+                answer = f"本地代码工具未能完成验证，Codex 后备也失败了：{result['error']}"
+            else:
+                answer = str(result.get("answer", "代码任务已通过后备执行器完成。"))
+            self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            self._publish_answer(answer, answer_ready)
+            if self.config["home"].get("auto_speak", True):
+                await self._speak_home(session, answer, status, ignore_cancel=True)
+            return answer
         answer = f"这次任务在尝试 {rounds} 轮后仍未完成，我已经停下来了。最后失败原因是：{last_reason[:180]}。没有把未验证的操作当作成功。"
         self.log_event("tool_round_limit_reached", rounds=rounds, failures=tool_failures, failure_summary=failure_summary, answer=answer)
         if status: status(f"任务失败：{last_reason[:120]}")
@@ -1882,6 +1946,32 @@ class HomeAgent:
         return answer
 
     async def _run_tool(self, name: str, args: dict[str, Any], confirm=None, status=None) -> Any:
+        if name.startswith("code_"):
+            editor = self.self_upgrade.code_editor
+            self_edit = bool(getattr(self, "current_code_self_edit", False))
+            try:
+                if name == "code_list_files":
+                    default_path = "HomeAgent" if self_edit else "Projects"
+                    return await asyncio.to_thread(editor.list_files, str(args.get("path") or default_path), self_edit, int(args.get("limit", 300)))
+                if name == "code_read_file":
+                    return await asyncio.to_thread(editor.read_file, str(args.get("path", "")), self_edit, int(args.get("max_chars", 30000)))
+                if name == "code_search_text":
+                    default_path = "HomeAgent" if self_edit else "Projects"
+                    return await asyncio.to_thread(editor.search_text, str(args.get("query", "")), str(args.get("path") or default_path), self_edit, int(args.get("limit", 100)))
+                if name == "code_write_file":
+                    return await asyncio.to_thread(editor.write_file, str(args.get("path", "")), str(args.get("content", "")), self_edit)
+                if name == "code_replace_text":
+                    return await asyncio.to_thread(editor.replace_text, str(args.get("path", "")), str(args.get("old", "")), str(args.get("new", "")), self_edit, int(args.get("count", 1)))
+                if name == "code_validate_project":
+                    validation = await asyncio.to_thread(editor.validate_current_changes, True)
+                    if not validation.get("ok"):
+                        return {"error": validation.get("error", "代码文件校验失败"), "validation": validation}
+                    tests = await asyncio.to_thread(editor.run_autonomous_tests, validation.get("changed", []))
+                    if not tests.get("ok"):
+                        return {"error": tests.get("error", "自动测试失败"), "validation": validation, "tests": tests}
+                    return {"ok": True, "validation": validation, "tests": tests, "changed": validation.get("changed", [])}
+            except (OSError, ValueError, UnicodeError) as exc:
+                return {"error": str(exc)}
         if name == "cloudmusic_search_and_play":
             plan = getattr(self, "current_task_plan", {})
             query = str(args.get("query") or plan.get("query") or "").strip()

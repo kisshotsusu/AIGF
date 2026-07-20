@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from agent import HomeAgent
 from home_modules.code_editor import CodeEditorModule
@@ -14,6 +15,8 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"home": {"max_context_messages": 4, "auto_speak": True}}
         agent.history = []
+        root = Path(__file__).resolve().parents[2]
+        agent.self_upgrade = SimpleNamespace(code_editor=CodeEditorModule(root, root / "HomeAgent"), is_upgrade_request=lambda text: False)
         agent.log_event = lambda *args, **kwargs: None
         agent._acknowledge_common_response = lambda text: None
 
@@ -33,8 +36,43 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(answer)
         self.assertEqual(["message_shown", "tts_started", "tts_finished"], events)
 
+    async def test_agent_executes_local_code_tools_without_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            editor = CodeEditorModule(root, home)
+            editor.begin_tracking()
+            agent = HomeAgent.__new__(HomeAgent)
+            agent.self_upgrade = SimpleNamespace(code_editor=editor)
+            agent.current_code_self_edit = False
+            written = await agent._run_tool("code_write_file", {"path": "Projects/demo/main.py", "content": "VALUE = 1\n"})
+            read = await agent._run_tool("code_read_file", {"path": "Projects/demo/main.py"})
+            self.assertTrue(written["ok"])
+            self.assertEqual("VALUE = 1\n", read["content"])
+
 
 class SelfProgrammingTests(unittest.TestCase):
+    def test_independent_project_request_prefers_local_tools(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"agent": {"prefer_local_code_tools": True}, "codex_cli": {"enabled": True, "trigger_mode": "auto", "trigger_keywords": ["写程序"]}}
+        agent.self_upgrade = SimpleNamespace(code_editor=CodeEditorModule(root, root / "HomeAgent"))
+        self.assertFalse(agent._should_route_to_codex("创建一个独立的 Python 记账项目并测试"))
+        self.assertTrue(agent._should_route_to_codex("明确调用 Codex 创建一个独立 Python 项目"))
+
+    def test_code_tool_surface_hides_codex_during_local_code_task(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_code_task = True
+        agent.config = {
+            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "codex_cli": {"enabled": True}, "vision_mcp": {"enabled": False}, "computer_control": {"enabled": False},
+        }
+        names = {item["function"]["name"] for item in agent._tools()}
+        self.assertIn("code_write_file", names)
+        self.assertIn("code_validate_project", names)
+        self.assertNotIn("codex_cli_task", names)
+
     def test_home_agent_code_request_is_detected(self) -> None:
         prompts = (
             r"你的本体在 E:\Doc\AI直播\HomeAgent，修改你自身的代码",
@@ -74,8 +112,80 @@ class SelfProgrammingTests(unittest.TestCase):
         module = CodeEditorModule(root, root / "HomeAgent")
         contract, loaded = module.build_execution_contract()
         self.assertTrue(loaded)
-        self.assertIn("必须在本机工程中实际完成修改", contract)
+        self.assertIn("必须在本机实际完成代码写入", contract)
         self.assertIn("没有写入文件", contract)
+
+    def test_independent_project_request_and_contract(self) -> None:
+        prompt = "创建一个独立的 Python 待办事项项目并编写测试"
+        self.assertTrue(CodeEditorModule.is_independent_project_request(prompt))
+        self.assertTrue(CodeEditorModule.is_code_task(prompt))
+        root = Path(__file__).resolve().parents[2]
+        contract, loaded = CodeEditorModule(root, root / "HomeAgent").build_execution_contract(self_edit=False)
+        self.assertFalse(loaded)
+        self.assertIn("Projects/<简短英文项目名>", contract)
+        self.assertIn("自动测试", contract)
+
+    def test_independent_python_project_is_tracked_and_tested(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            module = CodeEditorModule(root, home)
+            module.begin_tracking()
+            project = root / "Projects" / "demo"
+            tests = project / "tests"
+            tests.mkdir(parents=True)
+            (project / "calculator.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            (tests / "test_calculator.py").write_text(
+                "import unittest\nfrom calculator import add\n\n"
+                "class CalculatorTests(unittest.TestCase):\n"
+                "    def test_add(self):\n        self.assertEqual(3, add(1, 2))\n",
+                encoding="utf-8",
+            )
+            changed = module.changed_files()
+            self.assertIn("Projects/demo/calculator.py", changed)
+            validation = module.validate_current_changes(require_changes=True)
+            self.assertTrue(validation["ok"])
+            tests_result = module.run_autonomous_tests(changed, timeout=30)
+            self.assertTrue(tests_result["ok"], tests_result)
+            self.assertGreaterEqual(len(tests_result["commands"]), 2)
+
+    def test_local_code_file_tools_are_atomic_and_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            module = CodeEditorModule(root, home)
+            written = module.write_file("Projects/demo/main.py", "VALUE = 1\n")
+            self.assertTrue(written["created"])
+            self.assertEqual("VALUE = 1\n", module.read_file("Projects/demo/main.py")["content"])
+            replaced = module.replace_text("Projects/demo/main.py", "1", "2")
+            self.assertEqual(1, replaced["replaced"])
+            self.assertEqual("VALUE = 2\n", module.read_file("Projects/demo/main.py")["content"])
+            with self.assertRaises(ValueError):
+                module.write_file("HomeAgent/agent.py", "blocked")
+            with self.assertRaises(ValueError):
+                module.read_file(".env")
+
+    def test_failing_project_tests_block_success(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            module = CodeEditorModule(root, home)
+            module.begin_tracking()
+            tests = root / "Projects" / "broken" / "tests"
+            tests.mkdir(parents=True)
+            (tests.parent / "value.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (tests / "test_value.py").write_text(
+                "import unittest\nfrom value import VALUE\n\n"
+                "class ValueTests(unittest.TestCase):\n"
+                "    def test_expected_value(self):\n        self.assertEqual(2, VALUE)\n",
+                encoding="utf-8",
+            )
+            result = module.run_autonomous_tests(module.changed_files(), timeout=30)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["failed"])
 
 
 if __name__ == "__main__":

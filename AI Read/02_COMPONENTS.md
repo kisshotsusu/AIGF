@@ -13,6 +13,7 @@
 | `workspace/` | 身份、人格、场景规则、旧式每日记忆、角色图片 | 动态读取 |
 | `LongTermMemory/` | SQLite 长期记忆 | `memory.db` |
 | `Task/` | 一次性与周期提醒任务 | HomeAgent 调度器 |
+| `Projects/` | HomeAgent 独立项目的持久目录 | 每个子目录为一个独立项目 |
 | `state/` | 可跨进程修改的运行状态 | 直播上下文、维护状态 |
 | `logs/` | 直播消息、管理器日志 | `messages.jsonl` 等 |
 | `audio/` | TTS 输出 | 所有程序启动/运行时只保留最新 20 个 |
@@ -32,7 +33,7 @@
 - `HomeAgent/agent.py`：家庭 Agent、MiMo 语义计划、本地工具优先路由、Codex/MCP 后备、TTS 和上下文维护。
 - `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入、设置和重启恢复；`app.py` 保留 Tk 后备和 Qt 转发入口。
 - `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。
-- `HomeAgent/home_modules/code_editor.py`：隔离的自编程模块，负责请求识别、工程文档读取、执行合同、文件变更追踪及 Python/YAML/JSON 校验。
+- `HomeAgent/home_modules/code_editor.py`：隔离的代码工程模块，负责自身/独立项目识别、工程合同、文件追踪、Python/YAML/JSON/Node/TypeScript/静态网页校验和自主测试。
 - `CharacterManager/service.py`：UI 无关的数据接口、原子保存、配置文档拆分和未知字段保留。
 - `CharacterManager/qt_app.py`：默认角色工作台；`app.py --legacy-tk` 启动旧 Tk 前端。
 - `Vision/agent.py`：现有浏览器 CDP/DOM、独立 Playwright、懒加载 GUI-Actor、Windows 窗口工具和操作后截图验证。

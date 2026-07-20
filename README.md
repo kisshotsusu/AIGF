@@ -47,6 +47,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 | `modules/live/` | 直播助手核心、管理 API 与网页控制台；根 `main.py`、`manager.py` 是兼容入口 |
 | `HomeAgent/` | 家庭 Agent、PySide6 桌宠、STT/TTS、工具链、任务调度与恢复 |
 | `HomeAgent/home_modules/` | 与主程序隔离的能力模块；当前包含代码编辑准备、变更追踪和校验 |
+| `Projects/` | HomeAgent 创建的独立项目，每个项目包含自己的源码、README 和测试，不受 `work/` 清理影响 |
 | `CharacterManager/` | `service.py` 数据接口、Qt 默认 UI、Tk 兼容 UI |
 | `Vision/` | 浏览器 DOM、CDP 复用、GUI-Actor 和 Windows 窗口工具 |
 | `Sound/` | SenseVoice/FunASR 识别服务 |
@@ -78,7 +79,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 - TTS：`127.0.0.1:9879`，按需自动启动 GPT-SoVITS。
 - STT：HomeAgent 使用 `sound_mcp`，地址 `127.0.0.1:8766/mcp`。
 - Vision MCP：启用；`gui_enabled: true`、`preload_model: false`，即允许视觉但默认懒加载模型。
-- HomeAgent：本地工具优先，电脑操作默认最多 4 轮；Codex CLI 为复杂任务后备。
+- HomeAgent：本地工具优先，电脑操作默认最多 4 轮；代码任务也优先使用内置文件编辑/校验工具，Codex CLI 仅为低优先级后备。
 
 配置可能随 UI 实时保存而改变，排障时应重新读取磁盘 YAML。
 
@@ -99,6 +100,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 5. 最终回答一生成就立即显示在消息页，TTS 在其后继续播放，不再等整段语音结束才显示。
 6. 任务执行时 UI 实时显示当前步骤和已完成内容；长任务可以生成 TTS 进度汇报。
 7. 自主升级任务会先读取 README 与 `AI Read`、检查工作区、实际编辑并校验；没有文件变更不能报告成功，并可通过 `HomeAgent/state/task-recovery.json` 在重启后继续。
+8. “创建/开发/编写独立项目”会由 MiMo 规划并调用 HomeAgent 本地 `code_*` 工具，默认写入 `Projects/<project-name>/`；生成后本地执行编译和测试。仅当本地多轮失败或用户明确要求时才回退 Codex。
 
 ### 网页自动化
 

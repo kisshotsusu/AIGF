@@ -54,7 +54,8 @@ B站 WebSocket / 历史弹幕
      ├─ web-agent-operator
      ├─ Vision MCP（DOM 或视觉）
      ├─ 普通 LLM 工具循环
-     └─ Codex CLI / 其他 MCP（复杂任务后备）
+     ├─ CodeEditorModule（本地读写 / 自身代码 / Projects / 自动测试）
+     └─ Codex CLI / 其他 MCP（本地多轮失败后的低优先级后备）
   -> 操作后观察与结果验证
   -> Qt 实时进度 / 长任务 TTS 汇报
   -> 家庭历史 / 高价值记忆 / task-recovery

@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import py_compile
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    from home_modules.code_editor import CodeEditorModule
+except ModuleNotFoundError:  # Package-style imports used by tests and tooling.
+    from HomeAgent.home_modules.code_editor import CodeEditorModule
+
 
 class SelfUpgradeManager:
     """Persist task recovery and coordinate safe, restartable self-upgrades."""
 
-    TRACKED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".md", ".txt", ".bat", ".cmd", ".ps1"}
-    TRACKED_AREAS = ("HomeAgent", "Vision", "Skill", "CharacterManager", "modules", "src")
     RESTART_AREAS = ("HomeAgent/", "Vision/")
 
     def __init__(self, root: Path, home_agent: Path, config: dict[str, Any]):
@@ -25,7 +26,7 @@ class SelfUpgradeManager:
         self.state_dir = self.home_agent / "state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.state_dir / "task-recovery.json"
-        self._baseline: dict[str, str] = {}
+        self.code_editor = CodeEditorModule(self.root, self.home_agent, self.config.get("require_validation", True))
 
     def _write(self, value: dict[str, Any]) -> None:
         temporary = self.path.with_suffix(".tmp")
@@ -38,37 +39,16 @@ class SelfUpgradeManager:
         except (OSError, json.JSONDecodeError):
             return {}
 
-    def _fingerprint(self) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for area in self.TRACKED_AREAS:
-            folder = self.root / area
-            if not folder.exists():
-                continue
-            for path in folder.rglob("*"):
-                if not path.is_file() or path.suffix.lower() not in self.TRACKED_SUFFIXES:
-                    continue
-                if any(part in {".git", ".venv", "node_modules", "logs", "__pycache__", "models"} for part in path.parts):
-                    continue
-                if self.home_agent / "state" in path.parents:
-                    continue
-                try:
-                    stat = path.stat()
-                    result[path.relative_to(self.root).as_posix()] = hashlib.sha1(
-                        f"{stat.st_size}:{stat.st_mtime_ns}".encode()
-                    ).hexdigest()
-                except OSError:
-                    continue
-        return result
-
     @staticmethod
     def is_upgrade_request(prompt: str) -> bool:
-        compact = str(prompt).replace(" ", "").lower()
-        subjects = ("homeagent", "你自己", "自身", "自我", "程序", "系统")
-        actions = ("升级", "更新", "修改", "优化", "修复", "编辑", "增加功能", "重构")
-        return any(word in compact for word in subjects) and any(word in compact for word in actions)
+        return CodeEditorModule.is_code_edit_request(prompt)
+
+    def validate_current_changes(self, require_changes: bool = False) -> dict[str, Any]:
+        """Validate edits before an execution agent is allowed to claim success."""
+        return self.code_editor.validate_current_changes(require_changes)
 
     def begin(self, prompt: str, resumed: bool = False) -> None:
-        self._baseline = self._fingerprint()
+        self.code_editor.begin_tracking()
         now = datetime.now().isoformat(timespec="seconds")
         previous = self.read() if resumed else {}
         self._write({
@@ -89,32 +69,10 @@ class SelfUpgradeManager:
         self._write(state)
 
     def changed_files(self) -> list[str]:
-        after = self._fingerprint()
-        keys = set(self._baseline) | set(after)
-        return sorted(key for key in keys if self._baseline.get(key) != after.get(key))
+        return self.code_editor.changed_files()
 
     def _validate(self, changed: list[str]) -> dict[str, Any]:
-        if not self.config.get("require_validation", True):
-            return {"ok": True, "skipped": True}
-        checked: list[str] = []
-        try:
-            for relative in changed:
-                path = self.root / relative
-                if not path.is_file():
-                    continue
-                if path.suffix.lower() == ".py":
-                    py_compile.compile(str(path), doraise=True)
-                    checked.append(relative)
-                elif path.suffix.lower() == ".json":
-                    json.loads(path.read_text(encoding="utf-8"))
-                    checked.append(relative)
-                elif path.suffix.lower() in {".yaml", ".yml"}:
-                    import yaml
-                    yaml.safe_load(path.read_text(encoding="utf-8"))
-                    checked.append(relative)
-            return {"ok": True, "checked": checked}
-        except Exception as exc:
-            return {"ok": False, "checked": checked, "error": str(exc)}
+        return self.code_editor.validate_files(changed)
 
     def finalize(self, answer: str) -> bool:
         state = self.read()

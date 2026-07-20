@@ -206,7 +206,7 @@ class DesktopPet:
         text = self.input.get("1.0", "end").strip()
         if not text:
             return
-        self.agent.begin_task()
+        self.agent.begin_task(text)
         self.busy = True; self.send_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
         self.input.delete("1.0", "end")
         self._append("user", self.agent.config["home"].get("user_name", "你"), text)
@@ -226,11 +226,17 @@ class DesktopPet:
     def _chat_worker(self, text):
         loop = asyncio.new_event_loop()
         self.chat_loop = loop
+        answer_published = threading.Event()
+        def publish_answer(answer):
+            if answer_published.is_set(): return
+            answer_published.set()
+            self.root.after(0, lambda value=str(answer): self._append("assistant", self.agent.character_name, value))
         try:
             asyncio.set_event_loop(loop)
-            self.chat_task = loop.create_task(self.agent.chat(text, self.set_status, self.confirm_computer_action))
+            self.chat_task = loop.create_task(self.agent.chat(text, self.set_status, self.confirm_computer_action, publish_answer))
             answer = loop.run_until_complete(self.chat_task)
-            self.root.after(0, lambda: self._append("assistant", self.agent.character_name, answer))
+            publish_answer(answer)
+            self.agent.finalize_task_recovery(answer)
             self.set_status("就绪")
         except asyncio.CancelledError:
             self.agent.log_event("chat_cancelled")

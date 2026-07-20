@@ -44,8 +44,15 @@ class Bridge(QObject):
 class ChatWorker(QThread):
     def __init__(self, agent: HomeAgent, prompt: str, bridge: Bridge, confirm):
         super().__init__(); self.agent = agent; self.prompt = prompt; self.bridge = bridge; self.confirm = confirm
-        self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.last_report_at = 0.0; self.report_count = 0
+        self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False
         self.agent.begin_task(prompt, resumed=prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"))
+
+    def publish_answer(self, answer: str) -> None:
+        """Show the final text as soon as it exists; TTS may continue afterwards."""
+        text = str(answer or "").strip()
+        if text and not self.answer_emitted:
+            self.answer_emitted = True
+            self.bridge.answer.emit(text)
 
     async def progress_clock(self):
         while True:
@@ -81,11 +88,11 @@ class ChatWorker(QThread):
         self.loop = asyncio.new_event_loop(); self.started_at = time.monotonic()
         try:
             asyncio.set_event_loop(self.loop)
-            self.task = self.loop.create_task(self.agent.chat(self.prompt, self.report_status, self.confirm))
+            self.task = self.loop.create_task(self.agent.chat(self.prompt, self.report_status, self.confirm, self.publish_answer))
             self.clock = self.loop.create_task(self.progress_clock())
             answer = self.loop.run_until_complete(self.task)
             self.agent.finalize_task_recovery(answer)
-            self.bridge.answer.emit(answer)
+            self.publish_answer(answer)
         except asyncio.CancelledError:
             self.bridge.answer.emit("当前任务已停止。")
         except Exception as exc:

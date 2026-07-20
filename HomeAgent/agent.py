@@ -1229,6 +1229,12 @@ class HomeAgent:
             return {"error": f"Codex 工作目录不存在：{working_directory}"}
         gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", False))
         plan = task_plan or self._analyze_task(task)
+        self_code_task = self.self_upgrade.is_upgrade_request(task)
+        self_code_contract = ""
+        if self_code_task:
+            if status: status("正在读取工程文档并检查自编程约束…")
+            self_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract()
+            self.log_event("self_code_documents_loaded", documents=loaded_documents)
         prompt = (
             "你是家庭 AI 助手的执行代理。请使用可用的 CLI、文件和 MCP 工具完成任务，"
             "最后用简洁中文给出适合语音朗读的结果。不要输出密钥。\n"
@@ -1256,6 +1262,7 @@ class HomeAgent:
                   "每次点击、输入、搜索、选择后必须重新读取或截图验证；清单中任何动作未完成时不得结束或报告成功。"
                   "连续两次状态不变才报告具体失败。\n\n")
                if preferred_mcp else "")
+            + self_code_contract
             + f"角色与规则：\n{self.workspace.prompt_documents('home')}\n\n用户任务：{task}"
         )
         command = [*codex_command, "exec", "--json"]
@@ -1391,7 +1398,13 @@ class HomeAgent:
         if preferred_mcp and not any(preferred_mcp.lower() in call.lower() for call in mcp_calls):
             self.log_event("codex_preferred_mcp_missing", preferred_mcp=preferred_mcp, mcp_calls=mcp_calls)
             return {"error": f"Codex 调用了 MCP，但没有调用指定的 {preferred_mcp}。", "answer": answer, "mcp_calls": mcp_calls, "event_count": len(events)}
-        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:]}
+        code_validation = None
+        if self_code_task:
+            code_validation = self.self_upgrade.validate_current_changes(require_changes=True)
+            self.log_event("self_code_validation", result=code_validation)
+            if not code_validation.get("ok"):
+                return {"error": f"自编程任务未通过本地校验：{code_validation.get('error', 'unknown error')}", "answer": answer, "validation": code_validation, "event_count": len(events)}
+        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:], "validation": code_validation}
         self.log_event("codex_task_completed", result=result)
         return result
 
@@ -1550,7 +1563,12 @@ class HomeAgent:
         except Exception as exc:
             self.log_event("task_progress_speech_failed", error=str(exc))
 
-    async def chat(self, text: str, status=None, confirm=None) -> str:
+    @staticmethod
+    def _publish_answer(answer: str, answer_ready=None) -> None:
+        if answer_ready and str(answer or "").strip():
+            answer_ready(str(answer).strip())
+
+    async def chat(self, text: str, status=None, confirm=None, answer_ready=None) -> str:
         self._acknowledge_common_response(text)
         max_context = int(self.config["home"].get("max_context_messages", 30))
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
@@ -1563,6 +1581,7 @@ class HomeAgent:
         if task_plan.get("requires_clarification"):
             answer = "我没能可靠识别这次操作的目标对象，所以没有执行，避免搜索或点击错误内容。请再说一次目标名称。"
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            self._publish_answer(answer, answer_ready)
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, answer, status)
@@ -1579,6 +1598,7 @@ class HomeAgent:
             removed = request.get("removed_messages", 0)
             answer = f"好，直播场景的短期聊天上下文已经独立清空了，共移除{removed}条，长期记忆不会受影响。"
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            self._publish_answer(answer, answer_ready)
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status)
             return answer
@@ -1595,6 +1615,7 @@ class HomeAgent:
             answer = "已经为你打开指定的 Bilibili 页面。" if explicit_url != "https://www.bilibili.com/" else "已经为你打开 Bilibili。"
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
             self.log_event("direct_browser_open", url=explicit_url)
+            self._publish_answer(answer, answer_ready)
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, answer, status)
@@ -1647,6 +1668,7 @@ class HomeAgent:
             else:
                 answer = str(direct_visual.get("answer", "好啦，已经帮你操作完成了。"))
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            self._publish_answer(answer, answer_ready)
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status, ignore_cancel=True)
             return answer
@@ -1672,6 +1694,7 @@ class HomeAgent:
             else:
                 answer = str(result.get("answer", "")).strip()
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            self._publish_answer(answer, answer_ready)
             async with aiohttp.ClientSession() as session:
                 try:
                     provider, key = self._provider()
@@ -1776,6 +1799,7 @@ class HomeAgent:
                         answer = str(cloudmusic_verified_result.get("answer") or answer)
                     self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
                     self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+                    self._publish_answer(answer, answer_ready)
                     if not long_term_stored:
                         await self._maybe_remember_home(text, answer, session, provider, key)
                     if self.config["home"].get("auto_speak", True) and answer and not singing_performed:
@@ -1852,6 +1876,7 @@ class HomeAgent:
         self.log_event("tool_round_limit_reached", rounds=rounds, failures=tool_failures, failure_summary=failure_summary, answer=answer)
         if status: status(f"任务失败：{last_reason[:120]}")
         self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+        self._publish_answer(answer, answer_ready)
         if self.config["home"].get("auto_speak", True):
             await self._speak_home(session, answer, status, ignore_cancel=True)
         return answer

@@ -46,6 +46,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 |---|---|
 | `modules/live/` | 直播助手核心、管理 API 与网页控制台；根 `main.py`、`manager.py` 是兼容入口 |
 | `HomeAgent/` | 家庭 Agent、PySide6 桌宠、STT/TTS、工具链、任务调度与恢复 |
+| `HomeAgent/home_modules/` | 与主程序隔离的能力模块；当前包含代码编辑准备、变更追踪和校验 |
 | `CharacterManager/` | `service.py` 数据接口、Qt 默认 UI、Tk 兼容 UI |
 | `Vision/` | 浏览器 DOM、CDP 复用、GUI-Actor 和 Windows 窗口工具 |
 | `Sound/` | SenseVoice/FunASR 识别服务 |
@@ -95,8 +96,9 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 2. 优先选择本地确定性工具、网页 Skill 或 Vision MCP。
 3. 网页先检查当前目标：`browser_dom`、`browser_visual` 或 `desktop_visual`。
 4. 操作后重新观察并验证；失败保留阶段、证据与重试原因。
-5. 任务执行时 UI 实时显示当前步骤和已完成内容；长任务可以生成 TTS 进度汇报。
-6. 自主升级任务在重启前校验，并通过 `HomeAgent/state/task-recovery.json` 恢复未完成任务。
+5. 最终回答一生成就立即显示在消息页，TTS 在其后继续播放，不再等整段语音结束才显示。
+6. 任务执行时 UI 实时显示当前步骤和已完成内容；长任务可以生成 TTS 进度汇报。
+7. 自主升级任务会先读取 README 与 `AI Read`、检查工作区、实际编辑并校验；没有文件变更不能报告成功，并可通过 `HomeAgent/state/task-recovery.json` 在重启后继续。
 
 ### 网页自动化
 

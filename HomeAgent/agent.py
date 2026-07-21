@@ -47,6 +47,7 @@ from src.ai_live_assistant.long_term_memory import LongTermMemoryStore
 from task_manager import TaskStore
 from self_upgrade import SelfUpgradeManager
 from home_modules.command_executor import CommandExecutor
+from home_modules.mimo_multimodal import MiMoMultimodalClient
 
 
 class HomeAgent:
@@ -72,6 +73,7 @@ class HomeAgent:
         self.sound_service_lock = threading.Lock()
         self.self_upgrade = SelfUpgradeManager(ROOT, HOME_AGENT, self.config)
         self.command_executor = CommandExecutor(ROOT)
+        self.mimo_multimodal = MiMoMultimodalClient(self.project.get("mimo_multimodal", {}))
         self.restart_requested = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
         threading.Thread(target=self.ensure_sound_service, daemon=True, name="sound-mcp-autostart").start()
@@ -1465,7 +1467,8 @@ class HomeAgent:
             {"type": "function", "function": {"name": "list_skills", "description": "列出本地可用技能", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "list_character_images", "description": "列出角色形象库和主形象", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "generate_character_image", "description": "调用 ai-live-character-image 技能生成或编辑角色形象", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "operation": {"type": "string", "enum": ["generate", "edit"]}, "reference": {"type": "string", "description": "编辑时使用 primary 或图片路径"}, "label": {"type": "string"}, "tags": {"type": "string"}, "set_primary": {"type": "boolean"}}, "required": ["prompt"]}}},
-            {"type": "function", "function": {"name": "analyze_image", "description": "使用 MiMo 多模态 API 理解图片内容、识别画面细节或文字；不用于生成图片", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片路径，或 primary 表示角色主形象"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
+            {"type": "function", "function": {"name": "analyze_image", "description": "使用 MiMo 多模态 API 理解图片内容、识别画面细节或文字；不用于生成图片", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "项目内图片路径"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
+            {"type": "function", "function": {"name": "mimo_transcribe_audio", "description": "使用 MiMo API 识别项目内 WAV 或 MP3 语音文件", "parameters": {"type": "object", "properties": {"audio": {"type": "string", "description": "项目内音频路径"}, "language": {"type": "string", "enum": ["auto", "zh", "en"]}}, "required": ["audio"]}}},
             {"type": "function", "function": {"name": "sing_song", "description": "当用户要求唱歌、唱一首、哼唱或朗读歌词时调用。默认使用角色当前本地 TTS/SVC 音色朗读最多十行歌词；MiMo 唱歌仅作为已关闭的备用分支。", "parameters": {"type": "object", "properties": {"song": {"type": "string", "description": "歌曲名称或演唱主题"}, "lyrics": {"type": "string", "description": "最多十行需要朗读的歌词或测试文本"}, "style": {"type": "string", "description": "演唱或朗读情绪"}, "voice": {"type": "string", "description": "仅备用 MiMo 分支使用"}}, "required": ["song", "lyrics"]}}},
             {"type": "function", "function": {"name": "create_scheduled_task", "description": "创建TTS语音提醒或闹钟。一次性任务成功执行后自动删除；重复任务会保留并等待下一次。必须根据当前本地时间解析用户的自然语言时间。", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "message": {"type": "string", "description": "触发时由TTS播放的文本"}, "recurrence": {"type": "string", "enum": ["once", "daily", "weekdays", "weekly"]}, "scheduled_at": {"type": "string", "description": "仅once使用，本地ISO时间，如2026-07-17T15:00"}, "time": {"type": "string", "description": "重复任务使用的24小时HH:MM"}, "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 7}, "description": "仅weekly使用，周一为1、周日为7"}, "action": {"type": "string", "enum": ["tts"]}}, "required": ["title", "message", "recurrence"]}}},
             {"type": "function", "function": {"name": "list_scheduled_tasks", "description": "列出当前所有提醒、闹钟和重复任务", "parameters": {"type": "object", "properties": {}}}},
@@ -1865,6 +1868,8 @@ class HomeAgent:
             initial_media_state_checked = False
             media_target_preexisting = False
             tool_failures: list[dict[str, str]] = []
+            completion_evidence: list[dict[str, Any]] = []
+            completion_check_failures = 0
             local_code_verified = False
             for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
                 if status: status("正在思考…")
@@ -1912,6 +1917,20 @@ class HomeAgent:
                         answer = str(bilibili_favorite_result.get("answer") or answer)
                     if cloudmusic_verified_result:
                         answer = str(cloudmusic_verified_result.get("answer") or answer)
+                    if task_plan.get("actionable"):
+                        try:
+                            verification = await self.mimo_multimodal.verify_completion(session, text, task_plan, answer, completion_evidence)
+                        except Exception as exc:
+                            verification = {"passed": not bool(self.mimo_multimodal.config.get("fail_closed", True)), "reason": f"MiMo 完成检查不可用：{exc}", "next_action": "检查 MiMo 配置和网络后，继续收集本地终态证据"}
+                        self.log_event("mimo_completion_check", result=verification, evidence_count=len(completion_evidence), round=round_index)
+                        if not verification.get("passed"):
+                            completion_check_failures += 1
+                            reason = str(verification.get("reason") or "完成证据不足")
+                            if status: status(f"完成检查未通过：{reason[:100]}；正在继续修正…")
+                            if completion_check_failures <= int(self.mimo_multimodal.config.get("completion_max_retries", 2)):
+                                messages.append({"role": "user", "content": f"独立完成检查未通过：{reason}\n建议下一步：{verification.get('next_action') or '重新观察并取得可验证的终态证据'}。请继续调用本地工具修正，不要重复口头声明。"})
+                                continue
+                            answer = f"任务执行后的独立检查仍未通过：{reason[:220]}。我没有把未验证的结果报告为完成。"
                     self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
                     self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
                     self._publish_answer(answer, answer_ready)
@@ -1927,6 +1946,7 @@ class HomeAgent:
                     if status: status(f"正在调用工具：{name}")
                     self.log_event("tool_started", tool=name, arguments=args)
                     result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
+                    completion_evidence.append({"tool": name, "result": result})
                     if isinstance(result, dict) and result.get("status") == "failed":
                         failure_reason = str(result.get("error") or result.get("reason") or "未知原因")
                         tool_failures.append({"tool": name, "reason": failure_reason[:500]})
@@ -2206,14 +2226,26 @@ class HomeAgent:
             try: return json.loads(out.decode("utf-8").splitlines()[-1])
             except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}
         if name == "analyze_image":
-            script = project_path(self.config["agent"].get("skill_root", "Skill")) / "ai-live-character-image" / "scripts" / "image_understanding_api.py"
-            cmd = [sys.executable, str(script), "--image", str(args.get("image", "primary")), "--prompt", str(args.get("prompt", "请描述图片内容"))]
-            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            out, err = await proc.communicate()
-            if proc.returncode:
-                return {"error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
-            try: return json.loads(out.decode("utf-8").splitlines()[-1])
-            except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}
+            image_value = str(args.get("image") or "").strip()
+            if image_value == "primary":
+                manifest = ROOT / "workspace" / "character_images" / "manifest.json"
+                data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+                image_value = str((ROOT / "workspace" / "character_images" / str(data.get("primary") or "")))
+            path = self._allowed_path(image_value)
+            try:
+                timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await self.mimo_multimodal.analyze_image(session, path, str(args.get("prompt") or "请描述图片内容"))
+            except Exception as exc:
+                return {"status": "failed", "error": str(exc)}
+        if name == "mimo_transcribe_audio":
+            path = self._allowed_path(str(args.get("audio") or ""))
+            try:
+                timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await self.mimo_multimodal.transcribe_audio(session, path, str(args.get("language") or self.mimo_multimodal.config.get("speech_language", "auto")))
+            except Exception as exc:
+                return {"status": "failed", "error": str(exc)}
         if name in {"web_agent_task", "web_agent_operator", "web-agent-operator"}:
             task = str(args.get("task", "")).strip()
             if not task: return {"error": "网页任务内容为空"}
@@ -2515,6 +2547,11 @@ class HomeAgent:
         cfg = self.config["stt"]; mode = cfg.get("mode", "api")
         if mode == "sound_mcp":
             return await self._sound_mcp_transcribe(wav_path)
+        if mode == "mimo":
+            timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                result = await self.mimo_multimodal.transcribe_audio(session, wav_path, str(cfg.get("language") or self.mimo_multimodal.config.get("speech_language", "auto")))
+            return str(result.get("text") or "").strip()
         if mode == "faster_whisper":
             python = Path(cfg.get("local_python", "")); model = str(cfg.get("local_model", ""))
             if not python.exists() or not model: raise RuntimeError("请在 HomeAgent/config.yaml 设置 stt.local_python 和本地模型目录")

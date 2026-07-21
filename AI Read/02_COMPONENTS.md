@@ -34,8 +34,11 @@
 - `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入、设置和重启恢复；`app.py` 保留 Tk 后备和 Qt 转发入口。
 - `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。
 - `HomeAgent/home_modules/code_editor.py`：隔离的代码工程模块，负责自身/独立项目识别、工程合同、文件追踪、Python/YAML/JSON/Node/TypeScript/静态网页校验和自主测试。
+- `HomeAgent/home_modules/mimo_multimodal.py`：MiMo 图片理解、WAV/MP3 语音识别和基于工具证据的任务完成独立核验。
+- `HomeAgent/home_modules/command_executor.py`：执行模型规划后的 PowerShell/CMD 命令，统一工作目录、超时、输出和失败状态。
 - `CharacterManager/service.py`：UI 无关的数据接口、原子保存、配置文档拆分和未知字段保留。
 - `CharacterManager/qt_app.py`：默认角色工作台；`app.py --legacy-tk` 启动旧 Tk 前端。
+- 角色工作台的“模型 API”页面包含 DeepSeek、MiMo、Custom 与“MiMo 多模态”标签；多模态不再占用独立侧栏入口。
 - `Vision/agent.py`：现有浏览器 CDP/DOM、独立 Playwright、懒加载 GUI-Actor、Windows 窗口工具和操作后截图验证。
 - `Vision/mcp_server.py`：FastMCP 工具注册；网页工具固定在单一专用线程共享浏览器会话。
 - `Vision/mcp_call.py`：系统 Python 到项目 `.venv` MCP 客户端桥。

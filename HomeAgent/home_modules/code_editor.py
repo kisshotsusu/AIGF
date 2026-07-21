@@ -20,8 +20,9 @@ from typing import Any
 
 class CodeEditorModule:
     TRACKED_SUFFIXES = {".py", ".yaml", ".yml", ".json", ".md", ".txt", ".bat", ".cmd", ".ps1", ".toml", ".ini", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".css"}
-    TRACKED_AREAS = ("HomeAgent", "Vision", "Skill", "CharacterManager", "modules", "src", "Projects")
+    TRACKED_AREAS = ("HomeAgent", "Vision", "Skill", "CharacterManager", "modules", "src", "Projects", "AI Read")
     EXCLUDED_PARTS = {".git", ".venv", "node_modules", "logs", "__pycache__", "models"}
+    ROOT_TRACKED_FILES = ("config.yaml", "config.example.yaml", "README.md")
     DEVELOPMENT_DOCUMENTS = (
         "README.md",
         "AI Read/00_START_HERE.md",
@@ -147,6 +148,11 @@ class CodeEditorModule:
 
     def _fingerprint(self) -> dict[str, str]:
         result: dict[str, str] = {}
+        for relative in self.ROOT_TRACKED_FILES:
+            path = self.root / relative
+            if path.is_file():
+                stat = path.stat()
+                result[relative] = hashlib.sha1(f"{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
         for area in self.TRACKED_AREAS:
             folder = self.root / area
             if not folder.exists():
@@ -203,6 +209,22 @@ class CodeEditorModule:
         changed = self.changed_files()
         if require_changes and not changed:
             return {"ok": False, "changed": [], "error": "自编程任务没有产生任何代码或配置变更"}
+        implementation_changed = any(
+            not path.startswith(("AI Read/", "Projects/")) and path != "README.md"
+            for path in changed
+        )
+        documentation_changed = any(path.startswith("AI Read/") for path in changed)
+        if implementation_changed and not documentation_changed:
+            return {
+                "ok": False,
+                "changed": changed,
+                "error": "代码或配置已变更，但尚未同步更新 AI Read 中对应的架构、组件、接口、规则或当前状态说明",
+            }
+        changed_projects = {Path(path).parts[1] for path in changed if len(Path(path).parts) >= 3 and Path(path).parts[0].casefold() == "projects" and Path(path).name.casefold() != "readme.md"}
+        documented_projects = {Path(path).parts[1] for path in changed if len(Path(path).parts) >= 3 and Path(path).parts[0].casefold() == "projects" and Path(path).name.casefold() == "readme.md"}
+        missing_project_docs = sorted(changed_projects - documented_projects)
+        if missing_project_docs:
+            return {"ok": False, "changed": changed, "error": f"独立项目代码已变更但 README 未同步：{', '.join(missing_project_docs)}"}
         result = self.validate_files(changed)
         result["changed"] = changed
         return result
@@ -234,9 +256,10 @@ class CodeEditorModule:
             + ("1. 先阅读已注入的 README 和 AI Read 工程文档。\n" if self_edit else "1. 明确需求、技术栈、入口、目录结构和可自动验证的完成条件。\n") +
             "2. 用 git status 和代码搜索确认现有用户改动；不得覆盖或回退无关变更。\n"
             f"3. 检查入口、业务层和测试后实际编辑文件；{scope}\n"
-            "4. 同时编写可重复运行的自动测试和 README；不得只做无法测试的演示片段。\n"
-            "5. 使用适合技术栈的编译、语法检查和测试命令自行测试并修复失败。\n"
-            "6. 最终报告必须列出真实变更文件、启动方式和验证结果；没有写入文件或测试未通过时明确返回失败。\n"
+            "4. 同时编写可重复运行的自动测试；每次修改代码或配置，必须重写 AI Read 中受影响部分，使架构、组件、接口、规则和当前状态与磁盘实现一致，不能只追加含糊的更新日志。\n"
+            "5. 独立项目同步更新项目 README；AIAgent 自身的重要入口或使用方式变化也同步根 README。\n"
+            "6. 使用适合技术栈的编译、语法检查和测试命令自行测试并修复失败。\n"
+            "7. 最终报告必须列出真实变更文件、文档同步范围、启动方式和验证结果；没有写入文件、AI Read 未同步或测试未通过时明确返回失败。\n"
             "禁止读取或输出 .env 密钥。\n"
             + (f"委派前已经实际读取：{', '.join(loaded)}。以下是当前磁盘内容：\n\n{documents}\n\n" if self_edit else
                "完成后 HomeAgent 的独立校验模块会再次运行语法检查和项目测试；不得伪造测试结果。\n\n")

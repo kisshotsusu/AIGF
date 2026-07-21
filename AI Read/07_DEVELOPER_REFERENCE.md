@@ -58,6 +58,21 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - 运行期读取 `HomeAgent/config.yaml`、`config.yaml`、`workspace`、`Task`、`LongTermMemory`；`__init__` 后台线程 `ensure_vision_service` / `ensure_sound_service` 自动拉起 MCP。
 - `begin_task` / `update_task_recovery` / `finalize_task_recovery` / `recover_interrupted_task` / `stop_current_task`：围绕 `SelfUpgradeManager` 做任务持久化与重启恢复；`stop_current_task` 会 `taskkill` 当前活跃子进程但保留常驻服务。
 - `log_event(event, **data)`：写 `HomeAgent/logs/agent-events.jsonl`，密钥按正则脱敏（`bearer ...` / `sk-...` 截断为 `***`），单字段 ≤4000 字符。
+- 工具循环收集最近工具返回作为 `completion_evidence`；执行类任务生成候选答案后调用 `MiMoMultimodalClient.verify_completion`。失败时把 `reason/next_action` 作为新一轮指令，超过 `completion_max_retries` 后返回明确未通过而不是成功措辞。
+
+### `MiMoMultimodalClient`（`HomeAgent/home_modules/mimo_multimodal.py`）
+- `analyze_image(session, path, prompt)`：图片编码为 data URL，通过 `chat/completions` 的 `image_url` + `text` 内容调用 `mimo-v2.5`。
+- `transcribe_audio(session, path, language)`：只接受 WAV/MP3，Base64 后不超过 10 MB，通过 `input_audio` 和 `asr_options.language` 调用 `mimo-v2.5-asr`。
+- `verify_completion(session, task, plan, answer, evidence)`：要求模型只返回 `{passed, reason, next_action}`；核验依据是工具证据，默认接口异常关闭成功路径。
+
+### `CodeEditorModule` 文档门禁
+- 跟踪范围包含实现目录、根配置、README 与 `AI Read`。
+- `validate_current_changes` 检测到实现/配置变化但没有 `AI Read/*.md` 变化时返回失败。
+- 执行合同要求按影响重写现有章节、删除过期事实并报告文档同步范围；不能用追加更新日志代替维护当前说明。
+
+### 角色管理器 MiMo 多模态布局
+- `MiMoMultimodalPage(embedded=True)` 嵌入 `ModelPage.provider_tabs`，内部使用 `QScrollArea` 承载三组表单，避免较小窗口裁切输入项。
+- 保存按钮位于滚动区外并始终可见；图片/语音模型输入框保持最小宽度，语言下拉显示中文含义但保存稳定值 `auto/zh/en`。
 
 ## 3. 数据契约
 

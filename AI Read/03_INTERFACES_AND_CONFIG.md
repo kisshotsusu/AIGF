@@ -17,7 +17,8 @@
 - `singing`：唱歌模式（`local_tts` 朗读歌词，MiMo `mimo-v2.5-tts` 为关闭的备用分支）、男女声预设。
 - `memory_write`：重要度判断、每日上限、强制/忽略关键词。
 - `context_cleanup`：直播上下文保留 120 分钟、检查间隔。
-- `image_generation` / `image_understanding`：图像生成与多模态理解（MiMo）。
+- `image_generation` / `image_understanding`：图像生成与旧兼容图片理解配置。
+- `mimo_multimodal`：统一 MiMo 多模态配置，包括总开关、Base URL、密钥环境变量、图片模型、ASR 模型/语言、完成检查模型、失败重试、超时和 `fail_closed`。当前图片模型 `mimo-v2.5`，语音模型 `mimo-v2.5-asr`，完成检查默认启用并重试 2 次。
 - `workspace`：人格、身份、记忆和图片相对路径。
 
 > 注意：直播管理后台的 `PUT /api/config` 与 `PUT /api/secrets` 已在服务端保护 `llm`/`tts`/`image_generation`/`memory_write`/`workspace` 以及除 `BILIBILI_COOKIE` 外的所有密钥——这些项已迁移到角色工作台（见下）。直播网页即使长时间未刷新，也不能用旧值覆盖它们。
@@ -27,7 +28,7 @@
 - `home`：助理名、主人称呼、场景文件、上下文上限、是否自动播报。
 - `microphone`：采样率、声道、设备 ID、识别后自动发送、本地 STT 运行时路径。
 - `desktop_pet`：置顶、坐标、桌宠图标。
-- `stt`：模式 `sound_mcp`、语言、MCP 地址（8766）、本地 ASR 运行参数。
+- `stt`：模式支持 `sound_mcp`、`mimo`、通用 `api` 与本地识别；MiMo 模式读取根 `mimo_multimodal` 配置。
 - `agent`：`max_tool_rounds`（整体工具轮次上限，当前 28）、`operation_retry_rounds`（电脑操作重试，当前 4）、模型驱动电脑动作、本地工具优先、是否允许角色图片 Skill、Skill 根目录。
 - `semantic_planner`：**当前文档此前未记录的配置节**，控制 MiMo 语义计划步骤：`enabled`、`timeout_seconds`（10）、`minimum_confidence`（0.55）。低于置信度时回退或要求澄清。
 - `progress_reporting`：**此前未记录的配置节**，控制长任务进度汇报：`enabled`、`long_task_seconds`（60）、`tts_cooldown_seconds`（90）、`max_reports_per_task`（3）。
@@ -40,6 +41,8 @@
 `HomeAgent/config.d/` 把 `computer_control`、`vision_mcp`、`context_maintenance`、`context_cleanup`（直播上下文清理）另存为独立文档。角色管理器写入时经 `CharacterService` 同时更新 `HomeAgent/config.yaml` 与对应 `config.d` 文件，并保留 UI 未识别字段。
 
 密钥只存 `.env`，常见变量：`DEEPSEEK_API_KEY`、`MIMO_API_KEY`、`CUSTOM_API_KEY`、`IMAGE_API_KEY`、`STT_API_KEY`、`BILIBILI_COOKIE`。角色工作台负责 `llm`/`tts`/图像/STT 密钥；直播控制台只维护 `BILIBILI_COOKIE`。
+
+角色管理器中，普通对话供应商和 MiMo 多模态均位于“模型 API”页面；“MiMo 多模态”标签管理图片、语音和任务完成检查，并只显示 API Key 是否已配置，不回显明文。
 
 ## 管理后台 REST API（127.0.0.1:9888）
 

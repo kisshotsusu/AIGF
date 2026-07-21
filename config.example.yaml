@@ -110,6 +110,22 @@ image_understanding:
     thinking:
       type: disabled
 
+mimo_multimodal:
+  enabled: true
+  base_url: "https://api.xiaomimimo.com/v1"
+  api_key_env: MIMO_API_KEY
+  image_enabled: true
+  image_model: mimo-v2.5
+  speech_enabled: true
+  speech_model: mimo-v2.5-asr
+  speech_language: auto
+  completion_check_enabled: true
+  completion_model: mimo-v2.5
+  completion_max_retries: 2
+  timeout_seconds: 60
+  max_completion_tokens: 1024
+  fail_closed: true
+
 workspace:
   path: workspace
   identity_file: IDENTITY.yaml

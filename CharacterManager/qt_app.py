@@ -274,6 +274,7 @@ class ModelPage(QWidget):
         tabs=QTabWidget(); self.provider_tabs=tabs
         for name,label in (("deepseek","DeepSeek"),("mimo","小米 MiMo"),("custom","自定义")):
             w=QWidget();wf=QFormLayout(w);base=QLineEdit();model=QLineEdit();env=QLineEdit();secret=QLineEdit();secret.setEchoMode(QLineEdit.Password);secret.setPlaceholderText("留空则保留现有密钥");status=QLabel();status.setStyleSheet("font-weight:700");wf.addRow("Base URL",base);wf.addRow("模型名称",model);wf.addRow("密钥环境变量",env);wf.addRow("API Key",secret);wf.addRow("当前状态",status);tabs.addTab(w,label);self.providers[name]=(base,model,env,secret,status)
+        tabs.addTab(MiMoMultimodalPage(s, embedded=True),"MiMo 多模态")
         lay.addWidget(tabs,1);row=QHBoxLayout();row.addStretch();row.addWidget(button("保存模型 API",self.save,primary=True));lay.addLayout(row);self.load()
     def load(self):
         c=self.s.get_config_section("llm");self.current.setCurrentText(str(c.get("provider","deepseek")));defaults={"home":(.7,600),"live":(.55,160),"memory":(.2,180)}
@@ -298,7 +299,7 @@ class VoicePage(QWidget):
         for key,label in (("url","TTS 地址"),("health_url","健康检查地址"),("start_command","启动命令"),("model","模型"),("reference","参考音频"),("speaker","说话人")):
             self.tts[key]=QLineEdit();tf.addRow(label,self.tts[key])
         self.tts_enabled=QCheckBox("启用语音合成");self.tts_auto=QCheckBox("服务未运行时自动启动");self.tts_play=QCheckBox("生成后自动播放");tf.addRow(self.tts_enabled);tf.addRow(self.tts_auto);tf.addRow(self.tts_play);tabs.addTab(t,"语音合成 TTS")
-        st=QWidget();sf=QFormLayout(st);self.stt={};self.stt_mode=QComboBox();self.stt_mode.addItems(["sound_mcp","api","local"]);sf.addRow("识别模式",self.stt_mode)
+        st=QWidget();sf=QFormLayout(st);self.stt={};self.stt_mode=QComboBox();self.stt_mode.addItems(["sound_mcp","mimo","api","local"]);sf.addRow("识别模式",self.stt_mode)
         for key,label in (("language","识别语言"),("mcp_url","Sound MCP 地址"),("api_url","API 地址"),("model","模型"),("local_python","本地 Python"),("local_model","本地模型")):
             self.stt[key]=QLineEdit();sf.addRow(label,self.stt[key])
         self.stt_auto=QCheckBox("自动启动识别服务");sf.addRow(self.stt_auto);tabs.addTab(st,"语音识别 STT")
@@ -343,6 +344,42 @@ class ImageApiPage(QWidget):
         c=self.s.get_config_section("image_generation");self.mode.setCurrentText(str(c.get("mode","images")));self.base.setText(str(c.get("base_url","")));self.model.setText(str(c.get("model","")));self.size.setCurrentText(str(c.get("size","1024x1024")));self.timeout.setValue(int(c.get("timeout_seconds",180)));self.env.setText(str(c.get("api_key_env","IMAGE_API_KEY")));u=self.s.get_config_section("image_understanding");self.ubase.setText(str(u.get("base_url","https://api.xiaomimimo.com/v1")));self.umodel.setText(str(u.get("model","mimo-v2.5")));self.utimeout.setValue(int(u.get("timeout_seconds",60)));self.uenv.setText(str(u.get("api_key_env","MIMO_API_KEY")))
     def save(self):
         try:self.s.save_config_section("image_generation",{"mode":self.mode.currentText(),"base_url":self.base.text().strip(),"model":self.model.text().strip(),"size":self.size.currentText().strip(),"timeout_seconds":self.timeout.value(),"api_key_env":self.env.text().strip()});self.s.save_secret(self.env.text().strip(),self.key.text().strip());self.s.save_config_section("image_understanding",{"provider":"mimo","base_url":self.ubase.text().strip(),"model":self.umodel.text().strip(),"timeout_seconds":self.utimeout.value(),"api_key_env":self.uenv.text().strip(),"auth_header":"api-key","max_tokens_field":"max_completion_tokens","max_completion_tokens":1024,"extra_body":{"thinking":{"type":"disabled"}}});self.s.save_secret(self.uenv.text().strip(),self.ukey.text().strip());self.key.clear();self.ukey.clear();toast(self,"图片 API 设置已保存")
+        except Exception as exc:alert(self,exc)
+
+
+class MiMoMultimodalPage(QWidget):
+    def __init__(self,s,embedded=False):
+        super().__init__();self.s=s
+        lay=QVBoxLayout(self);lay.setContentsMargins(12,12,12,12);lay.setSpacing(10)
+        if not embedded:lay.addWidget(page_title("MiMo 多模态","统一管理任务完成检查、图片理解和语音识别。API Key 仅显示配置状态，不回显明文。"))
+        else:
+            intro=QLabel("配置 MiMo 的统一接口、图片理解、语音识别和任务完成检查。页面内容可上下滚动，保存按钮始终位于底部。")
+            intro.setWordWrap(True);intro.setStyleSheet("color:#294a43;background:#e7f2ef;border:1px solid #b7cec8;border-radius:8px;padding:9px 11px;font-weight:600")
+            lay.addWidget(intro)
+        scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setFrameShape(QFrame.NoFrame);scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded);scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        content=QWidget();content.setMinimumWidth(610);body=QVBoxLayout(content);body.setContentsMargins(4,2,8,8);body.setSpacing(12)
+        box=QGroupBox("1. 服务与认证");f=QFormLayout(box);f.setLabelAlignment(Qt.AlignRight|Qt.AlignVCenter);f.setHorizontalSpacing(18);f.setVerticalSpacing(10)
+        self.enabled=QCheckBox("启用 MiMo 多模态能力");self.base=QLineEdit();self.env=QLineEdit();self.key=QLineEdit();self.key.setEchoMode(QLineEdit.Password);self.key.setPlaceholderText("输入新密钥；留空则保留现有密钥");self.key_status=QLabel();self.timeout=QSpinBox();self.timeout.setRange(10,600);self.timeout.setSuffix(" 秒")
+        for w in (self.base,self.env,self.key):w.setMinimumWidth(390)
+        for label,w in (("",self.enabled),("Base URL",self.base),("密钥环境变量",self.env),("API Key",self.key),("当前密钥",self.key_status),("请求超时",self.timeout)):f.addRow(label,w)
+        body.addWidget(box)
+        caps=QGroupBox("2. 图片与语音能力");cf=QFormLayout(caps);cf.setLabelAlignment(Qt.AlignRight|Qt.AlignVCenter);cf.setHorizontalSpacing(18);cf.setVerticalSpacing(10)
+        self.image_enabled=QCheckBox("启用图片理解");self.image_model=QLineEdit();self.speech_enabled=QCheckBox("启用语音识别");self.speech_model=QLineEdit();self.language=QComboBox();self.language.addItems(["auto（自动判断）","zh（中文）","en（英文）"])
+        self.image_model.setMinimumWidth(390);self.speech_model.setMinimumWidth(390);self.language.setMinimumWidth(190)
+        for label,w in (("",self.image_enabled),("图片模型",self.image_model),("",self.speech_enabled),("语音模型",self.speech_model),("默认识别语言",self.language)):cf.addRow(label,w)
+        body.addWidget(caps)
+        check=QGroupBox("3. 任务完成检查");vf=QFormLayout(check);vf.setLabelAlignment(Qt.AlignRight|Qt.AlignVCenter);vf.setHorizontalSpacing(18);vf.setVerticalSpacing(10)
+        self.check_enabled=QCheckBox("执行类任务结束前调用 MiMo 独立核验");self.check_model=QLineEdit();self.check_model.setMinimumWidth(390);self.retries=QSpinBox();self.retries.setRange(0,5);self.retries.setSuffix(" 次");self.fail_closed=QCheckBox("核验接口异常时禁止报告已完成")
+        for label,w in (("",self.check_enabled),("核验模型",self.check_model),("失败后重试",self.retries),("",self.fail_closed)):vf.addRow(label,w)
+        note=QLabel("核验器只读取本地工具返回的证据。检查失败时，原因会交回 Agent 继续修正；需要使用 MiMo 录音识别时，请在“语音”页面把识别模式改为 mimo。")
+        note.setWordWrap(True);note.setStyleSheet("color:#24423c;background:#f0f6f4;border-radius:7px;padding:9px");vf.addRow("说明",note);body.addWidget(check);body.addStretch()
+        scroll.setWidget(content);lay.addWidget(scroll,1)
+        row=QHBoxLayout();row.addStretch();save_button=button("保存 MiMo 多模态设置",self.save,primary=True);save_button.setMinimumWidth(190);row.addWidget(save_button);lay.addLayout(row);self.load()
+    def load(self):
+        c=self.s.get_config_section("mimo_multimodal");self.enabled.setChecked(bool(c.get("enabled",True)));self.base.setText(str(c.get("base_url","https://api.xiaomimimo.com/v1")));self.env.setText(str(c.get("api_key_env","MIMO_API_KEY")));self.timeout.setValue(int(c.get("timeout_seconds",60)));self.image_enabled.setChecked(bool(c.get("image_enabled",True)));self.image_model.setText(str(c.get("image_model","mimo-v2.5")));self.speech_enabled.setChecked(bool(c.get("speech_enabled",True)));self.speech_model.setText(str(c.get("speech_model","mimo-v2.5-asr")));lang=str(c.get("speech_language","auto"));self.language.setCurrentIndex({"auto":0,"zh":1,"en":2}.get(lang,0));self.check_enabled.setChecked(bool(c.get("completion_check_enabled",True)));self.check_model.setText(str(c.get("completion_model","mimo-v2.5")));self.retries.setValue(int(c.get("completion_max_retries",2)));self.fail_closed.setChecked(bool(c.get("fail_closed",True)));configured=bool(self.s.read_env().get(self.env.text().strip()));self.key_status.setText("● 已配置（内容已隐藏）" if configured else "○ 尚未配置");self.key_status.setStyleSheet("color:#08745f;font-weight:700" if configured else "color:#a12d2d;font-weight:700")
+    def save(self):
+        try:
+            c=self.s.get_config_section("mimo_multimodal");c.update(enabled=self.enabled.isChecked(),base_url=self.base.text().strip(),api_key_env=self.env.text().strip(),image_enabled=self.image_enabled.isChecked(),image_model=self.image_model.text().strip(),speech_enabled=self.speech_enabled.isChecked(),speech_model=self.speech_model.text().strip(),speech_language=("auto","zh","en")[self.language.currentIndex()],completion_check_enabled=self.check_enabled.isChecked(),completion_model=self.check_model.text().strip(),completion_max_retries=self.retries.value(),timeout_seconds=self.timeout.value(),max_completion_tokens=1024,fail_closed=self.fail_closed.isChecked());self.s.save_config_section("mimo_multimodal",c);self.s.save_secret(self.env.text().strip(),self.key.text().strip());self.key.clear();self.load();toast(self,"MiMo 多模态设置已保存")
         except Exception as exc:alert(self,exc)
 
 

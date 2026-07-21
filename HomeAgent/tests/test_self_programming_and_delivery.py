@@ -148,8 +148,13 @@ class SelfProgrammingTests(unittest.TestCase):
             self.assertFalse(manager.validate_current_changes(require_changes=True)["ok"])
             source.write_text("value = 2\n", encoding="utf-8")
             result = manager.validate_current_changes(require_changes=True)
+            self.assertFalse(result["ok"])
+            self.assertIn("AI Read", result["error"])
+            docs = root / "AI Read"; docs.mkdir(); (docs / "06_CURRENT_STATE.md").write_text("已同步 sample.py 逻辑\n", encoding="utf-8")
+            result = manager.validate_current_changes(require_changes=True)
             self.assertTrue(result["ok"])
-            self.assertEqual(["HomeAgent/sample.py"], result["changed"])
+            self.assertIn("HomeAgent/sample.py", result["changed"])
+            self.assertIn("AI Read/06_CURRENT_STATE.md", result["changed"])
 
     def test_self_programming_reads_engineering_documents(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -197,6 +202,11 @@ class SelfProgrammingTests(unittest.TestCase):
             )
             changed = module.changed_files()
             self.assertIn("Projects/demo/calculator.py", changed)
+            validation = module.validate_current_changes(require_changes=True)
+            self.assertFalse(validation["ok"])
+            self.assertIn("README", validation["error"])
+            (project / "README.md").write_text("# Demo\n\nCalculator with tested add().\n", encoding="utf-8")
+            changed = module.changed_files()
             validation = module.validate_current_changes(require_changes=True)
             self.assertTrue(validation["ok"])
             tests_result = module.run_autonomous_tests(changed, timeout=30)

@@ -246,6 +246,17 @@ class SettingsDialog(QDialog):
         self._sync_startup_controls()
         tabs.addTab(general, "常规")
 
+        shell_page = QWidget(); shell_form = QFormLayout(shell_page); shell_form.setContentsMargins(18, 18, 18, 18); shell_cfg = cfg.get("shell_execution", {})
+        self.shell_enabled = QCheckBox("允许模型调用 PowerShell / Shell"); self.shell_enabled.setChecked(bool(shell_cfg.get("shell_enabled", True)))
+        self.cmd_enabled = QCheckBox("允许模型调用 CMD"); self.cmd_enabled.setChecked(bool(shell_cfg.get("cmd_enabled", True)))
+        self.shell_confirm = QCheckBox("每次执行命令前请求确认"); self.shell_confirm.setChecked(bool(shell_cfg.get("confirm_before_execute", False)))
+        self.shell_timeout = QSpinBox(); self.shell_timeout.setRange(1, 300); self.shell_timeout.setSuffix(" 秒"); self.shell_timeout.setValue(int(shell_cfg.get("timeout_seconds", 60)))
+        shell_note = QLabel("命令内容由主模型结合任务和工具反馈自主决定；本地执行器只负责权限、超时和输出回传。")
+        shell_note.setWordWrap(True); shell_note.setObjectName("muted")
+        shell_form.addRow("PowerShell", self.shell_enabled); shell_form.addRow("CMD", self.cmd_enabled); shell_form.addRow("执行确认", self.shell_confirm); shell_form.addRow("默认超时", self.shell_timeout); shell_form.addRow("说明", shell_note)
+        tabs.addTab(shell_page, "命令")
+        self.shell_enabled.toggled.connect(self.save); self.cmd_enabled.toggled.connect(self.save); self.shell_confirm.toggled.connect(self.save); self.shell_timeout.valueChanged.connect(self.save)
+
         stt_page = QWidget(); stt_form = QFormLayout(stt_page); stt_form.setContentsMargins(18, 18, 18, 18); stt = cfg.get("stt", {})
         self.stt_mode = QComboBox(); self.stt_mode.addItems(["sound_mcp", "api", "faster_whisper"]); self.stt_mode.setCurrentText(str(stt.get("mode", "sound_mcp")))
         self.stt_url = QLineEdit(str(stt.get("api_url", ""))); self.stt_model = QLineEdit(str(stt.get("model", ""))); self.stt_language = QLineEdit(str(stt.get("language", "auto")))
@@ -281,6 +292,7 @@ class SettingsDialog(QDialog):
             cfg.setdefault("desktop_pet", {})["always_on_top"] = self.always_top.isChecked()
             cfg.setdefault("microphone", {})["auto_send_after_transcription"] = self.auto_send.isChecked()
             control = cfg.setdefault("computer_control", {}); control["enabled"] = self.control.isChecked(); control["full_access"] = self.full_access.isChecked(); control["confirm_before_action"] = self.confirm_file.isChecked(); control["confirm_launch_app"] = self.confirm_app.isChecked()
+            shell = cfg.setdefault("shell_execution", {}); shell["shell_enabled"] = self.shell_enabled.isChecked(); shell["cmd_enabled"] = self.cmd_enabled.isChecked(); shell["confirm_before_execute"] = self.shell_confirm.isChecked(); shell["timeout_seconds"] = self.shell_timeout.value(); shell.setdefault("max_output_chars", 20000)
             cfg.setdefault("codex_cli", {})["enabled"] = self.codex.isChecked()
             startup = cfg.setdefault("system_startup", {}); startup["enabled"] = self.system_autostart.isChecked(); startup["restart_on_network_failure"] = self.network_restart.isChecked(); startup["max_restart_attempts"] = min(5, self.network_attempts.value())
             stt = cfg.setdefault("stt", {}); stt["mode"] = self.stt_mode.currentText(); stt["api_url"] = self.stt_url.text().strip(); stt["model"] = self.stt_model.text().strip(); stt["language"] = self.stt_language.text().strip() or "auto"

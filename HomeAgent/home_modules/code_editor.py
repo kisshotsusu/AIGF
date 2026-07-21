@@ -128,7 +128,7 @@ class CodeEditorModule:
         compact = str(prompt).replace(" ", "").lower()
         subjects = ("homeagent", "你自己", "自身", "自我", "本体", "你的代码", "程序", "系统")
         actions = ("升级", "更新", "修改", "优化", "修复", "编辑", "增加功能", "添加功能", "写代码", "改代码", "重构", "实现")
-        explicit_path = "ai直播/homeagent" in compact.replace("\\", "/")
+        explicit_path = "aiagent/homeagent" in compact.replace("\\", "/")
         delivery_change = "播放语音" in compact and "显示消息" in compact and any(word in compact for word in ("不要等", "立刻", "立即", "同时", "的时候"))
         return ((any(word in compact for word in subjects) or explicit_path) and any(word in compact for word in actions)) or delivery_change
 

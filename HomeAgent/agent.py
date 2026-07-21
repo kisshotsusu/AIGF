@@ -30,6 +30,14 @@ HOME_AGENT = ROOT / "HomeAgent"
 def project_path(value: str | Path) -> Path:
     path = Path(value).expanduser()
     return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+
+
+def _tts_safe_text_for_fallback(text: str) -> str:
+    """Keep emergency Windows speech short and compatible with local voices."""
+    value = re.sub(r"[`*_#>|]", "", str(text or ""))
+    return value.encode("gbk", errors="ignore").decode("gbk").strip()
+
+
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "Skill" / "schedule-home-task" / "scripts"))
 
@@ -38,6 +46,7 @@ from src.ai_live_assistant.workspace import Workspace
 from src.ai_live_assistant.long_term_memory import LongTermMemoryStore
 from task_manager import TaskStore
 from self_upgrade import SelfUpgradeManager
+from home_modules.command_executor import CommandExecutor
 
 
 class HomeAgent:
@@ -62,6 +71,7 @@ class HomeAgent:
         self.sound_service_process: subprocess.Popen | None = None
         self.sound_service_lock = threading.Lock()
         self.self_upgrade = SelfUpgradeManager(ROOT, HOME_AGENT, self.config)
+        self.command_executor = CommandExecutor(ROOT)
         self.restart_requested = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
         threading.Thread(target=self.ensure_sound_service, daemon=True, name="sound-mcp-autostart").start()
@@ -396,6 +406,16 @@ class HomeAgent:
         if not cfg.get("enabled", True) or not cfg.get("gui_enabled", True) or not self._codex_config().get("enabled", False): return False
         lowered = str(text).lower()
         return any(str(word).strip().lower() in lowered for word in cfg.get("trigger_keywords", []) if str(word).strip())
+
+    @staticmethod
+    def _is_file_authoring_request(text: str) -> bool:
+        """Recognize direct file/script creation without pretending it is a GUI task."""
+        value = str(text or "").lower().replace(" ", "")
+        action = any(word in value for word in ("写个", "写一个", "编写", "创建", "新建", "生成", "修改", "修复"))
+        target = any(ext in value for ext in (".bat", ".cmd", ".ps1", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".ini", ".md", ".txt")) or any(
+            word in value for word in ("bat", "批处理", "一键启动", "启动脚本", "脚本文件", "配置文件")
+        )
+        return action and target
 
     @staticmethod
     def _favorite_folder_key(value: str) -> str:
@@ -1468,7 +1488,7 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "cloudmusic_search_and_play", "description": "在本地网易云音乐客户端搜索并播放指定歌曲，内置多轮精确选择、Enter备用策略和窗口标题验证。网易云指定歌曲播放任务必须优先调用，禁止用底部全局播放按钮代替选择搜索结果。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "任务计划给出的准确歌曲名"}}, "required": ["query"]}}},
                 {"type": "function", "function": {"name": "ui_inspect_target", "description": "观察当前活动目标，判断是可读DOM网页、视觉网页还是原生程序。任何网页/界面任务第一步调用。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "ui_list_windows", "description": "读取当前可见窗口标题和进程，用于找到并验证目标程序以及媒体播放标题。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}}}},
-                {"type": "function", "function": {"name": "ui_activate_window", "description": "激活一个已经打开的窗口，不启动新浏览器。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}, "required": ["title_contains"]}}},
+                {"type": "function", "function": {"name": "ui_activate_window", "description": "激活一个已经打开的窗口，不启动新浏览器。优先传 ui_list_windows 返回的 title；工具也兼容 hwnd、process_name 和 process_path。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string", "description": "优先使用窗口真实 title，也可使用 hwnd、进程名或完整进程路径"}}, "required": ["title_contains"]}}},
                 {"type": "function", "function": {"name": "ui_type_window", "description": "在指定原生窗口中按语义定位输入框并输入文字。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "text": {"type": "string"}}, "required": ["title_contains", "target", "text"]}}},
                 {"type": "function", "function": {"name": "ui_click_window", "description": "在指定原生窗口中定位并单击目标。目标描述必须包含当前任务对象，不能用它代替播放指定搜索结果。失败重试时可用candidate_index切换视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
                 {"type": "function", "function": {"name": "ui_double_click_window", "description": "在指定原生窗口中定位并双击目标，适合选择并播放搜索结果行。必须明确描述目标标题，禁止描述底部全局播放按钮。若标题未变化，用candidate_index 1或2重试其他视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
@@ -1495,15 +1515,25 @@ class HomeAgent:
             tools += [
                 {"type": "function", "function": {"name": "list_directory", "description": "列出允许目录中的文件和子目录", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
                 {"type": "function", "function": {"name": "read_text_file", "description": "读取允许目录中的文本文件，不能读取密钥文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+                {"type": "function", "function": {"name": "write_text_file", "description": "原子创建或完整写入文本、脚本和配置文件。写入现有文件前先读取，写入后必须重新读取验证。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
                 {"type": "function", "function": {"name": "open_path", "description": "经过用户确认后，用系统默认程序打开允许目录中的文件或文件夹", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
                 {"type": "function", "function": {"name": "open_url", "description": "仅用于目标就是打开某个网页的单步请求。若还要搜索、查找、点击、选择、播放、填写或提交，禁止使用本工具，必须调用 web_agent_task。", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
                 {"type": "function", "function": {"name": "launch_app", "description": "按软件目录映射启动应用或打开软件目录。完整权限模式下也可使用可执行文件绝对路径", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "已配置的软件名称、程序路径或目录路径"}, "arguments": {"type": "array", "items": {"type": "string"}}}, "required": ["name"]}}},
             ]
+            shell_cfg = self.config.get("shell_execution", {})
+            if shell_cfg.get("shell_enabled", True):
+                tools.append({"type": "function", "function": {"name": "run_shell", "description": "在本机非交互 PowerShell 中执行命令。由你根据任务和已观察信息决定命令、工作目录与超时；适合 PowerShell cmdlet、系统查询、文件和进程操作。执行后必须检查 exit_code、stdout、stderr，不得把调用本身当作成功。", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "完整 PowerShell 命令"}, "cwd": {"type": "string", "description": "可选工作目录"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"]}}})
+            if shell_cfg.get("cmd_enabled", True):
+                tools.append({"type": "function", "function": {"name": "run_cmd", "description": "在本机非交互 CMD 中执行命令。由你在 BAT/CMD 语法、传统 Windows 命令或需要 cmd.exe 时自主选择；执行后必须检查 exit_code、stdout、stderr。", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "完整 CMD 命令"}, "cwd": {"type": "string", "description": "可选工作目录"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"]}}})
         if self.config.get("agent", {}).get("model_driven_computer_actions", True):
             delegated = {"web_agent_task", "vision_gui_task"}
             tools = [item for item in tools if item.get("function", {}).get("name") not in delegated]
         if getattr(self, "current_code_task", False) and self.config.get("agent", {}).get("prefer_local_code_tools", True):
             tools = [item for item in tools if item.get("function", {}).get("name") != "codex_cli_task"]
+        if getattr(self, "current_file_authoring_task", False):
+            blocked = {"codex_cli_task", "mcp_task", "launch_app", "open_path"}
+            tools = [item for item in tools if item.get("function", {}).get("name") not in blocked
+                     and not item.get("function", {}).get("name", "").startswith(("ui_", "web_", "vision_"))]
         return tools
 
     def _home_tts_chunks(self, text: str) -> list[str]:
@@ -1527,9 +1557,38 @@ class HomeAgent:
     async def _speak_home(self, session: aiohttp.ClientSession, text: str, status=None, ignore_cancel: bool = False) -> list[str]:
         await asyncio.to_thread(self.tts_execution_lock.acquire)
         try:
-            return await self._speak_home_unlocked(session, text, status, ignore_cancel=ignore_cancel)
+            try:
+                return await self._speak_home_unlocked(session, text, status, ignore_cancel=ignore_cancel)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.log_event("home_tts_failed", error=str(exc), fallback="windows_sapi")
+                if status: status("主语音服务暂时不可用，正在使用系统语音播报…")
+                spoken = await asyncio.to_thread(self._windows_sapi_speak, text)
+                self.log_event("home_tts_fallback", ok=spoken)
+                return []
         finally:
             self.tts_execution_lock.release()
+
+    @staticmethod
+    def _windows_sapi_speak(text: str) -> bool:
+        if os.name != "nt": return False
+        safe = _tts_safe_text_for_fallback(text)[:1200]
+        if not safe: return False
+        env = os.environ.copy(); env["HOME_AGENT_TTS_TEXT"] = safe
+        script = (
+            "Add-Type -AssemblyName System.Speech;"
+            "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            "$s.Speak($env:HOME_AGENT_TTS_TEXT)"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                env=env, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=90,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     async def _speak_home_unlocked(self, session: aiohttp.ClientSession, text: str, status=None, ignore_cancel: bool = False) -> list[str]:
         chunks = self._home_tts_chunks(text)
@@ -1611,6 +1670,7 @@ class HomeAgent:
         self.current_task_plan = task_plan
         code_task = self.self_upgrade.code_editor.is_code_task(text)
         self.current_code_task = code_task
+        self.current_file_authoring_task = self._is_file_authoring_request(text) and not code_task
         self.current_code_self_edit = self.self_upgrade.is_upgrade_request(text)
         self.log_event("task_plan_created", task_plan=task_plan)
         if task_plan.get("requires_clarification"):
@@ -1765,7 +1825,7 @@ class HomeAgent:
                 "若是 browser_visual，必须保持现有浏览器，用 ui_hotkey Ctrl+L、ui_type_active_text、Enter 和窗口视觉工具操作。"
                 "禁止调用 launch_app 启动 Chrome/Edge/Firefox，也禁止为了DOM能力创建新浏览器。"
                 "原生程序第一次调用 ui_list_windows 时不要传标题过滤；应用窗口标题可能是当前文档或歌曲名，"
-                "应从全部窗口的 process_name 找到目标进程，再把返回的真实窗口标题用于激活、输入和点击。"
+                "应从全部窗口的 process_name 找到目标进程，再把同一条记录返回的真实 title（不是 process_path）用于激活、输入和点击。"
                 "确认程序确实未运行后才允许启动；随后输入、提交并选择目标。"
                 "原生窗口搜索提交后必须调用 ui_analyze_window 观察结果列表，再根据观察双击准确结果。"
                 "选择点击锚点时使用分析结果中最有区分度的精确可见文字；存在明确歌手时优先用歌手名或‘歌名+歌手’，"
@@ -1775,6 +1835,12 @@ class HomeAgent:
                 "当 query 非空且目标是播放搜索结果时，必须先明确选择与 query 匹配的结果；"
                 "原生音乐列表优先双击准确的歌曲行。禁止直接点击底部或全局播放按钮来代替选择目标。"
                 "操作后必须再次读取网页、URL或窗口标题验证实际目标已打开/播放；没有证据不得报告成功。"
+            )
+        if self.current_file_authoring_task:
+            operation_contract += (
+                "\n\n【本地文件创建任务】这是文件系统任务，不是界面自动化任务。"
+                "禁止启动终端窗口、禁止调用视觉/网页/Codex。先用 list_directory 和 read_text_file 检查真实目录与入口，"
+                "再用 write_text_file 原子写入目标文件，最后重新 read_text_file 验证内容；本地工具足够时不得网络回退。"
             )
         if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True):
             local_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract(self_edit=self.current_code_self_edit)
@@ -2164,6 +2230,32 @@ class HomeAgent:
             if path.stat().st_size > 1024 * 1024: return {"error": "文本文件超过 1MB"}
             try: return {"path": str(path), "content": path.read_text(encoding="utf-8")[:30000]}
             except UnicodeDecodeError: return {"error": "不是 UTF-8 文本文件"}
+        if name == "write_text_file":
+            path = self._allowed_path(args.get("path")); content = str(args.get("content", ""))
+            blocked = {".env", ".pem", ".key", ".pfx"}
+            if path.name.lower() == ".env" or path.suffix.lower() in blocked: return {"error": "禁止写入密钥文件"}
+            if len(content.encode("utf-8")) > 1024 * 1024: return {"error": "写入内容超过 1MB"}
+            if not path.parent.is_dir(): return {"error": "目标目录不存在"}
+            if self.config.get("computer_control", {}).get("confirm_before_action", True) and not await self._confirm_control(f"写入文件：{path}", confirm): return {"cancelled": True}
+            temporary = path.with_name(f".{path.name}.home-agent.tmp")
+            temporary.write_text(content, encoding="utf-8", newline="\r\n" if path.suffix.lower() in {".bat", ".cmd"} else "\n")
+            temporary.replace(path)
+            return {"ok": True, "path": str(path), "bytes": path.stat().st_size, "status": "success", "evidence": {"path": str(path)}}
+        if name in {"run_shell", "run_cmd"}:
+            cfg = self.config.get("shell_execution", {})
+            kind = "shell" if name == "run_shell" else "cmd"
+            if not cfg.get(f"{kind}_enabled", True): return {"error": f"{kind} 执行功能未启用"}
+            cwd_value = str(args.get("cwd") or ROOT)
+            cwd = self._allowed_path(cwd_value)
+            if not cwd.is_dir(): return {"error": f"工作目录不存在：{cwd}"}
+            command = str(args.get("command") or "").strip()
+            if cfg.get("confirm_before_execute", False) and not await self._confirm_control(f"使用 {kind} 执行命令：{command[:200]}", confirm): return {"cancelled": True}
+            executor = getattr(self, "command_executor", None) or CommandExecutor(ROOT)
+            return await asyncio.to_thread(
+                executor.execute, kind, command, cwd=cwd,
+                timeout_seconds=int(args.get("timeout_seconds") or cfg.get("timeout_seconds", 60)),
+                max_output_chars=int(cfg.get("max_output_chars", 20000)),
+            )
         if name == "open_path":
             path = self._allowed_path(args.get("path"))
             if not path.exists(): return {"error": "路径不存在"}

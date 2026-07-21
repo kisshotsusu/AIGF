@@ -162,7 +162,7 @@ class TTSClient:
                     return await self._synthesize_once(text)
                 except asyncio.CancelledError:
                     raise
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as exc:
+                except (aiohttp.ClientError, asyncio.TimeoutError, asyncio.LimitOverrunError, OSError, RuntimeError) as exc:
                     if attempt >= attempts: raise
                     delay = min(base_delay * (2 ** (attempt - 1)), 15.0)
                     logging.getLogger("ai_live").warning(

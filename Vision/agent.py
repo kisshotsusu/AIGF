@@ -518,9 +518,33 @@ def list_windows(title_contains: str = ""):
 
 
 def _find_window(title_contains: str):
-    matches = list_windows(title_contains)
-    if not matches: raise RuntimeError(f"window not found: {title_contains}")
-    return matches[0]
+    """Resolve a window from its title, HWND, process name, or process path.
+
+    `list_windows` exposes all four fields.  A model may legitimately return the
+    process field it just observed, so activation must not interpret every value
+    as title text only.
+    """
+    reference = str(title_contains or "").strip()
+    if not reference:
+        raise RuntimeError("window reference is empty")
+    matches = list_windows(reference)
+    if matches:
+        return matches[0]
+
+    windows = list_windows()
+    folded = os.path.normcase(os.path.normpath(reference))
+    basename = os.path.basename(folded)
+    for window in windows:
+        if reference.isdigit() and int(reference) == int(window.get("hwnd", 0)):
+            return window
+        process_path = os.path.normcase(os.path.normpath(str(window.get("process_path") or "")))
+        process_name = str(window.get("process_name") or "").casefold()
+        if folded and process_path == folded:
+            return window
+        if basename and (process_name == basename.casefold() or os.path.basename(process_path) == basename):
+            return window
+    available = [str(item.get("title") or "") for item in windows[:8]]
+    raise RuntimeError(f"window not found: {reference}; available titles: {available}")
 
 
 def activate_window(title_contains: str):

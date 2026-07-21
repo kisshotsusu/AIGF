@@ -127,7 +127,12 @@ class CodeEditorModule:
     @staticmethod
     def is_code_edit_request(prompt: str) -> bool:
         compact = str(prompt).replace(" ", "").lower()
-        subjects = ("homeagent", "你自己", "自身", "自我", "本体", "你的代码", "程序", "系统")
+        subjects = (
+            "homeagent", "你自己", "自己", "自己的代码", "你自己的代码", "自身", "自我", "本体",
+            "你的代码", "自身代码", "自我升级", "自动升级", "程序", "系统",
+            "直播", "直播间", "直播助手", "欢迎观众", "弹幕", "b站", "bilibili", "liveassistant",
+            "角色管理器", "charactermanager", "视觉服务", "vision", "语音服务", "sound",
+        )
         actions = ("升级", "更新", "修改", "优化", "修复", "编辑", "增加功能", "添加功能", "写代码", "改代码", "重构", "实现")
         explicit_path = "aiagent/homeagent" in compact.replace("\\", "/")
         delivery_change = "播放语音" in compact and "显示消息" in compact and any(word in compact for word in ("不要等", "立刻", "立即", "同时", "的时候"))

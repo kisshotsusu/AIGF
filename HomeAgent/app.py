@@ -237,7 +237,11 @@ class DesktopPet:
             answer = loop.run_until_complete(self.chat_task)
             publish_answer(answer)
             self.agent.finalize_task_recovery(answer)
-            self.set_status("就绪")
+            if self.agent.restart_requested:
+                self.set_status("正在重启 Home Agent…")
+                self.root.after(800, self._restart_agent)
+            else:
+                self.set_status("就绪")
         except asyncio.CancelledError:
             self.agent.log_event("chat_cancelled")
             self.root.after(0, lambda: self._append("assistant", self.agent.character_name, "当前任务已停止。"))
@@ -256,6 +260,11 @@ class DesktopPet:
         self.busy = False
         if self.panel and self.panel.winfo_exists():
             self.send_btn.configure(state="normal"); self.stop_btn.configure(state="disabled"); self.input.focus_set()
+
+    def _restart_agent(self):
+        self.agent.self_upgrade.launch_restart_watchdog(os.getpid())
+        self.closing = True
+        self.root.destroy()
 
     def _sync_character_name(self):
         name = self.agent.refresh_identity()

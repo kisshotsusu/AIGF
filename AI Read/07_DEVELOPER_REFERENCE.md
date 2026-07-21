@@ -1,5 +1,31 @@
 # 开发者参考（细化补充）
 
+## 本地重启指令契约
+
+- `HomeAgent.is_restart_request(text)` 只接受明确的当前执行命令；否定、咨询和功能开发语句必须返回 `False`。
+- `HomeAgent.chat` 必须在 `_acknowledge_common_response`、历史注入、规划器和供应商请求之前处理直接重启，设置 `restart_requested` 并返回固定本地文案。
+- `finalize_task_recovery` 必须保留已经设置的直接重启标志，不能被普通任务的 `SelfUpgradeManager.finalize(False)` 覆盖。
+- Qt 使用 `_restart_if_requested`，Tk 使用 `_restart_agent`；两者都只能通过 `launch_restart_watchdog` 接力，避免新旧实例并存。
+
+## 自主升级完成门禁
+
+- `CodeEditorModule.is_code_edit_request` 必须覆盖用户对 HomeAgent 自身修改的常见自然表达；新增表达时同步回归测试。
+- `SelfUpgradeManager.finalize` 对 `is_self_upgrade=true` 调用 `validate_current_changes(require_changes=True)`。空变更、实现未同步 `AI Read` 或语法/配置错误都必须写入 `validation_failed` 并阻止重启。
+- 模型返回的普通 `content` 即使包含 `<tool_call>` 也不是工具调用。`HomeAgent._contains_unexecuted_tool_markup` 会拒绝此类回答，只有 API `tool_calls` 数组中的调用才能执行。
+- `_speak_home` 是 TTS 的统一安全门：伪工具标记、Markdown 代码块或超长源码不得播报。
+- 自身代码任务的 subject 不仅包括 HomeAgent，也包括本仓库的直播/B站/弹幕、CharacterManager、Vision、Sound 等组件；对应修复请求必须令 `current_code_self_edit=true`。
+- `aiohttp.ClientSession` 仅在其 `async with` 作用域内有效。工具循环退出后的失败或后备结果播报必须调用 `_speak_with_fresh_session`，不得继续引用循环中的 `session`。
+- `agent.max_tool_rounds` 是失败预算而非总调用数；每次模型迭代最多累计一个失败轮。成功工具结果不增加 `failed_rounds`。`max_tool_iterations` 是强制总上限，两者必须分别写入 `tool_round_limit_reached` 日志。
+- `_speak_with_fresh_session` 仍调用 `_speak_home`，后者首先执行 `TTSClient`（GPT-SoVITS）；只有 `_speak_home_unlocked` 抛出异常时才允许 `_windows_sapi_speak` 降级。
+
+## HomeAgent 主动屏幕关怀契约
+
+- `HomeAgent.proactive_screen_care() -> str`：后台抓取屏幕并调用 `MiMoMultimodalClient.analyze_image`；成功返回简短关怀语，关闭、接口失败或无结果返回空字符串。该方法不向外暴露截图路径，`finally` 必须删除临时 PNG。
+- `ScreenCareWorker` 在独立 `QThread` 中运行独立 asyncio 事件循环；`HomeAgentWindow.run_screen_care` 是唯一 Qt 调度入口。不得复用 `Bridge.finished`，否则会错误结束用户任务卡片。
+- 调度器必须保持“忙时跳过、单实例运行”的约束。`SettingsDialog` 将频率以分钟展示并保存为 `interval_seconds`；`HomeAgentWindow.apply_screen_care_settings()` 负责保存后即时启动、停止或重置定时器。最小值为 60 秒，默认值为 300 秒。
+- 关怀提示不得要求模型转录或复述屏幕内容；新增输出渠道时仍须服从 `screen_care.show_message`、`screen_care.speak` 和 `home.auto_speak`。
+- `_show_screen_care` 同时路由对话区与 `DesktopPetWindow.show_care_message`；桌宠气泡受 `popup_enabled` 控制。`CareMessagePopup` 必须保持 `WA_ShowWithoutActivating`，自动隐藏且位置限制在当前屏幕可用区域内。
+
 > 面向改代码的会话。本文是对 `01~06` 的“落地层”补充：具体函数签名、数据契约、同步逻辑与已知坑。所有内容已对照项目根目录代码核对；项目移动或改名后无需修改本文路径。
 
 ## 1. 代码位置与“单一真相源”

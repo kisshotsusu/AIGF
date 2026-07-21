@@ -29,9 +29,10 @@
 - `microphone`：采样率、声道、设备 ID、识别后自动发送、本地 STT 运行时路径。
 - `desktop_pet`：置顶、坐标、桌宠图标。
 - `stt`：模式支持 `sound_mcp`、`mimo`、通用 `api` 与本地识别；MiMo 模式读取根 `mimo_multimodal` 配置。
-- `agent`：`max_tool_rounds`（整体工具轮次上限，当前 28）、`operation_retry_rounds`（电脑操作重试，当前 4）、模型驱动电脑动作、本地工具优先、是否允许角色图片 Skill、Skill 根目录。
+- `agent`：`max_tool_rounds` 现表示失败轮次预算（当前 28），成功工具轮不计入；`max_tool_iterations` 是独立总迭代安全上限（当前 112）；`operation_retry_rounds`（电脑操作重试，当前 4）、模型驱动电脑动作、本地工具优先、是否允许角色图片 Skill、Skill 根目录。
 - `semantic_planner`：**当前文档此前未记录的配置节**，控制 MiMo 语义计划步骤：`enabled`、`timeout_seconds`（10）、`minimum_confidence`（0.55）。低于置信度时回退或要求澄清。
 - `progress_reporting`：**此前未记录的配置节**，控制长任务进度汇报：`enabled`、`long_task_seconds`（60）、`tts_cooldown_seconds`（90）、`max_reports_per_task`（3）。
+- `screen_care`：运行时主动屏幕关怀。默认 `enabled: true`、`interval_seconds: 300`；设置窗口的“屏幕关怀”页可实时启停，并以分钟为单位设置 1～1440 分钟的问候频率。`skip_while_busy` 防止打断用户任务，`all_screens: false` 只截主屏，`show_message` 控制是否写入对话区，`popup_enabled` 控制桌宠消息气泡，`popup_duration_seconds` 控制气泡显示时长（默认 12 秒），`speak` 与 `home.auto_speak` 共同控制播报，`max_chars` 限制关怀语长度。截图仅存于系统临时目录并在每轮结束后删除。
 - `context_maintenance`：家庭上下文每天 03:00 压缩；可清理家庭闲聊、清理 `work/` 并保留 3 天。
 - `codex_cli`：CLI、隔离 `CODEX_HOME`、沙箱、超时、触发模式与关键词。
 - `vision_mcp`：HTTP 服务、现有浏览器 CDP 端点、GUI 模型开关。当前 `gui_enabled: true`、`preload_model: false`，即允许按需懒加载视觉模型，服务启动不预占显存。

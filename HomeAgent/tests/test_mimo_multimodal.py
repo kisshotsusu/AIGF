@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from home_modules.mimo_multimodal import MiMoMultimodalClient
+from agent import HomeAgent
 
 
 class Response:
@@ -52,6 +53,31 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
             client._post = fake_post
             result = await client.verify_completion(Session(), "打开页面", {"actionable": True}, "完成", [])
             self.assertEqual(result, {"passed": False, "reason": "没有终态证据", "next_action": "重新读取页面"})
+
+    async def test_screen_care_deletes_temporary_screenshot(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"screen_care": {"enabled": True, "speak": False}, "home": {"auto_speak": True}}
+        agent.mimo_multimodal = MiMoMultimodalClient()
+        events = []
+        captured = []
+        agent.log_event = lambda event, **data: events.append((event, data))
+
+        class Image:
+            def convert(self, mode): return self
+            def save(self, path, kind): Path(path).write_bytes(b"png")
+
+        async def analyze(session, path, prompt):
+            self.assertTrue(path.exists())
+            captured.append(path)
+            self.assertIn("不要复述屏幕", prompt)
+            return {"text": "主人，忙一会儿也记得喝口水呀。", "model": "mimo-v2.5"}
+
+        agent.mimo_multimodal.analyze_image = analyze
+        with patch("PIL.ImageGrab.grab", return_value=Image()):
+            result = await agent.proactive_screen_care()
+        self.assertEqual(result, "主人，忙一会儿也记得喝口水呀。")
+        self.assertFalse(captured[0].exists())
+        self.assertEqual(events[-1][0], "proactive_screen_care")
 
 
 if __name__ == "__main__": unittest.main()

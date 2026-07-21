@@ -1,11 +1,13 @@
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from qt_app import TaskProgressCard
+from qt_app import HomeAgentWindow, TaskProgressCard
 
 
 class TaskProgressCardTests(unittest.TestCase):
@@ -40,6 +42,31 @@ class TaskProgressCardTests(unittest.TestCase):
         self.assertEqual(card.title.text(), "任务已完成")
         self.assertEqual(card.summary.text(), "执行完成 · 2 个步骤")
         self.assertTrue(card.details.isHidden())
+
+    def test_screen_care_settings_restart_or_stop_timer_immediately(self):
+        class Timer:
+            def __init__(self): self.started = None; self.stopped = False
+            def start(self, milliseconds): self.started = milliseconds; self.stopped = False
+            def stop(self): self.stopped = True
+
+        target = SimpleNamespace(agent=SimpleNamespace(config={"screen_care": {"enabled": True, "interval_seconds": 600}}), screen_care_timer=Timer())
+        HomeAgentWindow.apply_screen_care_settings(target)
+        self.assertEqual(target.screen_care_timer.started, 600000)
+
+        target.agent.config["screen_care"]["enabled"] = False
+        HomeAgentWindow.apply_screen_care_settings(target)
+        self.assertTrue(target.screen_care_timer.stopped)
+
+    def test_screen_care_displays_pet_popup_and_chat_message(self):
+        pet = SimpleNamespace(show_care_message=Mock())
+        target = SimpleNamespace(
+            agent=SimpleNamespace(config={"screen_care": {"show_message": True, "popup_enabled": True}}, character_name="苏苏"),
+            pet=pet, append_message=Mock(), set_status=Mock(),
+        )
+        HomeAgentWindow._show_screen_care(target, "主人，记得喝水呀。")
+        target.append_message.assert_called_once_with("assistant", "苏苏", "主人，记得喝水呀。")
+        pet.show_care_message.assert_called_once_with("主人，记得喝水呀。")
+        target.set_status.assert_called_once_with("就绪")
 
 
 if __name__ == "__main__":

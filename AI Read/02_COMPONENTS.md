@@ -32,9 +32,14 @@
 > `task_manager`（HomeAgent 的任务调度）不在 `HomeAgent/` 本地，而在 `Skill/schedule-home-task/scripts/task_manager.py`；`agent.py` 启动时把该目录加入 `sys.path` 后以 `from task_manager import TaskStore` 使用。
 - `HomeAgent/agent.py`：家庭 Agent、MiMo 语义计划、本地工具优先路由、Codex/MCP 后备、TTS 和上下文维护。
 - `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入、设置和重启恢复；`app.py` 保留 Tk 后备和 Qt 转发入口。
+- `HomeAgent/qt_app.py` 中的 `ScreenCareWorker`：按“屏幕关怀”设置的频率低优先级触发关怀，忙碌时跳过且不允许并发实例；设置窗口可实时启停和修改频率。
+- `HomeAgent/qt_app.py` 中的 `CareMessagePopup`：在桌宠旁显示不抢输入焦点的关怀气泡，默认 12 秒后自动隐藏并自动适配屏幕边缘。
 - `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。
+- `HomeAgent/restart_watchdog.py`：直接重启与升级后重启共用的进程接力器；等待旧 HomeAgent 退出后启动新实例。
+- `HomeAgent/home_modules/code_editor.py` 与 `self_upgrade.py` 共同保证自升级意图识别、真实变更要求、文档同步、语法校验和重启门禁；空变更不能完成自升级。
 - `HomeAgent/home_modules/code_editor.py`：隔离的代码工程模块，负责自身/独立项目识别、工程合同、文件追踪、Python/YAML/JSON/Node/TypeScript/静态网页校验和自主测试。
 - `HomeAgent/home_modules/mimo_multimodal.py`：MiMo 图片理解、WAV/MP3 语音识别和基于工具证据的任务完成独立核验。
+- `HomeAgent/agent.py::proactive_screen_care`：临时截取主屏幕、用 MiMo 生成隐私安全的简短关怀语、按配置播报并保证截图清理。
 - `HomeAgent/home_modules/command_executor.py`：执行模型规划后的 PowerShell/CMD 命令，统一工作目录、超时、输出和失败状态。
 - `CharacterManager/service.py`：UI 无关的数据接口、原子保存、配置文档拆分和未知字段保留。
 - `CharacterManager/qt_app.py`：默认角色工作台；`app.py --legacy-tk` 启动旧 Tk 前端。

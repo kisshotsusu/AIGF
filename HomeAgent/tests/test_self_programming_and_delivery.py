@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +13,26 @@ from self_upgrade import SelfUpgradeManager
 
 
 class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_restart_bypasses_model_planning(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.restart_requested = False
+        agent.log_event = Mock()
+        agent._plan_task = AsyncMock(side_effect=AssertionError("restart must not reach model planner"))
+        published = []
+        answer = await agent.chat("请现在重启你自己", answer_ready=published.append)
+        self.assertTrue(agent.restart_requested)
+        self.assertEqual(answer, "好的主人，Home Agent 正在重启。")
+        self.assertEqual(published, [answer])
+        agent._plan_task.assert_not_awaited()
+
+    def test_task_finalization_preserves_direct_restart_flag(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.restart_requested = True
+        agent.self_upgrade = SimpleNamespace(finalize=Mock(return_value=False))
+        agent.log_event = Mock()
+        self.assertTrue(agent.finalize_task_recovery("正在重启"))
+        self.assertTrue(agent.restart_requested)
+
     async def test_answer_is_published_before_tts_finishes(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"home": {"max_context_messages": 4, "auto_speak": True}}
@@ -64,6 +84,39 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [])
         self.assertTrue(any(name == "home_tts_fallback" and data["ok"] for name, data in events))
 
+    async def test_pseudo_tool_call_is_never_spoken(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.tts_execution_lock = __import__("threading").Lock()
+        events = []
+        agent.log_event = lambda name, **data: events.append((name, data))
+        agent._speak_home_unlocked = AsyncMock()
+        result = await agent._speak_home(None, "<tool_call><function=write_text_file><parameter=path>x.py")
+        self.assertEqual(result, [])
+        agent._speak_home_unlocked.assert_not_awaited()
+        self.assertEqual(events[-1][0], "home_tts_skipped_unsafe_content")
+
+    async def test_post_loop_speech_uses_open_fresh_session(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.project = {"tts": {"timeout_seconds": 5}}
+        states = []
+        async def speak(session, text, status=None, ignore_cancel=False):
+            states.append((session.closed, text, ignore_cancel)); return []
+        agent._speak_home = speak
+        await agent._speak_with_fresh_session("任务未完成", ignore_cancel=True)
+        self.assertEqual(states, [(False, "任务未完成", True)])
+
+    async def test_fresh_failure_speech_uses_primary_tts_before_fallback(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.project = {"tts": {"timeout_seconds": 5}}
+        agent.tts_execution_lock = __import__("threading").Lock()
+        agent.log_event = Mock()
+        agent._speak_home_unlocked = AsyncMock(return_value=["gpt-sovits.wav"])
+        agent._windows_sapi_speak = Mock(side_effect=AssertionError("must not fallback when GPT-SoVITS succeeds"))
+        result = await agent._speak_with_fresh_session("任务失败")
+        self.assertEqual(result, ["gpt-sovits.wav"])
+        agent._speak_home_unlocked.assert_awaited_once()
+        agent._windows_sapi_speak.assert_not_called()
+
     async def test_general_text_writer_atomically_creates_external_script(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             agent = HomeAgent.__new__(HomeAgent)
@@ -75,6 +128,12 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SelfProgrammingTests(unittest.TestCase):
+    def test_restart_command_detection_avoids_questions_and_feature_requests(self) -> None:
+        for prompt in ("重启自己", "请现在重启你自己", "重启 HomeAgent", "麻烦重新启动桌宠"):
+            self.assertTrue(HomeAgent.is_restart_request(prompt), prompt)
+        for prompt in ("不要重启自己", "如何重启自己？", "让他能自己重启自己", "完善重启自己的消息处理功能"):
+            self.assertFalse(HomeAgent.is_restart_request(prompt), prompt)
+
     def test_external_bat_request_uses_file_tools_not_ui_or_codex(self) -> None:
         prompt = r"检查 D:\Program\hermes-agent 给hermes 写个一键启动的bat"
         self.assertTrue(HomeAgent._is_file_authoring_request(prompt))
@@ -132,9 +191,21 @@ class SelfProgrammingTests(unittest.TestCase):
             "给 HomeAgent 添加自己写代码的功能",
             "修复你的代码并完成测试",
             "在播放语音的时候就显示消息，不要等语音播完再显示消息",
+            "升级自己的代码，在运行时增加屏幕关怀功能",
+            "完善自动升级功能",
+            "你的直播间欢迎观众功能失效了，检查一下并修复",
         )
         for prompt in prompts:
             self.assertTrue(SelfUpgradeManager.is_upgrade_request(prompt), prompt)
+
+    def test_self_upgrade_finalize_rejects_empty_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {"require_validation": True}})
+            manager.begin("升级自己的代码")
+            with self.assertRaisesRegex(RuntimeError, "没有产生任何代码或配置变更"):
+                manager.finalize("已经完成")
+            self.assertEqual(manager.read()["status"], "validation_failed")
 
     def test_self_programming_requires_real_validated_changes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

@@ -113,6 +113,21 @@ class ChatWorker(QThread):
             self.loop.call_soon_threadsafe(self.task.cancel)
 
 
+class ScreenCareWorker(QThread):
+    cared = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, agent: HomeAgent):
+        super().__init__(); self.agent = agent
+
+    def run(self):
+        try:
+            message = asyncio.run(self.agent.proactive_screen_care())
+            if message: self.cared.emit(message)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MessageBubble(QFrame):
     def __init__(self, role: str, name: str, text: str):
         super().__init__(); mine = role == "user"
@@ -267,6 +282,19 @@ class SettingsDialog(QDialog):
         tabs.addTab(stt_page, "语音识别")
         progress_page=QWidget(); progress_form=QFormLayout(progress_page); progress_cfg=cfg.get("progress_reporting",{}); self.progress_enabled=QCheckBox("长任务自动进行语音进度汇报");self.progress_enabled.setChecked(bool(progress_cfg.get("enabled",True)));self.progress_seconds=QSpinBox();self.progress_seconds.setRange(15,1800);self.progress_seconds.setSuffix(" 秒");self.progress_seconds.setValue(int(progress_cfg.get("long_task_seconds",60)));self.progress_cooldown=QSpinBox();self.progress_cooldown.setRange(30,3600);self.progress_cooldown.setSuffix(" 秒");self.progress_cooldown.setValue(int(progress_cfg.get("tts_cooldown_seconds",90)));self.progress_reports=QSpinBox();self.progress_reports.setRange(0,10);self.progress_reports.setValue(int(progress_cfg.get("max_reports_per_task",3)));progress_form.addRow("进度播报",self.progress_enabled);progress_form.addRow("长任务判定",self.progress_seconds);progress_form.addRow("播报冷却",self.progress_cooldown);progress_form.addRow("单任务最多播报",self.progress_reports);tabs.addTab(progress_page,"任务进度")
         self.progress_enabled.toggled.connect(self.save);self.progress_seconds.valueChanged.connect(self.save);self.progress_cooldown.valueChanged.connect(self.save);self.progress_reports.valueChanged.connect(self.save)
+        care_page = QWidget(); care_form = QFormLayout(care_page); care_form.setContentsMargins(18, 18, 18, 18)
+        care_cfg = cfg.get("screen_care", {})
+        self.screen_care_enabled = QCheckBox("定时观察屏幕并主动问候或关心")
+        self.screen_care_enabled.setChecked(bool(care_cfg.get("enabled", True)))
+        self.screen_care_minutes = QSpinBox(); self.screen_care_minutes.setRange(1, 1440); self.screen_care_minutes.setSuffix(" 分钟")
+        self.screen_care_minutes.setValue(max(1, int(care_cfg.get("interval_seconds", 300)) // 60))
+        care_note = QLabel("保存后立即生效；Home Agent 忙碌时会跳过本轮。截图经 MiMo 分析后立即删除。")
+        care_note.setWordWrap(True); care_note.setObjectName("muted")
+        care_form.addRow("屏幕关怀", self.screen_care_enabled); care_form.addRow("问候频率", self.screen_care_minutes); care_form.addRow("说明", care_note)
+        tabs.addTab(care_page, "屏幕关怀")
+        self.screen_care_enabled.toggled.connect(self._sync_screen_care_controls)
+        self.screen_care_enabled.toggled.connect(self.save); self.screen_care_minutes.valueChanged.connect(self.save)
+        self._sync_screen_care_controls()
         close = QPushButton("完成"); close.setObjectName("primaryButton"); close.clicked.connect(self.accept); root.addWidget(close, 0, Qt.AlignRight)
         upgrade_page = QWidget(); upgrade_form = QFormLayout(upgrade_page); upgrade_cfg = cfg.get("self_upgrade", {})
         self.upgrade_enabled = QCheckBox("允许 Home Agent 编辑和升级自身"); self.upgrade_enabled.setChecked(bool(upgrade_cfg.get("enabled", True)))
@@ -284,6 +312,9 @@ class SettingsDialog(QDialog):
         self.network_restart.setEnabled(enabled)
         self.network_attempts.setEnabled(enabled and self.network_restart.isChecked())
 
+    def _sync_screen_care_controls(self):
+        self.screen_care_minutes.setEnabled(self.screen_care_enabled.isChecked())
+
     def save(self):
         if self._saving: return
         self._saving = True
@@ -297,11 +328,12 @@ class SettingsDialog(QDialog):
             startup = cfg.setdefault("system_startup", {}); startup["enabled"] = self.system_autostart.isChecked(); startup["restart_on_network_failure"] = self.network_restart.isChecked(); startup["max_restart_attempts"] = min(5, self.network_attempts.value())
             stt = cfg.setdefault("stt", {}); stt["mode"] = self.stt_mode.currentText(); stt["api_url"] = self.stt_url.text().strip(); stt["model"] = self.stt_model.text().strip(); stt["language"] = self.stt_language.text().strip() or "auto"
             progress=cfg.setdefault("progress_reporting",{});progress["enabled"]=self.progress_enabled.isChecked();progress["long_task_seconds"]=self.progress_seconds.value();progress["tts_cooldown_seconds"]=self.progress_cooldown.value();progress["max_reports_per_task"]=self.progress_reports.value()
+            care = cfg.setdefault("screen_care", {}); care["enabled"] = self.screen_care_enabled.isChecked(); care["interval_seconds"] = self.screen_care_minutes.value() * 60
             upgrade = cfg.setdefault("self_upgrade", {}); upgrade["enabled"] = self.upgrade_enabled.isChecked(); upgrade["auto_restart"] = self.upgrade_restart.isChecked(); upgrade["require_validation"] = self.upgrade_validation.isChecked(); upgrade["max_restart_attempts"] = self.upgrade_attempts.value()
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
             set_windows_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")
             self._sync_startup_controls()
-            self.agent.config = cfg; self.owner.apply_always_on_top(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
+            self.agent.config = cfg; self.owner.apply_always_on_top(); self.owner.apply_screen_care_settings(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
         except Exception as exc: self.status.setText(f"保存失败：{exc}")
         finally: self._saving = False
 
@@ -322,11 +354,14 @@ class InspectorDialog(QDialog):
 
 class HomeAgentWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
+        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.screen_care_worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
         self.setWindowTitle(f"{self.agent.character_name} · Home Agent"); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window); self.setAttribute(Qt.WA_TranslucentBackground); self.resize(860, 380); self.setMinimumSize(640, 300)
         self._build(); self._connect(); self.apply_always_on_top()
         self.bridge.finished.connect(self._restart_if_requested)
         self.scheduler = QTimer(self); self.scheduler.timeout.connect(self.poll_tasks); self.scheduler.start(10000)
+        care_cfg = self.agent.config.get("screen_care", {})
+        self.screen_care_timer = QTimer(self); self.screen_care_timer.timeout.connect(self.run_screen_care)
+        if care_cfg.get("enabled", True): self.screen_care_timer.start(max(60, int(care_cfg.get("interval_seconds", 300))) * 1000)
         QTimer.singleShot(1800, self.resume_interrupted_task)
 
     def _build(self):
@@ -382,7 +417,7 @@ class HomeAgentWindow(QMainWindow):
 
     def _restart_if_requested(self):
         if self.agent.restart_requested:
-            self.set_status("升级完成，正在重启并继续任务…")
+            self.set_status("正在重启 Home Agent…")
             QTimer.singleShot(800, self.restart_for_upgrade)
 
     def restart_for_upgrade(self):
@@ -427,7 +462,30 @@ class HomeAgentWindow(QMainWindow):
     def apply_always_on_top(self):
         enabled = bool(self.agent.config.get("desktop_pet", {}).get("always_on_top", True)); was_visible = self.isVisible(); self.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
         if was_visible: self.show()
+    def apply_screen_care_settings(self):
+        cfg = self.agent.config.get("screen_care", {})
+        if cfg.get("enabled", True):
+            self.screen_care_timer.start(max(60, int(cfg.get("interval_seconds", 300))) * 1000)
+        else:
+            self.screen_care_timer.stop()
     def poll_tasks(self): threading.Thread(target=lambda: asyncio.run(self.agent.run_due_tasks()), daemon=True).start()
+    def run_screen_care(self):
+        cfg = self.agent.config.get("screen_care", {})
+        if not cfg.get("enabled", True): return
+        if cfg.get("skip_while_busy", True) and self.worker and self.worker.isRunning():
+            self.agent.log_event("proactive_screen_care_skipped", reason="user_task_running"); return
+        if self.screen_care_worker and self.screen_care_worker.isRunning():
+            self.agent.log_event("proactive_screen_care_skipped", reason="previous_run_active"); return
+        self.screen_care_worker = ScreenCareWorker(self.agent)
+        self.screen_care_worker.cared.connect(self._show_screen_care)
+        self.screen_care_worker.failed.connect(lambda error: self.agent.log_event("proactive_screen_care_worker_failed", error=error))
+        self.screen_care_worker.start()
+    def _show_screen_care(self, message):
+        if self.agent.config.get("screen_care", {}).get("show_message", True):
+            self.append_message("assistant", self.agent.character_name, message)
+        if self.pet is not None and self.agent.config.get("screen_care", {}).get("popup_enabled", True):
+            self.pet.show_care_message(message)
+        self.set_status("就绪")
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and event.position().y() <= 56: self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft(); event.accept()
     def mouseMoveEvent(self, event):
@@ -440,6 +498,29 @@ class HomeAgentWindow(QMainWindow):
             try: self.stream.stop(); self.stream.close()
             except Exception: pass
         event.accept()
+
+
+class CareMessagePopup(QFrame):
+    """Non-activating speech bubble shown next to the desktop pet."""
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setObjectName("carePopup")
+        layout = QVBoxLayout(self); layout.setContentsMargins(16, 12, 16, 12)
+        self.message = QLabel(); self.message.setObjectName("carePopupText"); self.message.setWordWrap(True); self.message.setFixedWidth(280)
+        layout.addWidget(self.message)
+        self.hide_timer = QTimer(self); self.hide_timer.setSingleShot(True); self.hide_timer.timeout.connect(self.hide)
+
+    def show_message(self, text: str, anchor: QWidget, duration_seconds: int = 12):
+        self.message.setText(str(text)); self.adjustSize()
+        screen = anchor.screen().availableGeometry(); gap = 8
+        x = anchor.x() - self.width() - gap
+        if x < screen.left(): x = anchor.x() + anchor.width() + gap
+        y = anchor.y() + max(0, (anchor.height() - self.height()) // 2)
+        x = max(screen.left() + gap, min(x, screen.right() - self.width() - gap))
+        y = max(screen.top() + gap, min(y, screen.bottom() - self.height() - gap))
+        self.move(x, y); self.show(); self.raise_()
+        self.hide_timer.start(max(3, int(duration_seconds)) * 1000)
 
 
 class DesktopPetWindow(QWidget):
@@ -456,7 +537,12 @@ class DesktopPetWindow(QWidget):
         else: self.image.setText("◉‿◉"); self.image.setStyleSheet("font-size:42px;color:#16766F;background:#E7F4F1;border-radius:70px;")
         self.menu = QMenu(self)
         self.menu.addAction("打开对话", self.toggle_chat); self.menu.addAction("停止当前任务", chat.stop_task); self.menu.addSeparator(); self.menu.addAction("日志与上下文", chat.open_inspector); self.menu.addAction("设置", chat.open_settings); self.menu.addSeparator(); self.menu.addAction("退出 Home Agent", self.quit_agent)
+        self.care_popup = CareMessagePopup()
         self.restore_position()
+
+    def show_care_message(self, message: str):
+        duration = int(self.chat.agent.config.get("screen_care", {}).get("popup_duration_seconds", 12))
+        self.care_popup.show_message(message, self, duration)
 
     def restore_position(self):
         cfg = self.chat.agent.config.get("desktop_pet", {}); screen = QApplication.primaryScreen().availableGeometry()
@@ -495,7 +581,7 @@ class DesktopPetWindow(QWidget):
         except OSError: pass
 
     def quit_agent(self):
-        self.save_position(); self.chat.force_quit = True; self.chat.close(); QApplication.quit()
+        self.care_popup.close(); self.save_position(); self.chat.force_quit = True; self.chat.close(); QApplication.quit()
 
 
 STYLE = f"""
@@ -508,6 +594,7 @@ QMainWindow {{ background: transparent; }}
 QScrollArea {{ background: {COLORS['window']}; }} QScrollArea > QWidget > QWidget {{ background: {COLORS['window']}; }}
 #bubbleAgent {{ background: {COLORS['panel']}; border: 1px solid {COLORS['line']}; border-radius: 15px; }} #bubbleUser {{ background: {COLORS['accent']}; border-radius: 15px; }} #bubbleError {{ background: #FFF0EF; border: 1px solid #F5C9C7; border-radius: 15px; }}
 #bubbleUser QLabel {{ color: white; }} #bubbleName {{ font-size: 11px; font-weight: 700; color: {COLORS['muted']}; }} #bubbleText {{ font-size: 14px; }}
+#carePopup {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 16px; }} #carePopupText {{ color: {COLORS['ink']}; font-size: 14px; }}
 #progressCard {{ background: #F7F9F9; border: 1px solid #DFE7E7; border-radius: 12px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #FAFBFB; border-color: #E4EAEA; }} #progressToggle {{ min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #526568; font-size: 19px; font-weight: 500; }} #progressToggle:hover {{ background: #E7EFEE; color: #16766F; }} #progressTitle {{ color: #263638; font-size: 13px; font-weight: 700; }} #progressSummary {{ color: #657578; font-size: 12px; }} #progressElapsed {{ color: #809093; font-size: 11px; }} #progressDetails {{ border-top: 1px solid #E4EAEA; }} #progressCurrent {{ color: #34484B; font-size: 12px; }} #progressDone {{ color: #657578; font-size: 12px; }}
 #composer {{ background: {COLORS['panel']}; border-top: 1px solid {COLORS['line']}; border-bottom-left-radius: 22px; border-bottom-right-radius: 22px; }}
 #input, QLineEdit, QComboBox, QTextBrowser {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 12px; padding: 10px; selection-background-color: {COLORS['accent']}; }} #input:focus, QLineEdit:focus {{ border: 1px solid {COLORS['accent']}; }}

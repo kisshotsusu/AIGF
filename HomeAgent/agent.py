@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -90,7 +91,8 @@ class HomeAgent:
         self.self_upgrade.progress(current, completed)
 
     def finalize_task_recovery(self, answer: str) -> bool:
-        self.restart_requested = self.self_upgrade.finalize(answer)
+        direct_restart = self.restart_requested
+        self.restart_requested = direct_restart or self.self_upgrade.finalize(answer)
         self.log_event("task_recovery_finalized", restart_requested=self.restart_requested)
         return self.restart_requested
 
@@ -1557,7 +1559,24 @@ class HomeAgent:
             else: chunks.append(piece)
         return chunks or ([normalized] if normalized else [])
 
+    @staticmethod
+    def _contains_unexecuted_tool_markup(text: str) -> bool:
+        value = str(text or "")
+        return bool(re.search(r"<\s*(?:tool_call|function\s*=|parameter\s*=|/\s*tool_call)", value, re.I))
+
+    @classmethod
+    def _answer_is_speakable(cls, text: str) -> bool:
+        value = str(text or "").strip()
+        if not value or cls._contains_unexecuted_tool_markup(value):
+            return False
+        if "```" in value or (len(value) > 500 and re.search(r"(?m)^\s*(?:from|import|class|def)\s+", value)):
+            return False
+        return True
+
     async def _speak_home(self, session: aiohttp.ClientSession, text: str, status=None, ignore_cancel: bool = False) -> list[str]:
+        if not self._answer_is_speakable(text):
+            self.log_event("home_tts_skipped_unsafe_content", reason="tool_markup_or_code", chars=len(str(text or "")))
+            return []
         await asyncio.to_thread(self.tts_execution_lock.acquire)
         try:
             try:
@@ -1572,6 +1591,12 @@ class HomeAgent:
                 return []
         finally:
             self.tts_execution_lock.release()
+
+    async def _speak_with_fresh_session(self, text: str, status=None, ignore_cancel: bool = False) -> list[str]:
+        """Speak after a previous tool-loop HTTP session has already left its context manager."""
+        timeout = aiohttp.ClientTimeout(total=int(self.project.get("tts", {}).get("timeout_seconds", 60)) + 30)
+        async with aiohttp.ClientSession(timeout=timeout) as speech_session:
+            return await self._speak_home(speech_session, text, status, ignore_cancel=ignore_cancel)
 
     @staticmethod
     def _windows_sapi_speak(text: str) -> bool:
@@ -1657,12 +1682,78 @@ class HomeAgent:
         except Exception as exc:
             self.log_event("task_progress_speech_failed", error=str(exc))
 
+    async def proactive_screen_care(self) -> str:
+        """Capture the primary screen once, let MiMo compose a privacy-safe caring line, then discard it."""
+        cfg = self.config.get("screen_care", {})
+        if not cfg.get("enabled", True):
+            return ""
+        screenshot: Path | None = None
+        try:
+            from PIL import ImageGrab
+
+            with tempfile.NamedTemporaryFile(prefix="home-agent-screen-", suffix=".png", delete=False) as handle:
+                screenshot = Path(handle.name)
+            image = await asyncio.to_thread(ImageGrab.grab, all_screens=bool(cfg.get("all_screens", False)))
+            await asyncio.to_thread(image.convert("RGB").save, screenshot, "PNG")
+            prompt = (
+                "你是家庭桌宠，请观察当前屏幕，用一句自然、温柔、不过度打扰的中文向主人问候或关心。"
+                "可以结合正在进行的活动（如工作、学习、娱乐）提醒休息、喝水或鼓励，但不要复述屏幕上的姓名、"
+                "账号、聊天、文件内容、密码、验证码、金额等隐私信息，也不要假装知道画面之外的情况。"
+                f"只输出一句话，不要解释，不要Markdown，最多{max(12, int(cfg.get('max_chars', 42)))}个汉字。"
+            )
+            timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                result = await self.mimo_multimodal.analyze_image(session, screenshot, prompt)
+                message = re.sub(r"\s+", " ", str(result.get("text") or "")).strip().strip('"“”')
+                if not message:
+                    return ""
+                message = message[:max(12, int(cfg.get("max_chars", 42)))]
+                if cfg.get("speak", True) and self.config.get("home", {}).get("auto_speak", True):
+                    await self._speak_home(session, message, None, ignore_cancel=True)
+                self.log_event("proactive_screen_care", model=result.get("model"), message=message)
+                return message
+        except Exception as exc:
+            self.log_event("proactive_screen_care_failed", error=str(exc))
+            return ""
+        finally:
+            if screenshot:
+                try:
+                    screenshot.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.log_event("proactive_screen_cleanup_failed", error=str(exc))
+
     @staticmethod
     def _publish_answer(answer: str, answer_ready=None) -> None:
         if answer_ready and str(answer or "").strip():
             answer_ready(str(answer).strip())
 
+    @staticmethod
+    def is_restart_request(text: str) -> bool:
+        """Recognize direct restart commands without routing capability questions to the LLM."""
+        value = re.sub(r"[\s，。！？、,.!?;；:：]+", "", str(text or "")).lower()
+        if not value or any(word in value for word in ("不要重启", "别重启", "停止重启", "取消重启")):
+            return False
+        if any(word in value for word in ("如何", "怎么", "为什么", "能不能", "能否", "是否", "可以吗", "会不会")):
+            return False
+        if any(word in value for word in ("功能", "支持", "实现", "增加", "添加", "修改", "完善", "代码", "消息", "识别", "处理")):
+            return False
+        exact = {
+            "重启", "重新启动", "重启自己", "自己重启", "重启你自己", "你重启自己",
+            "重启homeagent", "重新启动homeagent", "重启桌宠", "重新启动桌宠",
+        }
+        if value in exact:
+            return True
+        has_target = any(word in value for word in ("重启自己", "重启你自己", "重启homeagent", "重启桌宠", "重新启动自己", "重新启动homeagent", "重新启动桌宠"))
+        imperative = value.startswith(("请", "麻烦", "现在", "立即", "马上", "帮我")) or value.endswith(("吧", "一下"))
+        return has_target and imperative
+
     async def chat(self, text: str, status=None, confirm=None, answer_ready=None) -> str:
+        if self.is_restart_request(text):
+            answer = "好的主人，Home Agent 正在重启。"
+            self.restart_requested = True
+            self.log_event("direct_restart_requested", message=text)
+            self._publish_answer(answer, answer_ready)
+            return answer
         self._acknowledge_common_response(text)
         max_context = int(self.config["home"].get("max_context_messages", 30))
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
@@ -1871,7 +1962,13 @@ class HomeAgent:
             completion_evidence: list[dict[str, Any]] = []
             completion_check_failures = 0
             local_code_verified = False
-            for round_index in range(int(self.config["agent"].get("max_tool_rounds", 8))):
+            max_failed_rounds = max(1, int(self.config["agent"].get("max_tool_rounds", 8)))
+            max_tool_iterations = max(max_failed_rounds, int(self.config["agent"].get("max_tool_iterations", max_failed_rounds * 4)))
+            failed_rounds = 0
+            for round_index in range(max_tool_iterations):
+                if failed_rounds >= max_failed_rounds:
+                    break
+                round_failed = False
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
                 payload = {"model": provider["model"], "messages": messages, "tools": self._tools(), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
@@ -1884,7 +1981,19 @@ class HomeAgent:
                 calls = choice.get("tool_calls") or []
                 if not calls:
                     answer = (choice.get("content") or "").strip()
+                    if self._contains_unexecuted_tool_markup(answer):
+                        failed_rounds += 1
+                        self.log_event("unexecuted_tool_markup_rejected", answer=answer, round=round_index)
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "你刚才把工具调用写进了普通文本，因此它没有执行。禁止输出 <tool_call>、<function=> 或 "
+                                "<parameter=> 标签；请通过 API 的结构化 tool_calls 字段调用当前可用工具。"
+                            ),
+                        })
+                        continue
                     if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True) and not local_code_verified:
+                        failed_rounds += 1
                         self.log_event("unverified_local_code_answer_rejected", answer=answer, round=round_index)
                         messages.append({"role": "system", "content": "代码任务还没有通过本地验证。继续调用本地 code_* 工具实际写入代码，最后调用 code_validate_project；没有 ok=true 的测试证据不得回答完成。"})
                         continue
@@ -1895,15 +2004,18 @@ class HomeAgent:
                         and bool(task_plan.get("final_action_requires_verification") or task_plan.get("operation") == "play")
                     )
                     if requires_automated_media_proof and not (automated_media_target_verified or media_target_preexisting):
+                        failed_rounds += 1
                         self.log_event("unproven_media_success_rejected", answer=answer, query=task_plan.get("query"))
                         messages.append({"role": "system", "content": "当前目标播放尚无自动化归因证据。不要依据用户手动操作后的画面报告成功；继续执行精确自动双击。只有 ui_double_click_window 自身返回的 after_title 包含目标 query，才可完成。"})
                         continue
                     requires_bilibili_favorite_proof = task_plan.get("handler") == "bilibili_favorites"
                     if requires_bilibili_favorite_proof and not bilibili_favorite_verified:
+                        failed_rounds += 1
                         self.log_event("unproven_bilibili_favorite_success_rejected", answer=answer, task_plan=task_plan)
                         messages.append({"role": "system", "content": "B站收藏夹任务尚未取得受验证结果。立即调用 bilibili_open_favorite_video；只有返回 ok=true、used_existing_browser=true、BV号以及匹配的收藏夹序号后才能完成。"})
                         continue
                     if task_plan.get("actionable") and round_index == 0:
+                        failed_rounds += 1
                         self.log_event("premature_answer_rejected", answer=answer, task_plan=task_plan)
                         messages.append({"role": "system", "content": "这是需要实际执行的操作任务，但你尚未调用任何工具。不要只描述步骤或声称完成；立即选择合适工具执行，并在获得终态证据后回答。"})
                         continue
@@ -1925,6 +2037,7 @@ class HomeAgent:
                         self.log_event("mimo_completion_check", result=verification, evidence_count=len(completion_evidence), round=round_index)
                         if not verification.get("passed"):
                             completion_check_failures += 1
+                            failed_rounds += 1
                             reason = str(verification.get("reason") or "完成证据不足")
                             if status: status(f"完成检查未通过：{reason[:100]}；正在继续修正…")
                             if completion_check_failures <= int(self.mimo_multimodal.config.get("completion_max_retries", 2)):
@@ -1948,10 +2061,12 @@ class HomeAgent:
                     result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
                     completion_evidence.append({"tool": name, "result": result})
                     if isinstance(result, dict) and result.get("status") == "failed":
+                        round_failed = True
                         failure_reason = str(result.get("error") or result.get("reason") or "未知原因")
                         tool_failures.append({"tool": name, "reason": failure_reason[:500]})
                         if status: status(f"步骤失败：{name}：{failure_reason[:120]}；正在判断重试方案…")
                     elif isinstance(result, dict) and result.get("status") == "uncertain":
+                        round_failed = True
                         uncertain_reason = str(result.get("warning") or result.get("next_action") or "操作后画面没有明显变化")
                         tool_failures.append({"tool": name, "reason": uncertain_reason[:500]})
                         if status: status(f"操作尚未确认：{uncertain_reason[:120]}；正在重新识别或更换操作方式…")
@@ -2006,13 +2121,16 @@ class HomeAgent:
                     self.log_event("tool_completed", tool=name, result=result)
                     if status: status(f"已完成：工具 {name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
+                if round_failed:
+                    failed_rounds += 1
         failure_summary = "；".join(f"{row['tool']}：{row['reason']}" for row in tool_failures[-6:])
-        rounds = int(self.config["agent"].get("max_tool_rounds", 8))
+        rounds = failed_rounds
+        iteration_limit_reached = round_index + 1 >= max_tool_iterations and failed_rounds < max_failed_rounds
         last_reason = tool_failures[-1]["reason"] if tool_failures else "执行过程中始终没有取得可验证的完成证据"
         if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True) and self.config.get("agent", {}).get("codex_code_fallback", True) and self._codex_config().get("enabled", False):
             if status: status("本地代码工具未能完成验证，正在低优先级尝试 Codex 后备…")
-            self.log_event("local_code_fallback_to_codex", reason=last_reason, rounds=rounds)
-            result = await self._run_codex_task(text, require_mcp=False, status=status, task_plan=task_plan, previous_failure=f"HomeAgent 本地代码工具在 {rounds} 轮内未完成：{failure_summary or last_reason}")
+            self.log_event("local_code_fallback_to_codex", reason=last_reason, failed_rounds=rounds, iterations=round_index + 1)
+            result = await self._run_codex_task(text, require_mcp=False, status=status, task_plan=task_plan, previous_failure=f"HomeAgent 本地代码工具累计失败 {rounds} 轮后仍未完成：{failure_summary or last_reason}")
             if result.get("error"):
                 answer = f"本地代码工具未能完成验证，Codex 后备也失败了：{result['error']}"
             else:
@@ -2020,15 +2138,16 @@ class HomeAgent:
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
             self._publish_answer(answer, answer_ready)
             if self.config["home"].get("auto_speak", True):
-                await self._speak_home(session, answer, status, ignore_cancel=True)
+                await self._speak_with_fresh_session(answer, status, ignore_cancel=True)
             return answer
-        answer = f"这次任务在尝试 {rounds} 轮后仍未完成，我已经停下来了。最后失败原因是：{last_reason[:180]}。没有把未验证的操作当作成功。"
-        self.log_event("tool_round_limit_reached", rounds=rounds, failures=tool_failures, failure_summary=failure_summary, answer=answer)
+        limit_reason = f"达到总迭代安全上限 {max_tool_iterations} 次" if iteration_limit_reached else f"累计失败 {rounds} 轮"
+        answer = f"这次任务在{limit_reason}后仍未完成，我已经停下来了。最后失败原因是：{last_reason[:180]}。没有把未验证的操作当作成功。"
+        self.log_event("tool_round_limit_reached", failed_rounds=rounds, iterations=round_index + 1, max_failed_rounds=max_failed_rounds, max_tool_iterations=max_tool_iterations, failures=tool_failures, failure_summary=failure_summary, answer=answer)
         if status: status(f"任务失败：{last_reason[:120]}")
         self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
         self._publish_answer(answer, answer_ready)
         if self.config["home"].get("auto_speak", True):
-            await self._speak_home(session, answer, status, ignore_cancel=True)
+            await self._speak_with_fresh_session(answer, status, ignore_cancel=True)
         return answer
 
     async def _run_tool(self, name: str, args: dict[str, Any], confirm=None, status=None) -> Any:

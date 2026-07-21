@@ -79,7 +79,11 @@ class SelfUpgradeManager:
         changed = self.changed_files()
         state["changed_files"] = sorted(set(state.get("changed_files", [])) | set(changed))
         state["last_answer"] = str(answer)[:4000]
-        validation = self._validate(changed)
+        validation = (
+            self.code_editor.validate_current_changes(require_changes=True)
+            if state.get("is_self_upgrade")
+            else self._validate(changed)
+        )
         state["validation"] = validation
         if not validation.get("ok"):
             state.update({"status": "validation_failed", "updated_at": datetime.now().isoformat(timespec="seconds")})

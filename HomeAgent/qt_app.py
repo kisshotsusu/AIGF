@@ -37,6 +37,153 @@ COLORS = {
 }
 
 
+class WakeWordListener(QThread):
+    """Background thread that listens for wake words and triggers recording.
+    
+    Uses a two-stage approach:
+    1. Energy-based voice activity detection (low CPU)
+    2. Full STT transcription only when voice is detected
+    """
+    wake_detected = Signal(str)  # Emits the command after wake word
+    
+    def __init__(self, agent, parent=None):
+        super().__init__(parent)
+        self.agent = agent
+        self.running = False
+        self.stream = None
+        self.buffer = []
+        self.buffer_duration = 2.0  # seconds of audio to keep in buffer
+        self.sample_rate = 16000
+        self.channels = 1
+        self.energy_threshold = int(self.agent.config.get('prompt_wake', {}).get('energy_threshold', 50))
+        self.silence_timeout = 1.5  # seconds of silence before processing
+        self.cooldown_after_detect = 3.0  # seconds to wait after detection
+        self.last_detection_time = 0
+        
+    def run(self):
+        """Main listener loop."""
+        self.running = True
+        cfg = self.agent.config.get("microphone", {})
+        device_id = cfg.get("device_id")
+        self.sample_rate = cfg.get("sample_rate", 16000)
+        self.channels = cfg.get("channels", 1)
+        
+        # Buffer to hold recent audio
+        max_frames = int(self.buffer_duration * self.sample_rate / 1024)
+        silence_frames = 0
+        frames_needed = int(self.silence_timeout * self.sample_rate / 1024)
+        is_speaking = False
+        
+        def audio_callback(indata, frames, time_info, status):
+            if self.running:
+                self.buffer.append(indata.copy())
+                if len(self.buffer) > max_frames:
+                    self.buffer.pop(0)
+        
+        try:
+            self.stream = sd.InputStream(
+                device=device_id,
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="int16",
+                callback=audio_callback,
+                blocksize=1024
+            )
+            self.stream.start()
+            self.agent.log_event("wake_listener_started", device=device_id)
+            
+            while self.running:
+                time.sleep(0.1)  # Check every 100ms
+                
+                # Cooldown check
+                if time.time() - self.last_detection_time < self.cooldown_after_detect:
+                    continue
+                
+                if len(self.buffer) < 2:
+                    continue
+                
+                # Calculate energy of recent audio
+                recent_audio = np.concatenate(self.buffer[-2:], axis=0)
+                energy = np.abs(recent_audio.astype(float)).mean()
+                
+                if energy > self.energy_threshold:
+                    # Voice detected
+                    silence_frames = 0
+                    if not is_speaking:
+                        is_speaking = True
+                        self.agent.log_event("wake_listener_voice_started", energy=float(energy))
+                else:
+                    # Silence
+                    if is_speaking:
+                        silence_frames += 1
+                        if silence_frames >= frames_needed:
+                            # Speech ended, process the buffer
+                            is_speaking = False
+                            silence_frames = 0
+                            self._process_audio()
+                            
+        except Exception as e:
+            self.agent.log_event("wake_listener_error", error=str(e))
+        finally:
+            if self.stream:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except:
+                    pass
+            self.agent.log_event("wake_listener_stopped")
+                
+    def _process_audio(self):
+        """Process buffered audio for wake word detection."""
+        if len(self.buffer) < 3:  # Need at least ~1.5 seconds
+            return
+            
+        # Concatenate audio
+        audio_data = np.concatenate(self.buffer, axis=0)
+        self.buffer.clear()
+        
+        # Save to temp file
+        temp_path = HOME_AGENT / "recordings" / "wake_temp.wav"
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with wave.open(str(temp_path), "wb") as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(2)
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(audio_data.tobytes())
+        except Exception as e:
+            self.agent.log_event("wake_listener_save_error", error=str(e))
+            return
+        
+        # Transcribe
+        try:
+            text = asyncio.run(self.agent.transcribe(temp_path))
+            if not text:
+                return
+                
+            self.agent.log_event("wake_listener_transcribed", text=text)
+            
+            # Check for wake words
+            is_wake, command = self.agent.detect_wake_word(text)
+            if is_wake and command:
+                self.last_detection_time = time.time()
+                self.agent.log_event("wake_word_detected", text=text, command=command)
+                self.wake_detected.emit(command)
+        except Exception as e:
+            self.agent.log_event("wake_listener_transcribe_error", error=str(e))
+        finally:
+            # Clean up temp file
+            try:
+                temp_path.unlink(missing_ok=True)
+            except:
+                pass
+                    
+    def stop(self):
+        """Stop the listener."""
+        self.running = False
+        self.wait(3000)
+
+
 class Bridge(QObject):
     answer = Signal(str)
     error = Signal(str)
@@ -282,11 +429,18 @@ class SettingsDialog(QDialog):
         self.wake_auto_send = QCheckBox("唤醒后自动发送命令"); self.wake_auto_send.setChecked(bool(wake_cfg.get("auto_send_after_wake", True)))
         self.wake_confirmation = QCheckBox("唤醒时播放确认音"); self.wake_confirmation.setChecked(bool(wake_cfg.get("wake_confirmation_sound", True)))
         self.wake_timeout = QSpinBox(); self.wake_timeout.setRange(5, 60); self.wake_timeout.setSuffix(" 秒"); self.wake_timeout.setValue(int(wake_cfg.get("wake_timeout_seconds", 10)))
+        self.wake_energy = QSpinBox(); self.wake_energy.setRange(10, 500); self.wake_energy.setSuffix(" (越小越灵敏)"); self.wake_energy.setValue(int(wake_cfg.get("energy_threshold", 50)))
         self.wake_words_input = QLineEdit(); self.wake_words_input.setPlaceholderText("输入唤醒词，用逗号分隔"); self.wake_words_input.setText(", ".join(wake_cfg.get("wake_words", ["苏苏", "小助手"])))
         wake_note = QLabel("启用后，语音输入以唤醒词开头时会自动提取后面的命令并执行。例如：苏苏，打开浏览器")
         wake_note.setWordWrap(True); wake_note.setObjectName("muted")
-        wake_form.addRow("启用唤醒", self.wake_enabled); wake_form.addRow("自动发送", self.wake_auto_send); wake_form.addRow("确认音", self.wake_confirmation); wake_form.addRow("唤醒超时", self.wake_timeout); wake_form.addRow("唤醒词列表", self.wake_words_input); wake_form.addRow("说明", wake_note)
+        wake_form.addRow("启用唤醒", self.wake_enabled); wake_form.addRow("自动发送", self.wake_auto_send); wake_form.addRow("确认音", self.wake_confirmation); wake_form.addRow("唤醒超时", self.wake_timeout); wake_form.addRow("灵敏度", self.wake_energy); wake_form.addRow("唤醒词列表", self.wake_words_input); wake_form.addRow("说明", wake_note)
         self.wake_enabled.toggled.connect(self._sync_wake_controls)
+        self.wake_enabled.toggled.connect(self.defer_save)
+        self.wake_auto_send.toggled.connect(self.defer_save)
+        self.wake_confirmation.toggled.connect(self.defer_save)
+        self.wake_timeout.valueChanged.connect(self.defer_save)
+        self.wake_energy.valueChanged.connect(self.defer_save)
+        self.wake_words_input.textChanged.connect(self.defer_save)
         self._sync_wake_controls()
         tabs.addTab(wake_page, "唤醒")
         self.shell_enabled.toggled.connect(self.save); self.cmd_enabled.toggled.connect(self.save); self.shell_confirm.toggled.connect(self.save); self.shell_timeout.valueChanged.connect(self.save)
@@ -339,6 +493,7 @@ class SettingsDialog(QDialog):
         self.wake_auto_send.setEnabled(enabled)
         self.wake_confirmation.setEnabled(enabled)
         self.wake_timeout.setEnabled(enabled)
+        self.wake_energy.setEnabled(enabled)
         self.wake_words_input.setEnabled(enabled)
 
     def save(self):
@@ -356,11 +511,11 @@ class SettingsDialog(QDialog):
             progress=cfg.setdefault("progress_reporting",{});progress["enabled"]=self.progress_enabled.isChecked();progress["long_task_seconds"]=self.progress_seconds.value();progress["tts_cooldown_seconds"]=self.progress_cooldown.value();progress["max_reports_per_task"]=self.progress_reports.value()
             care = cfg.setdefault("screen_care", {}); care["enabled"] = self.screen_care_enabled.isChecked(); care["interval_seconds"] = self.screen_care_minutes.value() * 60
             upgrade = cfg.setdefault("self_upgrade", {}); upgrade["enabled"] = self.upgrade_enabled.isChecked(); upgrade["auto_restart"] = self.upgrade_restart.isChecked(); upgrade["require_validation"] = self.upgrade_validation.isChecked(); upgrade["max_restart_attempts"] = self.upgrade_attempts.value()
-            wake = cfg.setdefault("prompt_wake", {}); wake["enabled"] = self.wake_enabled.isChecked(); wake["auto_send_after_wake"] = self.wake_auto_send.isChecked(); wake["wake_confirmation_sound"] = self.wake_confirmation.isChecked(); wake["wake_timeout_seconds"] = self.wake_timeout.value(); wake["wake_words"] = [w.strip() for w in self.wake_words_input.text().split(",") if w.strip()]
+            wake = cfg.setdefault("prompt_wake", {}); wake["enabled"] = self.wake_enabled.isChecked(); wake["auto_send_after_wake"] = self.wake_auto_send.isChecked(); wake["wake_confirmation_sound"] = self.wake_confirmation.isChecked(); wake["wake_timeout_seconds"] = self.wake_timeout.value(); wake["energy_threshold"] = self.wake_energy.value(); wake["wake_words"] = [w.strip() for w in self.wake_words_input.text().split(",") if w.strip()]
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
             set_windows_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")
             self._sync_startup_controls()
-            self.agent.config = cfg; self.owner.apply_always_on_top(); self.owner.apply_screen_care_settings(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
+            self.agent.config = cfg; self.owner.apply_always_on_top(); self.owner.apply_screen_care_settings(); self.owner.apply_wake_listener_settings(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
         except Exception as exc: self.status.setText(f"保存失败：{exc}")
         finally: self._saving = False
 
@@ -390,6 +545,10 @@ class HomeAgentWindow(QMainWindow):
         self.screen_care_timer = QTimer(self); self.screen_care_timer.timeout.connect(self.run_screen_care)
         if care_cfg.get("enabled", True): self.screen_care_timer.start(max(60, int(care_cfg.get("interval_seconds", 300))) * 1000)
         QTimer.singleShot(1800, self.resume_interrupted_task)
+        
+        # Initialize wake word listener
+        self.wake_listener = None
+        self._start_wake_listener()
 
     def _build(self):
         shell = QFrame(); shell.setObjectName("shell"); self.setCentralWidget(shell)
@@ -541,6 +700,34 @@ class HomeAgentWindow(QMainWindow):
     def mouseMoveEvent(self, event):
         if self.drag_pos is not None and event.buttons() & Qt.LeftButton: self.move(event.globalPosition().toPoint() - self.drag_pos); event.accept()
     def mouseReleaseEvent(self, event): self.drag_pos = None
+    def _start_wake_listener(self):
+        """Start the wake word listener if enabled."""
+        if self.agent.is_prompt_wake_enabled() and not self.wake_listener:
+            self.wake_listener = WakeWordListener(self.agent, self)
+            self.wake_listener.wake_detected.connect(self._on_wake_detected)
+            self.wake_listener.start()
+            self.agent.log_event("wake_listener_started")
+            
+    def _stop_wake_listener(self):
+        """Stop the wake word listener."""
+        if self.wake_listener:
+            self.wake_listener.stop()
+            self.wake_listener = None
+            self.agent.log_event("wake_listener_stopped")
+            
+    def _on_wake_detected(self, command):
+        """Handle wake word detection."""
+        self.append_message("user", self.agent.config.get("home", {}).get("user_name", "主人"), f"[唤醒] {command}")
+        self.set_status("唤醒词已检测到，正在处理…")
+        self._start_task(command)
+        
+    def apply_wake_listener_settings(self):
+        """Apply wake listener settings changes."""
+        if self.agent.is_prompt_wake_enabled():
+            self._start_wake_listener()
+        else:
+            self._stop_wake_listener()
+
     def closeEvent(self, event):
         if self.pet is not None and not self.force_quit:
             self.hide(); event.ignore(); return

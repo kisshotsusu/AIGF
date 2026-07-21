@@ -13,6 +13,25 @@ from self_upgrade import SelfUpgradeManager
 
 
 class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_reminder_is_published_before_tts(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        task = {"id": "r1", "action": "tts", "message": "该喝水了", "reminder_attempts": 0}
+        agent.task_store = SimpleNamespace(
+            claim_due=lambda: [task],
+            finish=lambda *_: {"status": "waiting_ack"},
+        )
+        agent.run_context_maintenance = AsyncMock(return_value=None)
+        agent.log_event = Mock()
+        order: list[str] = []
+
+        async def speak(*_args, **_kwargs):
+            order.append("tts")
+            return ["reminder.wav"]
+
+        agent._speak_home = speak
+        await agent.run_due_tasks(lambda _message: order.append("message"))
+        self.assertEqual(["message", "tts"], order)
+
     async def test_direct_restart_bypasses_model_planning(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.restart_requested = False
@@ -28,10 +47,12 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def test_task_finalization_preserves_direct_restart_flag(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.restart_requested = True
-        agent.self_upgrade = SimpleNamespace(finalize=Mock(return_value=False))
+        agent.self_upgrade = SimpleNamespace(finalize=Mock(return_value=False), clear=Mock())
         agent.log_event = Mock()
         self.assertTrue(agent.finalize_task_recovery("正在重启"))
         self.assertTrue(agent.restart_requested)
+        agent.self_upgrade.clear.assert_called_once()
+        agent.self_upgrade.finalize.assert_not_called()
 
     async def test_answer_is_published_before_tts_finishes(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
@@ -173,6 +194,42 @@ class SelfProgrammingTests(unittest.TestCase):
         self.assertFalse(agent._should_route_to_codex("创建一个独立的 Python 记账项目并测试"))
         self.assertTrue(agent._should_route_to_codex("明确调用 Codex 创建一个独立 Python 项目"))
 
+    def test_development_document_inspection_is_not_misclassified_as_new_project(self) -> None:
+        prompt = r"你自己的项目路径在 E:\Doc\AIAgent，检查开发文档"
+        self.assertFalse(CodeEditorModule.is_independent_project_request(prompt))
+        self.assertFalse(CodeEditorModule.is_code_task(prompt))
+
+    def test_screen_care_reply_is_not_misclassified_as_code_task(self) -> None:
+        care = "主人，写代码累了吧？记得喝口水，让眼睛也休息一下哦。回复 模糊语义 号"
+        self.assertFalse(CodeEditorModule.is_code_edit_request(care))
+        self.assertFalse(CodeEditorModule.is_code_task(care))
+        self.assertTrue(CodeEditorModule.is_code_task(care + " 请修复 HomeAgent 的路由错误"))
+
+    def test_code_read_tools_allow_absolute_paths_when_full_access_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as root_folder, tempfile.TemporaryDirectory() as external_folder:
+            root = Path(root_folder); home = root / "HomeAgent"; home.mkdir()
+            external = Path(external_folder); source = external / "sample.py"; source.write_text("VALUE = 7\n", encoding="utf-8")
+            module = CodeEditorModule(root, home, allow_external_read=True, allow_external_write=True)
+            self.assertEqual(module.read_file(str(source))["content"], "VALUE = 7\n")
+            self.assertIn(str(source), module.list_files(str(external))["files"])
+            self.assertEqual(module.search_text("VALUE", str(external))["matches"][0]["path"], str(source))
+            module.begin_tracking()
+            result = module.write_file(str(source), "VALUE = 8\n", self_edit=True)
+            self.assertEqual("VALUE = 8\n", source.read_text(encoding="utf-8"))
+            self.assertEqual(str(source), result["path"])
+            self.assertIn(str(source), module.changed_files())
+            self.assertTrue(module.validate_files(module.changed_files())["ok"])
+
+    def test_code_read_tools_reject_unapproved_absolute_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as root_folder, tempfile.TemporaryDirectory() as external_folder:
+            root = Path(root_folder); home = root / "HomeAgent"; home.mkdir()
+            source = Path(external_folder) / "sample.py"; source.write_text("VALUE = 7\n", encoding="utf-8")
+            module = CodeEditorModule(root, home)
+            with self.assertRaisesRegex(ValueError, "绝对路径不在代码读取权限范围"):
+                module.read_file(str(source))
+            with self.assertRaises(ValueError):
+                module.write_file(str(source), "VALUE = 9\n", self_edit=True)
+
     def test_code_tool_surface_hides_codex_during_local_code_task(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = True
@@ -206,6 +263,57 @@ class SelfProgrammingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "没有产生任何代码或配置变更"):
                 manager.finalize("已经完成")
             self.assertEqual(manager.read()["status"], "validation_failed")
+
+    def test_completed_task_removes_recovery_file(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {"require_validation": True}})
+            manager.begin("普通聊天任务")
+            self.assertTrue(manager.path.exists())
+            self.assertFalse(manager.finalize("完成"))
+            self.assertFalse(manager.path.exists())
+            self.assertEqual(manager.resume_prompt(), "")
+
+    def test_completed_upgrade_restart_does_not_repeat_original_task(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            source = home / "sample.py"; source.write_text("value = 1\n", encoding="utf-8")
+            docs = root / "AI Read"; docs.mkdir(); doc = docs / "06_CURRENT_STATE.md"; doc.write_text("before\n", encoding="utf-8")
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {"require_validation": True, "enabled": True, "auto_restart": True}})
+            manager.begin("升级自己的代码")
+            source.write_text("value = 2\n", encoding="utf-8"); doc.write_text("after\n", encoding="utf-8")
+            self.assertTrue(manager.finalize("升级完成"))
+            self.assertEqual(manager.read()["status"], "restart_pending")
+            self.assertTrue(manager.read()["task_completed"])
+            self.assertEqual(manager.resume_prompt(), "")
+            self.assertFalse(manager.path.exists())
+
+    def test_only_running_task_is_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {}})
+            manager.begin("检查尚未完成的任务")
+            prompt = manager.resume_prompt()
+            self.assertIn("原任务：检查尚未完成的任务", prompt)
+            self.assertEqual(manager.read()["status"], "running")
+
+    def test_legacy_running_restart_command_is_cleared_not_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {}})
+            manager.begin("重启你自己。")
+            self.assertTrue(manager.path.exists())
+            self.assertEqual(manager.resume_prompt(), "")
+            self.assertFalse(manager.path.exists())
+
+    def test_direct_restart_never_creates_recovery_state(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {}})
+            agent = HomeAgent.__new__(HomeAgent)
+            agent.cancel_event = __import__("threading").Event(); agent.self_upgrade = manager
+            agent.begin_task("重启你自己。")
+            self.assertFalse(manager.path.exists())
 
     def test_self_programming_requires_real_validated_changes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

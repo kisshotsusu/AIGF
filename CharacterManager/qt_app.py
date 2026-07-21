@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QSize, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
@@ -15,6 +15,11 @@ from PySide6.QtWidgets import (
 )
 
 from service import CharacterService, CharacterServiceError
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from modules.live.ai_live_assistant.instance_lock import InstanceLock
 
 
 ACCENT = "#22a38a"
@@ -457,13 +462,10 @@ class MainWindow(QMainWindow):
 def run():
     app=QApplication.instance() or QApplication(sys.argv);app.setApplicationName("AI Character Manager");app.setStyle("Fusion");app.setStyleSheet(STYLE)
     lock_path = Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "ai-character-manager.lock"
-    lock = QLockFile(str(lock_path)); lock.setStaleLockTime(30000)
-    if not lock.tryLock(100):
-        # Recover a lock left behind by a crash or forced process termination.
-        lock.removeStaleLockFile()
-        if not lock.tryLock(100):
-            QMessageBox.information(None, "角色管理器", "角色管理器已经在运行。")
-            return 0
+    lock = InstanceLock(lock_path)
+    if not lock.acquire():
+        QMessageBox.information(None, "角色管理器", "角色管理器已经在运行。")
+        return 0
     app._character_manager_lock = lock
     win=MainWindow();win.show();return app.exec()
 

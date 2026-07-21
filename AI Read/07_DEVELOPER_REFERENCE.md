@@ -5,6 +5,7 @@
 - `HomeAgent.is_restart_request(text)` 只接受明确的当前执行命令；否定、咨询和功能开发语句必须返回 `False`。
 - `HomeAgent.chat` 必须在 `_acknowledge_common_response`、历史注入、规划器和供应商请求之前处理直接重启，设置 `restart_requested` 并返回固定本地文案。
 - `finalize_task_recovery` 必须保留已经设置的直接重启标志，不能被普通任务的 `SelfUpgradeManager.finalize(False)` 覆盖。
+- 直接重启不得调用 `SelfUpgradeManager.begin`，收尾必须调用 `clear()`。禁止写成 `direct_restart or finalize()`：布尔短路会在直接重启时跳过状态清理。`resume_prompt` 还需拒绝旧版遗留的纯重启提示词。
 - Qt 使用 `_restart_if_requested`，Tk 使用 `_restart_agent`；两者都只能通过 `launch_restart_watchdog` 接力，避免新旧实例并存。
 
 ## 自主升级完成门禁
@@ -44,7 +45,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 
 ### `LiveAssistant`（`app.py`）
 - `run()`：建立 `aiohttp` 会话，启动 `BilibiliLive` 事件流、历史弹幕轮询、`_context_cleanup_loop`、`_speech_worker` 四个生产者，主循环 `handle_event`。
-- `handle_event(event)`：按 `cmd` 分流 `DANMU_MSG` / `SEND_GIFT` / `INTERACT_WORD`+`ENTRY_EFFECT`。
+- `handle_event(event)`：按 `cmd` 分流弹幕、礼物及 `INTERACT_WORD(_V2)` / `ENTRY_EFFECT(_MUST_RECEIVE)` 新旧进场事件。
 - `_welcome(uid, user)`：冷却（`welcome_cooldown_seconds`）+ `_welcoming` 去重集合；仅当 `_emit(..., speech_priority=0)` 返回 `True`（语音成功）才写 `welcomed` 冷却。
 - `_emit(text, speech_priority=10) -> bool`：`send_danmaku` 与 `dry_run` 双重门控（须同时为 true 才发弹幕）；返回语音是否成功。
 - `_speech_worker()`：单消费者，从 `asyncio.PriorityQueue` 串行取 `(priority, seq, text, future)` 调用 `tts.speak`，写 `completed` future。优先级 0=欢迎，10=普通。
@@ -81,8 +82,11 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `start_assistant` 子进程：`python -m modules.live.main --config <ROOT>/config.yaml`，stdout 接 `logs/assistant.log`。
 
 ### HomeAgent（`HomeAgent/agent.py`）
+- `HomeAgentWindow.send()` 在 worker 忙碌时必须清空编辑框、显示用户消息并把文本追加到 `input_queue`，不得静默丢弃；`finish_task()` 仅在当前 worker（包含最终 TTS）结束后通过零延迟 Qt 回调启动队首任务。队列为进程内 FIFO，重启时不在旧进程继续消费。
 - 运行期读取 `HomeAgent/config.yaml`、`config.yaml`、`workspace`、`Task`、`LongTermMemory`；`__init__` 后台线程 `ensure_vision_service` / `ensure_sound_service` 自动拉起 MCP。
 - `begin_task` / `update_task_recovery` / `finalize_task_recovery` / `recover_interrupted_task` / `stop_current_task`：围绕 `SelfUpgradeManager` 做任务持久化与重启恢复；`stop_current_task` 会 `taskkill` 当前活跃子进程但保留常驻服务。
+- `SelfUpgradeManager.clear()` 是完成/取消状态的唯一清理入口。`resume_prompt()` 只能恢复 `running`；`restart_pending` 是已完成升级的进程接力标记，读取后必须清理并返回空字符串，禁止再次提交原任务。
+- `CodeEditorModule._resolve_read_path` 与 `_resolve_edit_path` 分别执行读写权限检查；`computer_control.full_access` 可授权绝对路径读写，`allowed_roots` 提供受限范围。外部结果返回规范绝对路径，写入后加入 `_external_changed` 并参与语法校验。
 - `log_event(event, **data)`：写 `HomeAgent/logs/agent-events.jsonl`，密钥按正则脱敏（`bearer ...` / `sk-...` 截断为 `***`），单字段 ≤4000 字符。
 - 工具循环收集最近工具返回作为 `completion_evidence`；执行类任务生成候选答案后调用 `MiMoMultimodalClient.verify_completion`。失败时把 `reason/next_action` 作为新一轮指令，超过 `completion_max_retries` 后返回明确未通过而不是成功措辞。
 

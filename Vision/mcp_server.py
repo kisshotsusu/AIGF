@@ -20,12 +20,15 @@ GUI Web Agent - MCP Server
 """
 import io
 import os
+import sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 # Must be set before importing torch through agent.  Expandable segments reduce
 # allocator fragmentation during repeated screenshots with varying dimensions.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
 
 from mcp.server.fastmcp import FastMCP, Image as MCPImage
 import agent
@@ -229,6 +232,14 @@ def desktop_hotkey(keys: list[str]) -> str:
 
 
 if __name__ == "__main__":
-    if os.getenv("VISION_PRELOAD_MODEL", "0") == "1": agent.load_model()
-    transport = os.getenv("VISION_MCP_TRANSPORT", "stdio").strip().lower()
-    mcp.run(transport="streamable-http" if transport in {"http", "streamable-http"} else "stdio")
+    from pathlib import Path
+    from modules.live.ai_live_assistant.instance_lock import InstanceLock
+    lock = InstanceLock(Path(HERE) / "state" / "vision-mcp.lock")
+    if not lock.acquire():
+        raise SystemExit("Vision MCP 已在运行，拒绝启动重复实例")
+    try:
+        if os.getenv("VISION_PRELOAD_MODEL", "0") == "1": agent.load_model()
+        transport = os.getenv("VISION_MCP_TRANSPORT", "stdio").strip().lower()
+        mcp.run(transport="streamable-http" if transport in {"http", "streamable-http"} else "stdio")
+    finally:
+        lock.release()

@@ -15,6 +15,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(HERE))
 
 from mcp.server.fastmcp import FastMCP
 import asr
@@ -46,5 +47,13 @@ def record_and_transcribe(duration: float = 5.0, language: str = "auto") -> str:
 
 
 if __name__ == "__main__":
+    from pathlib import Path
+    from modules.live.ai_live_assistant.instance_lock import InstanceLock
     transport = os.getenv("SOUND_MCP_TRANSPORT", "stdio").strip().lower()
-    mcp.run(transport="streamable-http" if transport in {"http", "streamable-http"} else "stdio")
+    lock = InstanceLock(Path(HERE) / "state" / "sound-mcp.lock")
+    if not lock.acquire():
+        raise SystemExit("Sound MCP 已在运行，拒绝启动重复实例")
+    try:
+        mcp.run(transport="streamable-http" if transport in {"http", "streamable-http"} else "stdio")
+    finally:
+        lock.release()

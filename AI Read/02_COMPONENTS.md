@@ -31,7 +31,7 @@
 > **单一真相源**：`src/ai_live_assistant/` 只是 `from modules.live.ai_live_assistant.xxx import *` 的兼容再导出 shim，供 `HomeAgent/agent.py` 通过 `src.ai_live_assistant.*` 引用。改直播核心代码只改 `modules/live/ai_live_assistant/`。
 > `task_manager`（HomeAgent 的任务调度）不在 `HomeAgent/` 本地，而在 `Skill/schedule-home-task/scripts/task_manager.py`；`agent.py` 启动时把该目录加入 `sys.path` 后以 `from task_manager import TaskStore` 使用。
 - `HomeAgent/agent.py`：家庭 Agent、MiMo 语义计划、本地工具优先路由、Codex/MCP 后备、TTS 和上下文维护。
-- `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入、设置和重启恢复；`app.py` 保留 Tk 后备和 Qt 转发入口。
+- `HomeAgent/qt_app.py`：默认桌宠 UI、任务进度、文字/语音输入 FIFO、设置和重启恢复；任务或最终 TTS 播放期间仍可排队输入，由单个 `ChatWorker` 依次消费；`app.py` 保留 Tk 后备和 Qt 转发入口。
 - `HomeAgent/qt_app.py` 中的 `ScreenCareWorker`：按“屏幕关怀”设置的频率低优先级触发关怀，忙碌时跳过且不允许并发实例；设置窗口可实时启停和修改频率。
 - `HomeAgent/qt_app.py` 中的 `CareMessagePopup`：在桌宠旁显示不抢输入焦点的关怀气泡，默认 12 秒后自动隐藏并自动适配屏幕边缘。
 - `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。
@@ -58,3 +58,6 @@
 ## 回归测试
 
 - `modules/live/tests/test_reliable_speech.py`：直播 TTS 暂态失败重试、欢迎冷却提交时机、重复进场合并。
+## 常驻组件单实例约束（2026-07-21）
+
+- HomeAgent、角色管理器、直播控制台、直播助手、Sound MCP、Vision MCP 均使用跨进程 `InstanceLock`；锁句柄覆盖整个进程生命周期，第二实例在初始化、占用端口或加载模型前退出。

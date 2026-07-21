@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 import brotli
 import json
+import logging
 import random
 import struct
 import time
 import zlib
 from collections.abc import AsyncIterator
 from typing import Any
+from http.cookies import SimpleCookie
 
 import aiohttp
 
 
 HEADER = struct.Struct(">IHHII")
+LOG = logging.getLogger("ai_live.bilibili")
 
 
 def packet(operation: int, body: bytes = b"", version: int = 1) -> bytes:
@@ -40,8 +43,33 @@ class BilibiliLive:
     def __init__(self, session: aiohttp.ClientSession, room_id: int, cookie: str = ""):
         self.session, self.room_id, self.cookie = session, room_id, cookie
 
+    def _cookies(self) -> dict[str, str]:
+        parsed = SimpleCookie()
+        try:
+            parsed.load(self.cookie)
+        except Exception:
+            return {}
+        return {key: morsel.value for key, morsel in parsed.items()}
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Cookie": self.cookie,
+            "Referer": f"https://live.bilibili.com/{self.room_id}",
+            "Origin": "https://live.bilibili.com",
+        }
+
+    def _auth_payload(self, real_id: int, token: str) -> dict[str, Any]:
+        cookies = self._cookies()
+        try:
+            uid = int(cookies.get("DedeUserID", "0"))
+        except ValueError:
+            uid = 0
+        return {"uid": uid, "roomid": real_id, "protover": 3,
+                "buvid": cookies.get("buvid3") or cookies.get("buvid4", ""),
+                "platform": "web", "type": 2, "key": token}
+
     async def _room_info(self) -> tuple[int, str, str]:
-        async with self.session.get("https://api.live.bilibili.com/room/v1/Room/room_init", params={"id": self.room_id}) as r:
+        async with self.session.get("https://api.live.bilibili.com/room/v1/Room/room_init", params={"id": self.room_id}, headers=self._headers()) as r:
             data = await r.json()
         real_id = int(data["data"]["room_id"])
         async with self.session.get("https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo", params={"id": real_id, "type": 0}, headers={"Cookie": self.cookie}) as r:
@@ -65,7 +93,7 @@ class BilibiliLive:
             try:
                 real_id, token, ws_url = await self._room_info()
                 async with self.session.ws_connect(ws_url, heartbeat=None) as ws:
-                    auth = json.dumps({"uid": 0, "roomid": real_id, "protover": 3, "buvid": "", "platform": "web", "type": 2, "key": token}).encode()
+                    auth = json.dumps(self._auth_payload(real_id, token)).encode()
                     await ws.send_bytes(packet(7, auth))
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     try:
@@ -76,6 +104,7 @@ class BilibiliLive:
                     finally: heartbeat.cancel()
             except asyncio.CancelledError: raise
             except Exception:
+                LOG.warning("B站直播事件连接失败，5 秒后重试", exc_info=True)
                 await asyncio.sleep(5)
 
     async def history_events(self, interval: float = 2.5) -> AsyncIterator[dict[str, Any]]:
@@ -110,7 +139,7 @@ class BilibiliLive:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                pass
+                LOG.warning("B站历史弹幕轮询失败", exc_info=True)
             await asyncio.sleep(interval)
 
     @staticmethod

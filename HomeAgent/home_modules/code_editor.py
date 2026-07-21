@@ -32,15 +32,30 @@ class CodeEditorModule:
         "AI Read/06_CURRENT_STATE.md",
     )
 
-    def __init__(self, root: Path, home_agent: Path, require_validation: bool = True):
+    def __init__(self, root: Path, home_agent: Path, require_validation: bool = True,
+                 allow_external_read: bool = False, external_read_roots: list[str] | None = None,
+                 allow_external_write: bool = False):
         self.root = root.resolve()
         self.home_agent = home_agent.resolve()
         self.require_validation = bool(require_validation)
+        self.allow_external_read = bool(allow_external_read)
+        self.allow_external_write = bool(allow_external_write)
+        self.external_read_roots = [Path(value).expanduser().resolve() for value in (external_read_roots or []) if str(value).strip()]
         self._baseline: dict[str, str] = {}
+        self._external_changed: set[str] = set()
 
     def _resolve_edit_path(self, value: str, self_edit: bool = False) -> Path:
-        raw = str(value or "").strip().replace("\\", "/")
-        if not raw or raw.startswith("/") or ":" in raw:
+        raw = str(value or "").strip()
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            path = candidate.resolve()
+            if not self.allow_external_write and not any(path == root or root in path.parents for root in self.external_read_roots):
+                raise ValueError("绝对路径不在代码写入权限范围；请开启完整磁盘访问或配置 allowed_roots")
+            if path.name.lower().startswith(".env") or path.suffix.lower() in {".pem", ".key", ".pfx"}:
+                raise ValueError("禁止读取或编辑密钥文件")
+            return path
+        raw = raw.replace("\\", "/")
+        if not raw:
             raise ValueError("代码工具只接受工程根目录内的相对路径")
         path = (self.root / raw).resolve()
         allowed = [self.root / "Projects"]
@@ -54,30 +69,50 @@ class CodeEditorModule:
             raise ValueError("禁止读取或编辑密钥文件")
         return path
 
+    def _resolve_read_path(self, value: str, self_edit: bool = False) -> Path:
+        raw = str(value or "").strip()
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            return self._resolve_edit_path(raw, self_edit)
+        path = candidate.resolve()
+        if not self.allow_external_read and not any(path == root or root in path.parents for root in self.external_read_roots):
+            raise ValueError("绝对路径不在代码读取权限范围；请开启完整磁盘访问或配置 allowed_roots")
+        if path.name.lower().startswith(".env") or path.suffix.lower() in {".pem", ".key", ".pfx"}:
+            raise ValueError("禁止读取或编辑密钥文件")
+        return path
+
     def list_files(self, path: str = "Projects", self_edit: bool = False, limit: int = 300) -> dict[str, Any]:
-        target = self._resolve_edit_path(path, self_edit)
+        target = self._resolve_read_path(path, self_edit)
         if not target.exists():
-            return {"ok": True, "path": str(target.relative_to(self.root)), "files": []}
+            try: display = target.relative_to(self.root).as_posix()
+            except ValueError: display = str(target)
+            return {"ok": True, "path": display, "files": []}
         if not target.is_dir():
             raise ValueError("列出路径必须是目录")
         files: list[str] = []
         for item in target.rglob("*"):
             if item.is_file() and not any(part in self.EXCLUDED_PARTS for part in item.parts):
-                files.append(item.relative_to(self.root).as_posix())
+                try: display = item.relative_to(self.root).as_posix()
+                except ValueError: display = str(item)
+                files.append(display)
                 if len(files) >= max(1, min(1000, int(limit))):
                     break
-        return {"ok": True, "path": target.relative_to(self.root).as_posix(), "files": files, "count": len(files)}
+        try: display_target = target.relative_to(self.root).as_posix()
+        except ValueError: display_target = str(target)
+        return {"ok": True, "path": display_target, "files": files, "count": len(files)}
 
     def read_file(self, path: str, self_edit: bool = False, max_chars: int = 30000) -> dict[str, Any]:
-        target = self._resolve_edit_path(path, self_edit)
+        target = self._resolve_read_path(path, self_edit)
         if not target.is_file():
             raise FileNotFoundError(f"文件不存在：{path}")
         content = target.read_text(encoding="utf-8")
         limit = max(1000, min(100000, int(max_chars)))
-        return {"ok": True, "path": target.relative_to(self.root).as_posix(), "content": content[:limit], "truncated": len(content) > limit, "chars": len(content)}
+        try: display = target.relative_to(self.root).as_posix()
+        except ValueError: display = str(target)
+        return {"ok": True, "path": display, "content": content[:limit], "truncated": len(content) > limit, "chars": len(content)}
 
     def search_text(self, query: str, path: str = "Projects", self_edit: bool = False, limit: int = 100) -> dict[str, Any]:
-        target = self._resolve_edit_path(path, self_edit)
+        target = self._resolve_read_path(path, self_edit)
         needle = str(query or "")
         if not needle:
             raise ValueError("搜索内容不能为空")
@@ -92,7 +127,9 @@ class CodeEditorModule:
                 continue
             for number, line in enumerate(lines, 1):
                 if needle.casefold() in line.casefold():
-                    matches.append({"path": file.relative_to(self.root).as_posix(), "line": number, "text": line[:500]})
+                    try: display = file.relative_to(self.root).as_posix()
+                    except ValueError: display = str(file)
+                    matches.append({"path": display, "line": number, "text": line[:500]})
                     if len(matches) >= max(1, min(500, int(limit))):
                         return {"ok": True, "query": needle, "matches": matches, "truncated": True}
         return {"ok": True, "query": needle, "matches": matches, "truncated": False}
@@ -107,7 +144,10 @@ class CodeEditorModule:
         temporary = target.with_name(f".{target.name}.home-agent.tmp")
         temporary.write_text(text, encoding="utf-8", newline="\n")
         temporary.replace(target)
-        return {"ok": True, "path": target.relative_to(self.root).as_posix(), "chars": len(text), "created": not existed}
+        try: display = target.relative_to(self.root).as_posix()
+        except ValueError:
+            display = str(target); self._external_changed.add(display)
+        return {"ok": True, "path": display, "chars": len(text), "created": not existed}
 
     def replace_text(self, path: str, old: str, new: str, self_edit: bool = False, count: int = 1) -> dict[str, Any]:
         target = self._resolve_edit_path(path, self_edit)
@@ -122,11 +162,26 @@ class CodeEditorModule:
         temporary = target.with_name(f".{target.name}.home-agent.tmp")
         temporary.write_text(updated, encoding="utf-8", newline="\n")
         temporary.replace(target)
-        return {"ok": True, "path": target.relative_to(self.root).as_posix(), "replaced": requested, "remaining_matches": occurrences - requested}
+        try: display = target.relative_to(self.root).as_posix()
+        except ValueError:
+            display = str(target); self._external_changed.add(display)
+        return {"ok": True, "path": display, "replaced": requested, "remaining_matches": occurrences - requested}
 
     @staticmethod
     def is_code_edit_request(prompt: str) -> bool:
         compact = str(prompt).replace(" ", "").lower()
+        # “写代码”也常出现在关怀、闲聊和辅助功能标签中，并不等于要求执行代码任务。
+        # 只有同一句还包含明确的修改动作时，才允许这些非指令语境继续参与分类。
+        non_action_context = (
+            "写代码累了", "代码写累了", "写代码辛苦", "辛苦了", "喝口水",
+            "休息一下", "眼睛也休息", "回复模糊语义号", "模糊语义号",
+        )
+        decisive_actions = (
+            "修复", "修改", "升级", "更新", "优化", "重构", "实现", "新增",
+            "增加功能", "添加功能", "编辑", "改代码", "fix", "implement", "refactor",
+        )
+        if any(marker in compact for marker in non_action_context) and not any(action in compact for action in decisive_actions):
+            return False
         subjects = (
             "homeagent", "你自己", "自己", "自己的代码", "你自己的代码", "自身", "自我", "本体",
             "你的代码", "自身代码", "自我升级", "自动升级", "程序", "系统",
@@ -143,9 +198,11 @@ class CodeEditorModule:
         if cls.is_code_edit_request(prompt):
             return False
         compact = str(prompt).replace(" ", "").lower()
+        # “检查开发文档” describes documentation, not a request to develop a new project.
+        action_text = compact.replace("开发文档", "文档").replace("开发说明", "说明")
         subjects = ("项目", "应用", "网站", "网页应用", "桌面应用", "脚本", "工具", "软件", "程序", "代码库", "api", "服务")
         actions = ("创建", "新建", "开发", "编写", "搭建", "实现", "生成", "从零", "build", "create", "develop", "scaffold")
-        return any(word in compact for word in subjects) and any(word in compact for word in actions)
+        return any(word in compact for word in subjects) and any(word in action_text for word in actions)
 
     @classmethod
     def is_code_task(cls, prompt: str) -> bool:
@@ -180,11 +237,12 @@ class CodeEditorModule:
 
     def begin_tracking(self) -> None:
         self._baseline = self._fingerprint()
+        self._external_changed.clear()
 
     def changed_files(self) -> list[str]:
         after = self._fingerprint()
         keys = set(self._baseline) | set(after)
-        return sorted(key for key in keys if self._baseline.get(key) != after.get(key))
+        return sorted({key for key in keys if self._baseline.get(key) != after.get(key)} | self._external_changed)
 
     def validate_files(self, changed: list[str]) -> dict[str, Any]:
         if not self.require_validation:
@@ -192,7 +250,8 @@ class CodeEditorModule:
         checked: list[str] = []
         try:
             for relative in changed:
-                path = self.root / relative
+                candidate = Path(relative)
+                path = candidate if candidate.is_absolute() else self.root / candidate
                 if not path.is_file():
                     continue
                 suffix = path.suffix.lower()
@@ -215,7 +274,7 @@ class CodeEditorModule:
         if require_changes and not changed:
             return {"ok": False, "changed": [], "error": "自编程任务没有产生任何代码或配置变更"}
         implementation_changed = any(
-            not path.startswith(("AI Read/", "Projects/")) and path != "README.md"
+            not Path(path).is_absolute() and not path.startswith(("AI Read/", "Projects/")) and path != "README.md"
             for path in changed
         )
         documentation_changed = any(path.startswith("AI Read/") for path in changed)

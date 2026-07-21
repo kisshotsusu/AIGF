@@ -3,7 +3,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
+from types import SimpleNamespace
 
 from home_modules.mimo_multimodal import MiMoMultimodalClient
 from agent import HomeAgent
@@ -57,6 +58,7 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
     async def test_screen_care_deletes_temporary_screenshot(self):
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"screen_care": {"enabled": True, "speak": False}, "home": {"auto_speak": True}}
+        agent.history = []
         agent.mimo_multimodal = MiMoMultimodalClient()
         events = []
         captured = []
@@ -78,6 +80,35 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "主人，忙一会儿也记得喝口水呀。")
         self.assertFalse(captured[0].exists())
         self.assertEqual(events[-1][0], "proactive_screen_care")
+        self.assertEqual(result, agent.history[-1]["content"])
+        self.assertEqual("proactive_screen_care", agent.history[-1]["source"])
+
+    async def test_screen_care_publishes_context_before_tts(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"screen_care": {"enabled": True, "speak": True, "max_chars": 42}, "home": {"auto_speak": True, "max_context_messages": 8}}
+        agent.history = [{"role": "assistant", "content": "旧代码任务"}]
+        agent.mimo_multimodal = SimpleNamespace(
+            config={"timeout_seconds": 5},
+            analyze_image=AsyncMock(return_value={"text": "主人，记得喝口水哦。", "model": "mimo-v2.5"}),
+        )
+        agent.log_event = Mock()
+        order = []
+
+        async def speak(*_args, **_kwargs):
+            order.append("tts")
+            self.assertEqual("主人，记得喝口水哦。", agent.history[-1]["content"])
+            return ["care.wav"]
+
+        agent._speak_home = speak
+
+        class Image:
+            def convert(self, mode): return self
+            def save(self, path, kind): Path(path).write_bytes(b"png")
+
+        with patch("PIL.ImageGrab.grab", return_value=Image()):
+            result = await agent.proactive_screen_care(lambda _message: order.append("message"))
+        self.assertEqual("主人，记得喝口水哦。", result)
+        self.assertEqual(["message", "tts"], order)
 
 
 if __name__ == "__main__": unittest.main()

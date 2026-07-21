@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .ai_live_assistant.app import LiveAssistant
 from .ai_live_assistant.config import load_config
+from .ai_live_assistant.instance_lock import InstanceLock
 
 
 def main() -> None:
@@ -19,7 +20,13 @@ def main() -> None:
     if args.check:
         print("配置检查通过")
         return
-    asyncio.run(LiveAssistant(cfg).run())
+    lock = InstanceLock(Path(cfg["_root"]) / "state" / "live-assistant.lock")
+    if not lock.acquire():
+        raise SystemExit("直播助手已在运行，拒绝启动重复实例")
+    try:
+        asyncio.run(LiveAssistant(cfg).run())
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__": main()

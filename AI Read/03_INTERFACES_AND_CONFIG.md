@@ -33,10 +33,12 @@
 - `semantic_planner`：**当前文档此前未记录的配置节**，控制 MiMo 语义计划步骤：`enabled`、`timeout_seconds`（10）、`minimum_confidence`（0.55）。低于置信度时回退或要求澄清。
 - `progress_reporting`：**此前未记录的配置节**，控制长任务进度汇报：`enabled`、`long_task_seconds`（60）、`tts_cooldown_seconds`（90）、`max_reports_per_task`（3）。
 - `screen_care`：运行时主动屏幕关怀。默认 `enabled: true`、`interval_seconds: 300`；设置窗口的“屏幕关怀”页可实时启停，并以分钟为单位设置 1～1440 分钟的问候频率。`skip_while_busy` 防止打断用户任务，`all_screens: false` 只截主屏，`show_message` 控制是否写入对话区，`popup_enabled` 控制桌宠消息气泡，`popup_duration_seconds` 控制气泡显示时长（默认 12 秒），`speak` 与 `home.auto_speak` 共同控制播报，`max_chars` 限制关怀语长度。截图仅存于系统临时目录并在每轮结束后删除。
+- `prompt_wake`：**新增配置节**，控制提示词唤醒直接输入功能。`enabled`（默认 `false`）启用/禁用唤醒功能；`wake_words` 为唤醒词列表（默认 `["苏苏", "小助手", "你好苏苏", "嘿苏苏"]`）；`auto_send_after_wake`（默认 `true`）控制唤醒后是否自动发送命令；`wake_confirmation_sound`（默认 `true`）控制唤醒时是否播放确认音；`wake_timeout_seconds`（默认 10）控制唤醒超时时间。启用后，语音输入以唤醒词开头时会自动提取后面的命令并执行。设置窗口新增"唤醒"标签页，可直接配置唤醒词、启用/禁用及自动发送选项。
 - `context_maintenance`：家庭上下文每天 03:00 压缩；可清理家庭闲聊、清理 `work/` 并保留 3 天。
 - `codex_cli`：CLI、隔离 `CODEX_HOME`、沙箱、超时、触发模式与关键词。
 - `vision_mcp`：HTTP 服务、现有浏览器 CDP 端点、GUI 模型开关。当前 `gui_enabled: true`、`preload_model: false`，即允许按需懒加载视觉模型，服务启动不预占显存。
 - `computer_control`：权限、确认策略、软件名称到路径映射。
+- `computer_control.full_access` 授权代码工具对绝对路径进行列举、读取、搜索、原子写入和精确替换；关闭时绝对路径仅限 `allowed_roots`。外部改动纳入变更跟踪与语法校验；`.env`、PEM、KEY、PFX 密钥文件始终拒绝。
 - `self_upgrade`：是否允许自编辑、重启恢复、重启前校验和最大连续重启次数。
 
 `HomeAgent/config.d/` 把 `computer_control`、`vision_mcp`、`context_maintenance`、`context_cleanup`（直播上下文清理）另存为独立文档。角色管理器写入时经 `CharacterService` 同时更新 `HomeAgent/config.yaml` 与对应 `config.d` 文件，并保留 UI 未识别字段。

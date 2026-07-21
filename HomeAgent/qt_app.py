@@ -7,13 +7,14 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 import yaml
-from PySide6.QtCore import QLockFile, QObject, QPoint, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
@@ -23,6 +24,9 @@ from PySide6.QtWidgets import (
 )
 
 from agent import HOME_AGENT, ROOT, HomeAgent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from modules.live.ai_live_assistant.instance_lock import InstanceLock
 from home_modules.system_startup import AUTOSTART_ARGUMENT, run_network_guard, set_windows_autostart
 
 
@@ -41,6 +45,7 @@ class Bridge(QObject):
     transcription = Signal(str)
     confirm = Signal(str, object)
     progress = Signal(object)
+    reminder = Signal(str)
 
 
 class ChatWorker(QThread):
@@ -122,8 +127,7 @@ class ScreenCareWorker(QThread):
 
     def run(self):
         try:
-            message = asyncio.run(self.agent.proactive_screen_care())
-            if message: self.cared.emit(message)
+            asyncio.run(self.agent.proactive_screen_care(self.cared.emit))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -270,6 +274,21 @@ class SettingsDialog(QDialog):
         shell_note.setWordWrap(True); shell_note.setObjectName("muted")
         shell_form.addRow("PowerShell", self.shell_enabled); shell_form.addRow("CMD", self.cmd_enabled); shell_form.addRow("执行确认", self.shell_confirm); shell_form.addRow("默认超时", self.shell_timeout); shell_form.addRow("说明", shell_note)
         tabs.addTab(shell_page, "命令")
+
+        # Prompt wake settings tab
+        wake_page = QWidget(); wake_form = QFormLayout(wake_page); wake_form.setContentsMargins(18, 18, 18, 18); wake_form.setSpacing(14)
+        wake_cfg = cfg.get("prompt_wake", {})
+        self.wake_enabled = QCheckBox("启用提示词唤醒"); self.wake_enabled.setChecked(bool(wake_cfg.get("enabled", False)))
+        self.wake_auto_send = QCheckBox("唤醒后自动发送命令"); self.wake_auto_send.setChecked(bool(wake_cfg.get("auto_send_after_wake", True)))
+        self.wake_confirmation = QCheckBox("唤醒时播放确认音"); self.wake_confirmation.setChecked(bool(wake_cfg.get("wake_confirmation_sound", True)))
+        self.wake_timeout = QSpinBox(); self.wake_timeout.setRange(5, 60); self.wake_timeout.setSuffix(" 秒"); self.wake_timeout.setValue(int(wake_cfg.get("wake_timeout_seconds", 10)))
+        self.wake_words_input = QLineEdit(); self.wake_words_input.setPlaceholderText("输入唤醒词，用逗号分隔"); self.wake_words_input.setText(", ".join(wake_cfg.get("wake_words", ["苏苏", "小助手"])))
+        wake_note = QLabel("启用后，语音输入以唤醒词开头时会自动提取后面的命令并执行。例如：苏苏，打开浏览器")
+        wake_note.setWordWrap(True); wake_note.setObjectName("muted")
+        wake_form.addRow("启用唤醒", self.wake_enabled); wake_form.addRow("自动发送", self.wake_auto_send); wake_form.addRow("确认音", self.wake_confirmation); wake_form.addRow("唤醒超时", self.wake_timeout); wake_form.addRow("唤醒词列表", self.wake_words_input); wake_form.addRow("说明", wake_note)
+        self.wake_enabled.toggled.connect(self._sync_wake_controls)
+        self._sync_wake_controls()
+        tabs.addTab(wake_page, "唤醒")
         self.shell_enabled.toggled.connect(self.save); self.cmd_enabled.toggled.connect(self.save); self.shell_confirm.toggled.connect(self.save); self.shell_timeout.valueChanged.connect(self.save)
 
         stt_page = QWidget(); stt_form = QFormLayout(stt_page); stt_form.setContentsMargins(18, 18, 18, 18); stt = cfg.get("stt", {})
@@ -315,6 +334,13 @@ class SettingsDialog(QDialog):
     def _sync_screen_care_controls(self):
         self.screen_care_minutes.setEnabled(self.screen_care_enabled.isChecked())
 
+    def _sync_wake_controls(self):
+        enabled = self.wake_enabled.isChecked()
+        self.wake_auto_send.setEnabled(enabled)
+        self.wake_confirmation.setEnabled(enabled)
+        self.wake_timeout.setEnabled(enabled)
+        self.wake_words_input.setEnabled(enabled)
+
     def save(self):
         if self._saving: return
         self._saving = True
@@ -330,6 +356,7 @@ class SettingsDialog(QDialog):
             progress=cfg.setdefault("progress_reporting",{});progress["enabled"]=self.progress_enabled.isChecked();progress["long_task_seconds"]=self.progress_seconds.value();progress["tts_cooldown_seconds"]=self.progress_cooldown.value();progress["max_reports_per_task"]=self.progress_reports.value()
             care = cfg.setdefault("screen_care", {}); care["enabled"] = self.screen_care_enabled.isChecked(); care["interval_seconds"] = self.screen_care_minutes.value() * 60
             upgrade = cfg.setdefault("self_upgrade", {}); upgrade["enabled"] = self.upgrade_enabled.isChecked(); upgrade["auto_restart"] = self.upgrade_restart.isChecked(); upgrade["require_validation"] = self.upgrade_validation.isChecked(); upgrade["max_restart_attempts"] = self.upgrade_attempts.value()
+            wake = cfg.setdefault("prompt_wake", {}); wake["enabled"] = self.wake_enabled.isChecked(); wake["auto_send_after_wake"] = self.wake_auto_send.isChecked(); wake["wake_confirmation_sound"] = self.wake_confirmation.isChecked(); wake["wake_timeout_seconds"] = self.wake_timeout.value(); wake["wake_words"] = [w.strip() for w in self.wake_words_input.text().split(",") if w.strip()]
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
             set_windows_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")
             self._sync_startup_controls()
@@ -354,7 +381,7 @@ class InspectorDialog(QDialog):
 
 class HomeAgentWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.screen_care_worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
+        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.input_queue = deque(); self.screen_care_worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
         self.setWindowTitle(f"{self.agent.character_name} · Home Agent"); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window); self.setAttribute(Qt.WA_TranslucentBackground); self.resize(860, 380); self.setMinimumSize(640, 300)
         self._build(); self._connect(); self.apply_always_on_top()
         self.bridge.finished.connect(self._restart_if_requested)
@@ -384,7 +411,7 @@ class HomeAgentWindow(QMainWindow):
 
     def _connect(self):
         self.send_btn.clicked.connect(self.send); self.stop_btn.clicked.connect(self.stop_task); self.voice_btn.clicked.connect(self.toggle_record); QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self.send)
-        self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.progress.connect(self.update_task_progress); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
+        self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.progress.connect(self.update_task_progress); self.bridge.reminder.connect(self._show_reminder); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
 
     def append_message(self, role, name, text):
         self.message_layout.insertWidget(self.message_layout.count() - 1, MessageBubble(role, name, str(text)))
@@ -396,8 +423,17 @@ class HomeAgentWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
     def send(self):
         text = self.input.toPlainText().strip()
-        if not text or (self.worker and self.worker.isRunning()): return
-        self.input.clear(); self.append_message("user", self.agent.config.get("home", {}).get("user_name", "你"), text); self.progress_card=TaskProgressCard(); self.message_layout.insertWidget(self.message_layout.count()-1,self.progress_card); self.task_cancelled=False; self.agent.begin_task(); self.send_btn.setEnabled(False); self.stop_btn.setEnabled(True); self.set_status("正在思考…")
+        if not text: return
+        self.input.clear(); self.append_message("user", self.agent.config.get("home", {}).get("user_name", "你"), text)
+        if self.worker and self.worker.isRunning():
+            self.input_queue.append(text)
+            self.set_status(f"已排队 {len(self.input_queue)} 项，当前任务结束后执行")
+            self.input.setFocus()
+            return
+        self._start_task(text)
+
+    def _start_task(self, text):
+        self.progress_card=TaskProgressCard(); self.message_layout.insertWidget(self.message_layout.count()-1,self.progress_card); self.task_cancelled=False; self.agent.begin_task(); self.send_btn.setEnabled(True); self.stop_btn.setEnabled(True); self.set_status("正在思考…")
         self.worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action); self.worker.start()
 
     def stop_task(self):
@@ -406,6 +442,10 @@ class HomeAgentWindow(QMainWindow):
     def finish_task(self):
         if self.progress_card:self.progress_card.finish(self.task_cancelled)
         self.send_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.set_status("就绪"); self.input.setFocus()
+        self.worker = None
+        if self.input_queue and not self.agent.restart_requested:
+            next_text = self.input_queue.popleft()
+            QTimer.singleShot(0, lambda: self._start_task(next_text))
 
     def resume_interrupted_task(self):
         prompt = self.agent.recover_interrupted_task()
@@ -468,7 +508,17 @@ class HomeAgentWindow(QMainWindow):
             self.screen_care_timer.start(max(60, int(cfg.get("interval_seconds", 300))) * 1000)
         else:
             self.screen_care_timer.stop()
-    def poll_tasks(self): threading.Thread(target=lambda: asyncio.run(self.agent.run_due_tasks()), daemon=True).start()
+    def poll_tasks(self):
+        threading.Thread(
+            target=lambda: asyncio.run(self.agent.run_due_tasks(self.bridge.reminder.emit)),
+            daemon=True,
+            name="scheduled-task-poller",
+        ).start()
+    def _show_reminder(self, message):
+        self.append_message("assistant", self.agent.character_name, message)
+        if self.pet is not None:
+            self.pet.show_care_message(message)
+        self.set_status("提醒已送达，语音播放中…")
     def run_screen_care(self):
         cfg = self.agent.config.get("screen_care", {})
         if not cfg.get("enabled", True): return
@@ -606,11 +656,9 @@ QDialog {{ background: {COLORS['window']}; }} #dialogTitle {{ font-size: 22px; f
 def run():
     app = QApplication.instance() or QApplication([])
     lock_path = Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "ai-home-agent.lock"
-    lock = QLockFile(str(lock_path)); lock.setStaleLockTime(30000)
-    if not lock.tryLock(100):
-        lock.removeStaleLockFile()
-        if not lock.tryLock(100):
-            return 0
+    lock = InstanceLock(lock_path)
+    if not lock.acquire():
+        return 0
     app._home_agent_lock = lock
     font_path = Path(r"C:\Windows\Fonts\NotoSansSC.ttf")
     if font_path.exists():

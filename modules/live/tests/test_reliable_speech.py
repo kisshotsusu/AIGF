@@ -6,10 +6,34 @@ import unittest
 from pathlib import Path
 
 from modules.live.ai_live_assistant.app import LiveAssistant
+from modules.live.ai_live_assistant.bilibili import BilibiliLive
 from modules.live.ai_live_assistant.tts import TTSClient
 
 
 class ReliableSpeechTests(unittest.IsolatedAsyncioTestCase):
+    def test_websocket_auth_uses_login_cookie_identity(self) -> None:
+        bili = BilibiliLive(object(), 123, "DedeUserID=42; buvid3=abc-123")
+        payload = bili._auth_payload(456, "token")
+        self.assertEqual(42, payload["uid"])
+        self.assertEqual("abc-123", payload["buvid"])
+
+    async def test_new_entry_event_variants_trigger_welcome(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            cfg = {"_root": folder, "reply": {"max_context_messages": 4},
+                   "bilibili": {"welcome_enabled": True}}
+            assistant = LiveAssistant(cfg)
+            calls: list[tuple[str, str]] = []
+            assistant._start_background_task = lambda coroutine: asyncio.create_task(coroutine)  # type: ignore[method-assign]
+
+            async def welcome(uid: str, user: str) -> None:
+                calls.append((uid, user))
+
+            assistant._welcome = welcome  # type: ignore[method-assign]
+            await assistant.handle_event({"cmd": "INTERACT_WORD_V2", "data": {"uinfo": {"uid": 7, "base": {"name": "观众甲"}}}})
+            await assistant.handle_event({"cmd": "ENTRY_EFFECT_MUST_RECEIVE", "data": {"uid": 8, "uname": "观众乙"}})
+            await asyncio.sleep(0)
+            self.assertEqual([("7", "观众甲"), ("8", "观众乙")], calls)
+
     async def test_tts_retries_transient_gpu_failure(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             client = TTSClient(object(), {"retry_attempts": 4, "retry_delay_seconds": 0.001}, Path(folder))

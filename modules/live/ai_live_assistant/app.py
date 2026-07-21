@@ -62,7 +62,7 @@ class LiveAssistant:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     async def run(self) -> None:
-        headers = {"User-Agent": "Mozilla/5.0 AI-Live-Assistant/1.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"}
         async with aiohttp.ClientSession(headers=headers) as session:
             bili = BilibiliLive(session, int(self.cfg["app"]["room_id"]), secret_from_env(self.cfg["bilibili"].get("cookie_env")))
             self.llm = LLMClient(session, self.cfg["llm"])
@@ -118,10 +118,13 @@ class LiveAssistant:
                 if should_reply: self._start_background_task(self._smart_reply(user, text))
         elif cmd == "SEND_GIFT":
             await self._handle_gift(event.get("data", {}))
-        elif cmd in {"INTERACT_WORD", "ENTRY_EFFECT"}:
+        elif cmd in {"INTERACT_WORD", "INTERACT_WORD_V2", "ENTRY_EFFECT", "ENTRY_EFFECT_MUST_RECEIVE"}:
             data = event.get("data", {})
-            user = str(data.get("uname") or data.get("copy_writing") or "新朋友")
-            uid = str(data.get("uid") or user)
+            uinfo = data.get("uinfo", {}) if isinstance(data.get("uinfo"), dict) else {}
+            base = uinfo.get("base", {}) if isinstance(uinfo.get("base"), dict) else {}
+            user = str(data.get("uname") or data.get("username") or base.get("name") or data.get("copy_writing") or "新朋友")
+            user = re.sub(r"<[^>]+>", "", user).strip()
+            uid = str(data.get("uid") or uinfo.get("uid") or user)
             if self.cfg["bilibili"].get("welcome_enabled", True):
                 self._record_message("welcome", user, "", status="received", uid=uid, command=cmd)
                 self._start_background_task(self._welcome(uid, user))

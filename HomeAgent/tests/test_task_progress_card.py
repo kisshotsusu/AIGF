@@ -68,6 +68,17 @@ class TaskProgressCardTests(unittest.TestCase):
         pet.show_care_message.assert_called_once_with("主人，记得喝水呀。")
         target.set_status.assert_called_once_with("就绪")
 
+    def test_reminder_displays_chat_message_and_pet_popup_immediately(self):
+        pet = SimpleNamespace(show_care_message=Mock())
+        target = SimpleNamespace(
+            agent=SimpleNamespace(character_name="苏苏"), pet=pet,
+            append_message=Mock(), set_status=Mock(),
+        )
+        HomeAgentWindow._show_reminder(target, "主人，该喝水啦。")
+        target.append_message.assert_called_once_with("assistant", "苏苏", "主人，该喝水啦。")
+        pet.show_care_message.assert_called_once_with("主人，该喝水啦。")
+        target.set_status.assert_called_once_with("提醒已送达，语音播放中…")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -376,13 +376,23 @@ def manager_is_running() -> bool:
 
 
 def main() -> None:
+    from .ai_live_assistant.instance_lock import InstanceLock
     ensure_files()
-    if manager_is_running():
+    lock = InstanceLock(ROOT / "state" / "live-manager.lock")
+    if not lock.acquire():
         print("AI Live Console is already running. Opening the existing page...")
         webbrowser.open("http://127.0.0.1:9888")
         return
-    webbrowser.open("http://127.0.0.1:9888")
-    web.run_app(create_app(), host="127.0.0.1", port=9888, print=lambda x: print(x))
+    if manager_is_running():
+        lock.release()
+        print("AI Live Console is already running. Opening the existing page...")
+        webbrowser.open("http://127.0.0.1:9888")
+        return
+    try:
+        webbrowser.open("http://127.0.0.1:9888")
+        web.run_app(create_app(), host="127.0.0.1", port=9888, print=lambda x: print(x))
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__": main()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -26,12 +27,25 @@ class SelfUpgradeManager:
         self.state_dir = self.home_agent / "state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.state_dir / "task-recovery.json"
-        self.code_editor = CodeEditorModule(self.root, self.home_agent, self.config.get("require_validation", True))
+        control = config.get("computer_control", {})
+        self.code_editor = CodeEditorModule(
+            self.root, self.home_agent, self.config.get("require_validation", True),
+            allow_external_read=bool(control.get("full_access", False)),
+            external_read_roots=control.get("allowed_roots", []),
+            allow_external_write=bool(control.get("full_access", False)),
+        )
 
     def _write(self, value: dict[str, Any]) -> None:
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(self.path)
+
+    def clear(self) -> None:
+        """Remove recovery state once a task no longer needs recovery."""
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def read(self) -> dict[str, Any]:
         try:
@@ -42,6 +56,16 @@ class SelfUpgradeManager:
     @staticmethod
     def is_upgrade_request(prompt: str) -> bool:
         return CodeEditorModule.is_code_edit_request(prompt)
+
+    @staticmethod
+    def _is_restart_only_prompt(prompt: str) -> bool:
+        value = re.sub(r"[\s，。！？、,.!?;；:：]+", "", str(prompt or "")).lower()
+        return value in {
+            "重启", "重新启动", "重启自己", "自己重启", "重启你自己", "你重启自己",
+            "重启homeagent", "重新启动homeagent", "重启桌宠", "重新启动桌宠",
+            "请重启自己", "请重启你自己", "请重启homeagent", "请重启桌宠",
+        } or (any(target in value for target in ("重启自己", "重启你自己", "重启homeagent", "重启桌宠"))
+               and value.startswith(("请", "现在", "立即", "马上", "麻烦", "帮我")))
 
     def validate_current_changes(self, require_changes: bool = False) -> dict[str, Any]:
         """Validate edits before an execution agent is allowed to claim success."""
@@ -92,21 +116,34 @@ class SelfUpgradeManager:
         restart_sensitive = any(path.startswith(self.RESTART_AREAS) and path.endswith(".py") for path in changed)
         should_restart = bool(self.config.get("enabled", True) and self.config.get("auto_restart", True) and state.get("is_self_upgrade") and restart_sensitive and int(state.get("restart_count", 0)) < int(self.config.get("max_restart_attempts", 2)))
         if should_restart:
-            state.update({"status": "restart_pending", "current_step": "重启后验证升级并继续任务", "restart_count": int(state.get("restart_count", 0)) + 1, "updated_at": datetime.now().isoformat(timespec="seconds")})
+            state.update({
+                "status": "restart_pending", "task_completed": True,
+                "current_step": "升级已完成，等待重启加载新代码",
+                "restart_count": int(state.get("restart_count", 0)) + 1,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
             self._write(state)
             return True
-        state.update({"status": "completed", "updated_at": datetime.now().isoformat(timespec="seconds")})
-        self._write(state)
+        self.clear()
         return False
 
     def cancel(self) -> None:
-        state = self.read()
-        state.update({"status": "cancelled", "updated_at": datetime.now().isoformat(timespec="seconds")})
-        self._write(state)
+        self.clear()
 
     def resume_prompt(self) -> str:
         state = self.read()
-        if state.get("status") not in {"running", "restart_pending"} or not str(state.get("prompt", "")).strip():
+        status = state.get("status")
+        if self._is_restart_only_prompt(str(state.get("prompt", ""))):
+            self.clear()
+            return ""
+        if status == "restart_pending":
+            # finalize() already validated and completed this task.  Restart only
+            # loads the new code; it must never submit the original prompt again.
+            self.clear()
+            return ""
+        if status != "running" or not str(state.get("prompt", "")).strip():
+            if status in {"completed", "cancelled"}:
+                self.clear()
             return ""
         original = str(state["prompt"]).strip()
         completed = "；".join(state.get("completed_steps") or []) or "暂无可靠完成记录"

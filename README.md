@@ -97,7 +97,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 2. 优先选择本地确定性工具、网页 Skill 或 Vision MCP。
 3. 网页先检查当前目标：`browser_dom`、`browser_visual` 或 `desktop_visual`。
 4. 操作后重新观察并验证；失败保留阶段、证据与重试原因。
-5. 最终回答一生成就立即显示在消息页，TTS 在其后继续播放，不再等整段语音结束才显示。
+5. 最终回答一生成就立即显示在消息页，TTS 在其后继续播放；播放期间文字或语音识别的新输入可继续提交并进入 FIFO，当前任务和语音全部结束后自动执行下一项。
 6. 任务执行时 UI 实时显示当前步骤和已完成内容；长任务可以生成 TTS 进度汇报。
 7. 自主升级任务会先读取 README 与 `AI Read`、检查工作区、实际编辑并校验；没有文件变更不能报告成功，并可通过 `HomeAgent/state/task-recovery.json` 在重启后继续。
 8. “创建/开发/编写独立项目”会由 MiMo 规划并调用 HomeAgent 本地 `code_*` 工具，默认写入 `Projects/<project-name>/`；生成后本地执行编译和测试。仅当本地多轮失败或用户明确要求时才回退 Codex。

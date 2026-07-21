@@ -82,9 +82,47 @@ class HomeAgent:
         self.refresh_identity()
         self.log_event("long_term_memory_migration", result=migration, total=self.long_term_memory.count())
 
+
+    def is_prompt_wake_enabled(self) -> bool:
+        """Check if prompt wake feature is enabled."""
+        return bool(self.config.get('prompt_wake', {}).get('enabled', False))
+
+    def get_wake_words(self) -> list:
+        """Get list of wake words from config."""
+        return self.config.get('prompt_wake', {}).get('wake_words', ['苏苏', '小助手'])
+
+    def detect_wake_word(self, text: str) -> tuple:
+        """
+        Detect if text starts with a wake word and extract the command.
+        Returns (is_wake, command_text).
+        """
+        if not self.is_prompt_wake_enabled():
+            return False, text
+        
+        wake_words = self.get_wake_words()
+        text_stripped = text.strip()
+        
+        for wake_word in wake_words:
+            if text_stripped.startswith(wake_word):
+                command = text_stripped[len(wake_word):].strip()
+                # Remove common connectors
+                command = re.sub(r'^[，,。.！!？?\s]+', '', command)
+                if command:
+                    self.log_event('wake_word_detected', wake_word=wake_word, command=command)
+                    return True, command
+        
+        return False, text
+
+    def should_auto_send_after_wake(self) -> bool:
+        """Check if should auto send after wake word detection."""
+        return bool(self.config.get('prompt_wake', {}).get('auto_send_after_wake', True))
+
     def begin_task(self, prompt: str = "", resumed: bool = False) -> None:
         self.cancel_event.clear()
         if prompt:
+            if self.is_restart_request(prompt):
+                self.self_upgrade.clear()
+                return
             self.self_upgrade.begin(prompt, resumed=resumed)
 
     def update_task_recovery(self, current: str, completed: list[str]) -> None:
@@ -92,7 +130,13 @@ class HomeAgent:
 
     def finalize_task_recovery(self, answer: str) -> bool:
         direct_restart = self.restart_requested
-        self.restart_requested = direct_restart or self.self_upgrade.finalize(answer)
+        if direct_restart:
+            # A restart command is local process control, not a recoverable task.
+            self.self_upgrade.clear()
+            upgrade_restart = False
+        else:
+            upgrade_restart = self.self_upgrade.finalize(answer)
+        self.restart_requested = direct_restart or upgrade_restart
         self.log_event("task_recovery_finalized", restart_requested=self.restart_requested)
         return self.restart_requested
 
@@ -1682,7 +1726,7 @@ class HomeAgent:
         except Exception as exc:
             self.log_event("task_progress_speech_failed", error=str(exc))
 
-    async def proactive_screen_care(self) -> str:
+    async def proactive_screen_care(self, notification_ready=None) -> str:
         """Capture the primary screen once, let MiMo compose a privacy-safe caring line, then discard it."""
         cfg = self.config.get("screen_care", {})
         if not cfg.get("enabled", True):
@@ -1708,6 +1752,11 @@ class HomeAgent:
                 if not message:
                     return ""
                 message = message[:max(12, int(cfg.get("max_chars", 42)))]
+                max_context = int(self.config.get("home", {}).get("max_context_messages", 30))
+                self.history.append({"role": "assistant", "content": message, "source": "proactive_screen_care"})
+                self.history = self.history[-max_context:]
+                if notification_ready:
+                    notification_ready(message)
                 if cfg.get("speak", True) and self.config.get("home", {}).get("auto_speak", True):
                     await self._speak_home(session, message, None, ignore_cancel=True)
                 self.log_event("proactive_screen_care", model=result.get("model"), message=message)
@@ -1754,6 +1803,13 @@ class HomeAgent:
             self.log_event("direct_restart_requested", message=text)
             self._publish_answer(answer, answer_ready)
             return answer
+        
+        # Prompt wake detection
+        is_wake, wake_command = self.detect_wake_word(text)
+        if is_wake:
+            self.log_event("prompt_wake_activated", original=text, command=wake_command)
+            text = wake_command
+        
         self._acknowledge_common_response(text)
         max_context = int(self.config["home"].get("max_context_messages", 30))
         self.history.append({"role": "user", "content": text}); self.history = self.history[-max_context:]
@@ -2438,7 +2494,7 @@ class HomeAgent:
             await asyncio.create_subprocess_exec(str(command), *arguments); return {"ok": True, "application": app_name, "arguments": arguments}
         return {"error": f"未知工具: {name}"}
 
-    async def run_due_tasks(self) -> list[dict[str, Any]]:
+    async def run_due_tasks(self, notification_ready=None) -> list[dict[str, Any]]:
         """由桌宠常驻轮询器调用；任务只有在 TTS 成功后才算执行成功。"""
         results = []
         maintenance = await self.run_context_maintenance()
@@ -2452,6 +2508,10 @@ class HomeAgent:
                 if attempt == 1: spoken = f"{base}。主人，听到后记得回应我一声哦。"
                 elif attempt == 2: spoken = f"主人，我还没有收到你的回应。再提醒一次：{base}。"
                 else: spoken = f"主人，这是最后一次提醒：{base}。"
+                # Publish the reminder before synthesis/playback. UI delivery must
+                # not be delayed or lost when TTS is slow, busy, or unavailable.
+                if notification_ready:
+                    notification_ready(spoken)
                 async with aiohttp.ClientSession() as session:
                     paths = await self._speak_home(session, spoken)
                 if not paths: raise RuntimeError("TTS 没有生成可播放音频")

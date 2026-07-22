@@ -1776,6 +1776,60 @@ class HomeAgent:
         if answer_ready and str(answer or "").strip():
             answer_ready(str(answer).strip())
 
+    def is_screen_read_request(self, text: str) -> bool:
+        """Detect if user wants to see what's on screen."""
+        normalized = re.sub(r"[\s，。！？、,.!?;；:：]+", "", str(text or "").lower().strip())
+        patterns = [
+            "看看我在做什么", "看看我在干嘛", "看看屏幕", "看屏幕",
+            "我在做什么", "我在干嘛", "我在干什么", "我在忙什么",
+            "看看我", "看看桌面", "看桌面", "截屏看看",
+            "屏幕上有什么", "屏幕上有啥", "显示屏幕"
+        ]
+        return any(p in normalized for p in patterns)
+
+    async def read_screen_activity(self, status=None) -> str:
+        """Capture screen and analyze what user is doing."""
+        screenshot = None
+        try:
+            from PIL import ImageGrab
+            
+            if status: status("正在截取屏幕…")
+            
+            with tempfile.NamedTemporaryFile(prefix="home-agent-screen-read-", suffix=".png", delete=False) as handle:
+                screenshot = Path(handle.name)
+            image = await asyncio.to_thread(ImageGrab.grab, all_screens=False)
+            await asyncio.to_thread(image.convert("RGB").save, screenshot, "PNG")
+            
+            if status: status("正在分析屏幕内容…")
+            
+            prompt = (
+                "请仔细观察这张屏幕截图，描述用户正在做什么。"
+                "包括：1) 使用什么软件或网站 2) 正在进行什么活动 3) 如果能看到具体内容可以简要说明。"
+                "回答要自然、简洁，像朋友聊天一样，不要太正式。"
+                "用中文回答，最多100个汉字。"
+            )
+            
+            timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                result = await self.mimo_multimodal.analyze_image(session, screenshot, prompt)
+                answer = re.sub(r"\s+", " ", str(result.get("text") or "")).strip().strip('\'"\'"')
+                
+                if not answer:
+                    answer = "看不太清楚呢，可能屏幕内容比较复杂。"
+                
+                self.log_event("screen_read_completed", answer=answer[:100])
+                return answer
+                
+        except Exception as exc:
+            self.log_event("screen_read_failed", error=str(exc))
+            return f"读取屏幕时出了点问题：{str(exc)[:100]}"
+        finally:
+            if screenshot:
+                try:
+                    Path(screenshot).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     @staticmethod
     def is_restart_request(text: str) -> bool:
         """Recognize direct restart commands without routing capability questions to the LLM."""
@@ -1865,6 +1919,19 @@ class HomeAgent:
                 if self.config["home"].get("auto_speak", True):
                     await self._speak_home(session, answer, status)
             return answer
+        
+        # Screen read request
+        if self.is_screen_read_request(text):
+            if status: status("正在读取屏幕…")
+            answer = await self.read_screen_activity(status)
+            self.history.append({"role": "assistant", "content": answer})
+            self.history = self.history[-max_context:]
+            self._publish_answer(answer, answer_ready)
+            async with aiohttp.ClientSession() as session:
+                if self.config["home"].get("auto_speak", True):
+                    await self._speak_home(session, answer, status)
+            return answer
+        
         if task_plan.get("handler") and not self.config.get("agent", {}).get("model_driven_computer_actions", True):
             visual_query = str(task_plan.get("query") or "")
             visual_target = "B站" if task_plan.get("site") == "bilibili" else "网易云"

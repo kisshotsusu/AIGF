@@ -21,6 +21,7 @@ import subprocess
 import time
 import json
 import urllib.request
+import threading
 
 import torch
 from PIL import Image, ImageChops, ImageGrab, ImageStat
@@ -56,6 +57,7 @@ _browser = None
 _page = None
 _owns_browser = False
 _browser_source = "none"
+_SCREENSHOT_LOCK = threading.Lock()
 
 _BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe", "firefox.exe"}
 _CDP_ENDPOINTS = tuple(
@@ -474,10 +476,51 @@ def _primary_screen():
     return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
+def _grab_windows_image(*, hwnd: int | None = None, bbox=None, all_screens: bool = False, attempts: int = 3) -> Image.Image:
+    """Serialize and retry Pillow GDI captures; prefer HWND capture for windows."""
+    errors = []
+    with _SCREENSHOT_LOCK:
+        for attempt in range(max(1, attempts)):
+            strategies = []
+            if hwnd:
+                strategies.append(("hwnd", {"window": int(hwnd), "include_layered_windows": True}))
+            if bbox is not None:
+                strategies.append(("bbox", {"bbox": bbox, "all_screens": True}))
+            if not strategies:
+                strategies.append(("desktop", {"all_screens": all_screens}))
+            for label, kwargs in strategies:
+                source = None
+                try:
+                    source = ImageGrab.grab(**kwargs)
+                    converted = source.convert("RGB")
+                    if converted is source:
+                        if hasattr(converted, "copy"):
+                            return converted.copy()
+                        source = None
+                    return converted
+                except OSError as exc:
+                    errors.append(f"{label}: {exc}")
+                finally:
+                    if source is not None and hasattr(source, "close"):
+                        source.close()
+            if attempt + 1 < attempts:
+                time.sleep(0.15 * (attempt + 1))
+    detail = errors[-1] if errors else "unknown capture error"
+    raise RuntimeError(f"screen grab failed after {max(1, attempts)} attempts: {detail}")
+
+
 def desktop_screenshot_pil() -> Image.Image:
     """只截取 Windows 主显示器，降低视觉推理开销。"""
     if os.name != "nt": raise RuntimeError("桌面视觉控制目前只支持 Windows")
-    return ImageGrab.grab(all_screens=False).convert("RGB")
+    try:
+        return _grab_windows_image(all_screens=False)
+    except RuntimeError:
+        # A detached/transitioning desktop can make BitBlt fail while PrintWindow
+        # still works. The active window is the most relevant safe fallback.
+        window = _foreground_window()
+        left, top, right, bottom = window.get("bounds", [0, 0, 0, 0])
+        bbox = (left, top, right, bottom) if right > left and bottom > top else None
+        return _grab_windows_image(hwnd=int(window.get("hwnd") or 0), bbox=bbox, all_screens=True)
 
 
 def list_windows(title_contains: str = ""):
@@ -561,13 +604,13 @@ def window_screenshot_pil(title_contains: str) -> Image.Image:
     bbox = (left, top, right, bottom)
     if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
         raise RuntimeError("target window has invalid bounds")
-    return ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
+    return _grab_windows_image(hwnd=int(window["hwnd"]), bbox=bbox, all_screens=True)
 
 
 def _capture_window_info(window: dict) -> Image.Image:
     left, top, right, bottom = window["bounds"]
     if right <= left or bottom <= top: raise RuntimeError("target window has invalid bounds")
-    return ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
+    return _grab_windows_image(hwnd=int(window["hwnd"]), bbox=(left, top, right, bottom), all_screens=True)
 
 
 def _window_title_by_hwnd(hwnd: int) -> str:
@@ -617,7 +660,7 @@ def _wait_and_compare_window(window: dict, before: Image.Image, before_title: st
         evidence["after_title"] = after_title
         return evidence
     except Exception as exc:
-        return {"post_screenshot_captured": False, "waited_ms": delay, "state_changed": True, "execution_likely_succeeded": True, "reason": f"目标窗口在操作后已关闭或变化：{exc}", "next_action": "目标窗口结构已变化；重新列出窗口并读取新状态"}
+        return {"post_screenshot_captured": False, "waited_ms": delay, "state_changed": False, "execution_likely_succeeded": False, "reason": f"操作后截图失败，无法验证状态变化：{exc}", "next_action": "重新列出窗口并截图验证；验证成功前不得假设操作成功"}
 
 
 def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):

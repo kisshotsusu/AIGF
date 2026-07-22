@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from types import SimpleNamespace
 
 from home_modules.mimo_multimodal import MiMoMultimodalClient
-from agent import HomeAgent
+from agent import HomeAgent, _grab_screen_with_retry, _read_compatible_text
 
 
 class Response:
@@ -23,6 +23,32 @@ class Session:
 
 
 class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
+    def test_screen_capture_retries_transient_gdi_failure(self):
+        from PIL import Image
+
+        captured = Image.new("RGB", (4, 4), "white")
+        with patch("PIL.ImageGrab.grab", side_effect=[OSError("screen grab failed"), captured]) as grab:
+            result = _grab_screen_with_retry(attempts=2)
+        self.assertEqual(result.size, (4, 4))
+        self.assertEqual(grab.call_count, 2)
+        result.close()
+
+    def test_read_compatible_text_accepts_gb18030_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "build.log"
+            path.write_bytes("编译进度 43%".encode("gb18030"))
+            content, encoding = _read_compatible_text(path)
+        self.assertEqual(content, "编译进度 43%")
+        self.assertEqual(encoding, "gb18030")
+
+    def test_pasted_image_builds_ephemeral_multimodal_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "clipboard.png"; image.write_bytes(b"png-data")
+            content = HomeAgent._image_message_content("这道题怎么做？", image)
+            self.assertEqual(content[0]["type"], "image_url")
+            self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+            self.assertEqual(content[1], {"type": "text", "text": "这道题怎么做？"})
+
     async def test_image_uses_official_content_shape(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MIMO_API_KEY": "hidden"}):
             image = Path(directory) / "screen.png"; image.write_bytes(b"png")
@@ -54,6 +80,31 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
             client._post = fake_post
             result = await client.verify_completion(Session(), "打开页面", {"actionable": True}, "完成", [])
             self.assertEqual(result, {"passed": False, "reason": "没有终态证据", "next_action": "重新读取页面"})
+
+    async def test_completion_check_disables_thinking_without_response_format(self):
+        client = MiMoMultimodalClient()
+        captured = {}
+
+        async def fake_post(session, payload):
+            captured.update(payload)
+            return '{"passed":true,"reason":"证据充分","next_action":""}'
+
+        client._post = fake_post
+        result = await client.verify_completion(Session(), "打开页面", {"actionable": True}, "完成", [])
+        self.assertTrue(result["passed"])
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+        self.assertFalse(captured["stream"])
+        self.assertNotIn("response_format", captured)
+        self.assertIn("只读任务", captured["messages"][1]["content"])
+        self.assertIn("不得额外要求被观察对象达到终态", captured["messages"][1]["content"])
+
+    async def test_completion_check_rejects_string_false(self):
+        with patch.dict(os.environ, {"MIMO_API_KEY": "hidden"}):
+            client = MiMoMultimodalClient()
+            async def fake_post(session, payload): return '{"passed":"false","reason":"没有终态证据","next_action":"重新读取页面"}'
+            client._post = fake_post
+            with self.assertRaisesRegex(RuntimeError, "JSON boolean"):
+                await client.verify_completion(Session(), "打开页面", {"actionable": True}, "完成", [])
 
     async def test_screen_care_deletes_temporary_screenshot(self):
         agent = HomeAgent.__new__(HomeAgent)
@@ -109,6 +160,13 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
             result = await agent.proactive_screen_care(lambda _message: order.append("message"))
         self.assertEqual("主人，记得喝口水哦。", result)
         self.assertEqual(["message", "tts"], order)
+
+    async def test_model_screen_tool_forwards_arbitrary_visual_question(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.analyze_current_screen = AsyncMock(return_value={"ok": True, "observation": "答案是 B"})
+        result = await agent._run_tool("ui_analyze_screen", {"question": "读取题干和四个选项，计算后给出答案及依据"})
+        self.assertTrue(result["ok"])
+        agent.analyze_current_screen.assert_awaited_once_with("读取题干和四个选项，计算后给出答案及依据")
 
 
 if __name__ == "__main__": unittest.main()

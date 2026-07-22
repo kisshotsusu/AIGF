@@ -317,7 +317,13 @@ class LiveAssistant:
             try:
                 raw = await self.llm.reply([{"role": "system", "content": "只输出合法JSON，不要Markdown。"}, {"role": "user", "content": prompt}], profile="memory")
                 match = re.search(r"\{.*\}", raw, re.S)
-                if match: result.update(json.loads(match.group(0)))
+                if match:
+                    parsed = json.loads(match.group(0))
+                    if not isinstance(parsed, dict) or not isinstance(parsed.get("should_remember"), bool):
+                        raise ValueError("直播记忆判断的 should_remember 必须是 JSON boolean")
+                    if not isinstance(parsed.get("importance"), int) or isinstance(parsed.get("importance"), bool):
+                        raise ValueError("直播记忆判断的 importance 必须是整数")
+                    result.update(parsed)
             except Exception:
                 self.log.exception("记忆重要度分析失败")
         score = max(0, min(100, int(result.get("importance", 0))))

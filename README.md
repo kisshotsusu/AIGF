@@ -93,7 +93,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 
 ### HomeAgent 任务
 
-1. 模型生成语义任务计划和可观察完成条件。
+1. MiMo 先判断当前消息是否为任务，再选择直接回答、执行或追问，并生成执行策略、工具能力、步骤和可观察完成条件。
 2. 优先选择本地确定性工具、网页 Skill 或 Vision MCP。
 3. 网页先检查当前目标：`browser_dom`、`browser_visual` 或 `desktop_visual`。
 4. 操作后重新观察并验证；失败保留阶段、证据与重试原因。
@@ -101,6 +101,7 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 6. 任务执行时 UI 实时显示当前步骤和已完成内容；长任务可以生成 TTS 进度汇报。
 7. 自主升级任务会先读取 README 与 `AI Read`、检查工作区、实际编辑并校验；没有文件变更不能报告成功，并可通过 `HomeAgent/state/task-recovery.json` 在重启后继续。
 8. “创建/开发/编写独立项目”会由 MiMo 规划并调用 HomeAgent 本地 `code_*` 工具，默认写入 `Projects/<project-name>/`；生成后本地执行编译和测试。仅当本地多轮失败或用户明确要求时才回退 Codex。
+9. 输入框支持直接按 `Ctrl+V` 粘贴系统截图；可只发送截图，也可附带问题。截图只在本轮以 MiMo 图片消息发送，任务结束后删除临时文件，不写入长期对话 Base64。
 
 ### 网页自动化
 
@@ -144,3 +145,4 @@ CharacterManager(Qt) ──> CharacterService ──> config / workspace / LongT
 ## 文档导航
 
 新开发会话从 [`AI Read/00_START_HERE.md`](AI%20Read/00_START_HERE.md) 开始。当前完成度、近期修复和后续重点集中在 [`AI Read/06_CURRENT_STATE.md`](AI%20Read/06_CURRENT_STATE.md)。
+屏幕任务由 MiMo 先理解目标再执行：可以让 HomeAgent 看当前画面、读取屏幕题目并解答，或根据游戏画面逐步操作。游戏与界面操作会在每一步后重新观察，不会按固定关键词直接截图或盲目连续输入。

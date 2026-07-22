@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 import threading
+import uuid
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,7 @@ class DesktopPet:
         self.inspector_window = None
         self.drag_start = None
         self.mic_devices = []
+        self.pending_image_path = None
 
         self.root = tk.Tk()
         self.root.title(f"{self.agent.character_name} · 家庭桌宠")
@@ -172,6 +175,8 @@ class DesktopPet:
         self.input = tk.Text(bottom, height=2, wrap="word", relief="solid", bd=1, font=("Microsoft YaHei UI", 10), padx=6, pady=5)
         self.input.pack(side="left", fill="both", expand=True)
         self.input.bind("<Control-Return>", lambda _: self.send())
+        self.input.bind("<Control-v>", self._paste_clipboard_image)
+        self.input.bind("<Control-V>", self._paste_clipboard_image)
         self._append("assistant", self.agent.character_name, "我在这里。可以输入文字，或点击“开始语音”。")
         self.input.focus_set()
 
@@ -204,14 +209,32 @@ class DesktopPet:
         if self.busy or not self.panel:
             return
         text = self.input.get("1.0", "end").strip()
-        if not text:
+        image_path, self.pending_image_path = self.pending_image_path, None
+        if not text and not image_path:
             return
+        if not text: text = "请分析这张截图。"
         self.agent.begin_task(text)
         self.busy = True; self.send_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
         self.input.delete("1.0", "end")
-        self._append("user", self.agent.config["home"].get("user_name", "你"), text)
+        self._append("user", self.agent.config["home"].get("user_name", "你"), text + ("\n[已附加截图]" if image_path else ""))
         self.set_status("正在思考…")
-        threading.Thread(target=self._chat_worker, args=(text,), daemon=True).start()
+        threading.Thread(target=self._chat_worker, args=(text, image_path), daemon=True).start()
+
+    def _paste_clipboard_image(self, _event=None):
+        try:
+            from PIL import Image, ImageGrab
+            image = ImageGrab.grabclipboard()
+            if not isinstance(image, Image.Image):
+                return None
+            folder = Path(tempfile.gettempdir()) / "home-agent-clipboard"; folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"clipboard_{uuid.uuid4().hex}.png"; image.convert("RGB").save(path, "PNG")
+            if self.pending_image_path:
+                Path(self.pending_image_path).unlink(missing_ok=True)
+            self.pending_image_path = str(path); self.set_status(f"截图已附加（{image.width}×{image.height}），可输入问题后发送")
+            return "break"
+        except Exception as exc:
+            self.set_status(f"读取剪贴板截图失败：{exc}")
+            return "break"
 
     def stop_current_task(self):
         if not self.busy:
@@ -223,7 +246,7 @@ class DesktopPet:
             loop.call_soon_threadsafe(task.cancel)
         self.set_status("正在停止…")
 
-    def _chat_worker(self, text):
+    def _chat_worker(self, text, image_path=None):
         loop = asyncio.new_event_loop()
         self.chat_loop = loop
         answer_published = threading.Event()
@@ -233,7 +256,7 @@ class DesktopPet:
             self.root.after(0, lambda value=str(answer): self._append("assistant", self.agent.character_name, value))
         try:
             asyncio.set_event_loop(loop)
-            self.chat_task = loop.create_task(self.agent.chat(text, self.set_status, self.confirm_computer_action, publish_answer))
+            self.chat_task = loop.create_task(self.agent.chat(text, self.set_status, self.confirm_computer_action, publish_answer, image_path=image_path))
             answer = loop.run_until_complete(self.chat_task)
             publish_answer(answer)
             self.agent.finalize_task_recovery(answer)
@@ -251,6 +274,9 @@ class DesktopPet:
             self.root.after(0, lambda e=str(exc): self._append("error", "错误", e))
             self.set_status("发生错误")
         finally:
+            if image_path:
+                try: Path(image_path).unlink(missing_ok=True)
+                except OSError: pass
             self.chat_task = None
             self.chat_loop = None
             loop.close()

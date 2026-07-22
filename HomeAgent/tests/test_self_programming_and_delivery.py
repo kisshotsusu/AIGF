@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -149,6 +150,58 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SelfProgrammingTests(unittest.TestCase):
+    def test_malformed_tool_arguments_are_rejected_instead_of_becoming_empty(self) -> None:
+        with self.assertRaises(json.JSONDecodeError):
+            HomeAgent._parse_tool_arguments('{"path":')
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            HomeAgent._parse_tool_arguments('["not", "an", "object"]')
+        self.assertEqual({"path": "demo.txt"}, HomeAgent._parse_tool_arguments('{"path":"demo.txt"}'))
+
+    def test_truncated_or_filtered_model_responses_are_incomplete(self) -> None:
+        for reason in ("length", "content_filter", "repetition_truncation"):
+            self.assertTrue(HomeAgent._is_incomplete_model_response(reason), reason)
+        for reason in ("stop", "tool_calls", None):
+            self.assertFalse(HomeAgent._is_incomplete_model_response(reason), reason)
+
+    def test_task_fallback_does_not_semantically_route_by_keywords(self) -> None:
+        plan = HomeAgent._analyze_task("打开网页并点击屏幕上的按钮", "上一轮说过 B 站")
+        self.assertFalse(plan["is_task"])
+        self.assertFalse(plan["actionable"])
+        self.assertEqual("direct_answer", plan["execution_strategy"])
+        self.assertEqual("conversation", plan["domain"])
+
+    def test_web_route_comes_from_model_plan_not_keywords(self) -> None:
+        self.assertTrue(HomeAgent._should_route_to_web({"is_task": True, "actionable": True, "domain": "web"}))
+        self.assertFalse(HomeAgent._should_route_to_web({"is_task": False, "actionable": True, "domain": "web", "goal": "打开网页"}))
+        self.assertFalse(HomeAgent._should_route_to_web({"is_task": True, "actionable": False, "domain": "web", "goal": "解释网页是什么"}))
+
+    def test_planner_context_keeps_assistant_source_and_user_reply(self) -> None:
+        context = HomeAgent._planner_context([
+            {"role": "assistant", "content": "主人，休息一下吧", "source": "proactive_screen_care"},
+            {"role": "user", "content": "好的"},
+        ])
+        self.assertIn('"role": "assistant"', context)
+        self.assertIn('"source": "proactive_screen_care"', context)
+        self.assertIn('"content": "好的"', context)
+
+    def test_visual_route_comes_from_model_plan_not_keywords(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"vision_mcp": {"enabled": True, "gui_enabled": True}}
+        self.assertTrue(agent._should_route_to_vision({"visual_required": True, "interaction_mode": "solve"}))
+        self.assertFalse(agent._should_route_to_vision({"visual_required": False, "goal": "看看屏幕"}))
+
+    def test_visual_tool_surface_supports_screen_questions(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_code_task = False
+        agent.config = {
+            "agent": {"model_driven_computer_actions": True, "prefer_local_code_tools": True},
+            "vision_mcp": {"enabled": True}, "codex_cli": {"enabled": False},
+            "computer_control": {"enabled": False},
+        }
+        tools = {item["function"]["name"] for item in agent._tools()}
+        self.assertIn("ui_analyze_screen", tools)
+        self.assertFalse(hasattr(agent, "is_screen_read_request"))
+
     def test_restart_command_detection_avoids_questions_and_feature_requests(self) -> None:
         for prompt in ("重启自己", "请现在重启你自己", "重启 HomeAgent", "麻烦重新启动桌宠"):
             self.assertTrue(HomeAgent.is_restart_request(prompt), prompt)

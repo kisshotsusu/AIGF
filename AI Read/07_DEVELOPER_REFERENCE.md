@@ -88,12 +88,12 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `SelfUpgradeManager.clear()` 是完成/取消状态的唯一清理入口。`resume_prompt()` 只能恢复 `running`；`restart_pending` 是已完成升级的进程接力标记，读取后必须清理并返回空字符串，禁止再次提交原任务。
 - `CodeEditorModule._resolve_read_path` 与 `_resolve_edit_path` 分别执行读写权限检查；`computer_control.full_access` 可授权绝对路径读写，`allowed_roots` 提供受限范围。外部结果返回规范绝对路径，写入后加入 `_external_changed` 并参与语法校验。
 - `log_event(event, **data)`：写 `HomeAgent/logs/agent-events.jsonl`，密钥按正则脱敏（`bearer ...` / `sk-...` 截断为 `***`），单字段 ≤4000 字符。
-- 工具循环收集最近工具返回作为 `completion_evidence`；执行类任务生成候选答案后调用 `MiMoMultimodalClient.verify_completion`。失败时把 `reason/next_action` 作为新一轮指令，超过 `completion_max_retries` 后返回明确未通过而不是成功措辞。
+- 工具循环收集最近工具返回作为 `completion_evidence`；执行类任务生成候选答案后调用 `MiMoMultimodalClient.verify_completion`。只读观察/查询在成功证据已包含所问信息时即通过，不额外要求被观察对象达到终态；变更/交互任务仍必须有可验证终态。失败时把 `reason/next_action` 作为新一轮指令，超过 `completion_max_retries` 后返回明确未通过而不是成功措辞。
 
 ### `MiMoMultimodalClient`（`HomeAgent/home_modules/mimo_multimodal.py`）
 - `analyze_image(session, path, prompt)`：图片编码为 data URL，通过 `chat/completions` 的 `image_url` + `text` 内容调用 `mimo-v2.5`。
 - `transcribe_audio(session, path, language)`：只接受 WAV/MP3，Base64 后不超过 10 MB，通过 `input_audio` 和 `asr_options.language` 调用 `mimo-v2.5-asr`。
-- `verify_completion(session, task, plan, answer, evidence)`：要求模型只返回 `{passed, reason, next_action}`；核验依据是工具证据，默认接口异常关闭成功路径。
+- `verify_completion(session, task, plan, answer, evidence)`：要求模型只返回 `{passed, reason, next_action}`；核验依据是工具证据，默认接口异常关闭成功路径。请求固定 `thinking.type=disabled`、`stream=false`，不设置 `response_format`；空响应错误必须包含 `finish_reason`。
 
 ### `CodeEditorModule` 文档门禁
 - 跟踪范围包含实现目录、根配置、README 与 `AI Read`。
@@ -147,3 +147,32 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - **TTS 重复启动**：`/api/options` 超时但 9879 端口存活时，客户端不会拉起第二个 GPT-SoVITS，请勿在此时手动再启动。
 - **Codex 隔离**：`codex_cli.isolated_home: true` 使用独立 `CODEX_HOME`；校验 JSONL 完成事件与必需 MCP 调用。网络任务不得把 Codex 当首选。
 - **私密边界**：直播模型上下文只注入 `include_private=False`；`LIVE_RULES.md`/`HOME_RULES.md` 分离场景行为；私密记忆/附件/照片只允许 `scene=home` 读取。
+## 屏幕任务 API（2026-07-22）
+
+- `HomeAgent.analyze_current_screen(question, status=None) -> dict`：全屏临时截图加 MiMo 问答；`question` 必须由当前任务模型生成，不得恢复固定活动描述提示。`_grab_screen_with_retry` 串行抓图并重试 3 次，整屏失败时尝试当前前台 HWND，返回的 PIL 图必须在保存后关闭。
+- `HomeAgent._should_route_to_vision(task_plan)`：只读取已验证计划的 `visual_required`，不得重新增加自然语言关键词匹配。
+- `_run_tool("ui_analyze_screen", {"question": ...})`：视觉执行循环的全屏观察入口；窗口级后续操作继续使用 `ui_list_windows/ui_analyze_window/ui_click_window/ui_hotkey`。
+- Vision 的 `_grab_windows_image` 对目标窗口先用 HWND/PrintWindow，再使用窗口边界截图；`_wait_and_compare_window` 无法取得操作后截图时必须返回 `state_changed=false` 和 `execution_likely_succeeded=false`。
+- `read_text_file` 支持 UTF-8、带 BOM 的 UTF-16、文本扩展名的 GB18030；含 NUL 或未知非 UTF-8 扩展名继续按二进制拒绝。返回值包含实际 `encoding`。
+- `CommandExecutor.execute("cmd", ...)` 必须用 `shell=True` 的字符串命令路径保留 CMD 内部引号；不得恢复为参数列表，否则 Python 的 `\"` 转义会破坏 `/fi "... eq ..."` 等过滤器。
+
+## 总任务规划 API（2026-07-22）
+
+- `HomeAgent._plan_task(text, context)`：调用 MiMo 输出完整任务判定与执行合同。本地只做枚举、白名单、权限与一致性校验，不允许用原始文本关键词把模型的 `is_task/actionable/domain` 覆盖回去。
+- `HomeAgent._planner_context(history, limit=8)`：序列化最近用户/助手消息并保留 `source`，供规划器识别主动关怀后的短回复。
+- `HomeAgent._should_route_to_web(task_plan)`：只在模型计划同时满足 `is_task=true`、`actionable=true`、`domain=web` 时路由网页能力。
+- `_analyze_task` 仅是规划接口不可用时的保守非执行合同，不负责语义识别或站点路由。
+
+## MiMo 多轮工具调用约束（2026-07-22）
+
+- 主循环把模型返回的完整 assistant message（包括可选 `reasoning_content` 和 `tool_calls`）加入本轮消息链，并用原始 `tool_call_id` 回传每个工具结果。
+- `_is_incomplete_model_response` 拒绝 `length/content_filter/repetition_truncation`，被拒响应中的文本和工具均不得执行。
+- `_parse_tool_arguments` 只接受 JSON 对象；解析失败必须生成 `executed=false` 的工具失败消息，不允许用空字典调用工具。
+- `MiMoMultimodalClient.verify_completion` 只接受实际布尔类型的 `passed`。本项目按要求不传 `response_format`，继续使用提示词、JSON 解析和本地字段校验。
+
+## 剪贴板图片输入 API（2026-07-22）
+
+- `ClipboardImageTextEdit.image_pasted(QImage)`：Qt 粘贴图片信号；图片粘贴不把富文本写入输入框，文本粘贴继续走父类实现。
+- `ChatWorker(..., image_path=None)` 与 `HomeAgent.chat(..., image_path=None)`：图片随队列项进入工作线程，工作线程 `finally` 负责删除文件。
+- `HomeAgent._image_message_content(text, image_path)`：验证图片、Base64 上限并返回 MiMo/OpenAI 兼容的 `image_url` 与 `text` 内容数组。
+- 当前用户历史仍是纯文本字典；构造 API `messages` 时只替换本轮最后一条用户消息，禁止把数据 URL写回 `self.history`。

@@ -40,7 +40,9 @@ class CommandExecutor:
         if shell_kind == "shell":
             args = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", value]
         elif shell_kind == "cmd":
-            args = ["cmd.exe", "/d", "/s", "/c", value]
+            # A list makes subprocess escape embedded quotes as \". cmd.exe does
+            # not understand that escaping, so use Python's Windows CMD wrapper.
+            args = value
         else:
             return {"status": "failed", "error": f"不支持的命令类型：{kind}"}
 
@@ -55,6 +57,7 @@ class CommandExecutor:
                 args, cwd=str(workdir), env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=timeout, creationflags=flags, check=False,
+                shell=shell_kind == "cmd",
             )
             stdout = self._decode(result.stdout)
             stderr = self._decode(result.stderr)

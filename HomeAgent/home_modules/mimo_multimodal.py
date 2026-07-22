@@ -47,7 +47,14 @@ class MiMoMultimodalClient:
             if response.status >= 400:
                 raise RuntimeError(f"MiMo HTTP {response.status}: {raw[:600]}")
         data = json.loads(raw)
-        return str(data["choices"][0]["message"].get("content") or "").strip()
+        choice = data["choices"][0]
+        content = str(choice["message"].get("content") or "").strip()
+        if not content:
+            raise RuntimeError(
+                "MiMo returned an empty response"
+                f" (finish_reason={choice.get('finish_reason', 'unknown')})"
+            )
+        return content
 
     async def analyze_image(self, session: aiohttp.ClientSession, image_path: Path, prompt: str) -> dict[str, Any]:
         if not self.config.get("enabled") or not self.config.get("image_enabled"):
@@ -94,7 +101,9 @@ class MiMoMultimodalClient:
         compact_evidence = json.dumps(evidence[-12:], ensure_ascii=False, default=str)[:12000]
         prompt = (
             "你是独立任务完成核验器。只根据工具证据判断任务是否真正完成，不能依据助手的口头声明。"
-            "操作任务没有成功状态、终态字段或可验证观察时必须判定失败。只输出 JSON："
+            "先按任务计划区分类型：observe、查询、读取、分析等只读任务，只要成功的工具证据已取得用户所问信息，"
+            "就应判定完成，不得额外要求被观察对象达到终态；点击、输入、播放、提交、修改等操作任务，"
+            "没有成功状态、终态字段或可验证观察时必须判定失败。只输出 JSON："
             '{"passed":true或false,"reason":"简短依据","next_action":"失败时给出下一步工具动作"}。\n'
             f"用户任务：{task}\n任务计划：{json.dumps(plan, ensure_ascii=False)}\n候选回复：{answer}\n工具证据：{compact_evidence}"
         )
@@ -102,11 +111,15 @@ class MiMoMultimodalClient:
             "model": self.config["completion_model"],
             "messages": [{"role": "system", "content": "只输出合法 JSON，不要 Markdown。"}, {"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_completion_tokens": 500,
+            "max_completion_tokens": max(500, min(2048, int(self.config["max_completion_tokens"]))),
+            "thinking": {"type": "disabled"},
+            "stream": False,
         }
         content = await self._post(session, payload)
         match = re.search(r"\{.*\}", content, re.S)
         if not match:
             raise RuntimeError(f"MiMo 完成检查返回了非 JSON 内容：{content[:300]}")
         result = json.loads(match.group(0))
-        return {"passed": bool(result.get("passed")), "reason": str(result.get("reason") or "未提供原因"), "next_action": str(result.get("next_action") or "")}
+        if not isinstance(result, dict) or not isinstance(result.get("passed"), bool):
+            raise RuntimeError("MiMo 完成检查的 passed 必须是 JSON boolean")
+        return {"passed": result["passed"], "reason": str(result.get("reason") or "未提供原因"), "next_action": str(result.get("next_action") or "")}

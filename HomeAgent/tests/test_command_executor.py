@@ -26,6 +26,13 @@ class CommandExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["exit_code"], 7)
 
+    def test_cmd_preserves_embedded_filter_quotes(self):
+        result = CommandExecutor(Path.cwd()).execute(
+            "cmd", 'tasklist /fi "imagename eq definitely-not-running.exe" /fo list'
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("Invalid argument", result["stderr"])
+
 
 if __name__ == "__main__":
     unittest.main()

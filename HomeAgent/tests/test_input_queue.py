@@ -4,14 +4,17 @@ import unittest
 from collections import deque
 from pathlib import Path
 from unittest.mock import Mock, patch
+import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HOME_AGENT = Path(__file__).resolve().parents[1]
 if str(HOME_AGENT) not in sys.path:
     sys.path.insert(0, str(HOME_AGENT))
 
+from PySide6.QtCore import QMimeData
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
-from qt_app import HomeAgentWindow
+from qt_app import ClipboardImageTextEdit, HomeAgentWindow
 
 
 class InputQueueTests(unittest.TestCase):
@@ -30,8 +33,31 @@ class InputQueueTests(unittest.TestCase):
         window.send_btn = Mock()
         window.stop_btn = Mock()
         window.input = Mock()
+        window.pending_image_path = None
         window.set_status = Mock()
         return window
+
+    def test_text_editor_emits_clipboard_image_instead_of_inserting_text(self):
+        editor = ClipboardImageTextEdit()
+        received = []
+        editor.image_pasted.connect(received.append)
+        mime = QMimeData(); image = QImage(12, 8, QImage.Format_ARGB32); image.fill(0xFFFFFFFF); mime.setImageData(image)
+        editor.insertFromMimeData(mime)
+        self.assertEqual(len(received), 1)
+        self.assertEqual((received[0].width(), received[0].height()), (12, 8))
+        self.assertEqual(editor.toPlainText(), "")
+
+    def test_busy_image_only_send_keeps_attachment_in_queue(self):
+        window = self.make_window_stub(); window.worker = Mock(); window.worker.isRunning.return_value = True
+        window.input.toPlainText.return_value = ""
+        window.append_message = Mock(); window._start_task = Mock()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            image_path = handle.name
+        window.pending_image_path = image_path
+        window.send()
+        self.assertEqual(list(window.input_queue), [("请分析这张截图。", image_path)])
+        window._start_task.assert_not_called()
+        Path(image_path).unlink(missing_ok=True)
 
     def test_busy_send_is_queued_and_input_remains_available(self):
         window = self.make_window_stub()

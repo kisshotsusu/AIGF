@@ -30,7 +30,7 @@
 - `desktop_pet`：置顶、坐标、桌宠图标。
 - `stt`：模式支持 `sound_mcp`、`mimo`、通用 `api` 与本地识别；MiMo 模式读取根 `mimo_multimodal` 配置。
 - `agent`：`max_tool_rounds` 现表示失败轮次预算（当前 28），成功工具轮不计入；`max_tool_iterations` 是独立总迭代安全上限（当前 112）；`operation_retry_rounds`（电脑操作重试，当前 4）、模型驱动电脑动作、本地工具优先、是否允许角色图片 Skill、Skill 根目录。
-- `semantic_planner`：**当前文档此前未记录的配置节**，控制 MiMo 语义计划步骤：`enabled`、`timeout_seconds`（10）、`minimum_confidence`（0.55）。低于置信度时回退或要求澄清。
+- `semantic_planner`：控制 MiMo 总任务判定与语义计划：`enabled`、`timeout_seconds`（10）、`minimum_confidence`（0.55）、`context_messages`（8，包含用户和助手消息及来源）、`max_tokens`（900）。低于置信度时使用不执行外部动作的保守回退。
 - `progress_reporting`：**此前未记录的配置节**，控制长任务进度汇报：`enabled`、`long_task_seconds`（60）、`tts_cooldown_seconds`（90）、`max_reports_per_task`（3）。
 - `screen_care`：运行时主动屏幕关怀。默认 `enabled: true`、`interval_seconds: 300`；设置窗口的“屏幕关怀”页可实时启停，并以分钟为单位设置 1～1440 分钟的问候频率。`skip_while_busy` 防止打断用户任务，`all_screens: false` 只截主屏，`show_message` 控制是否写入对话区，`popup_enabled` 控制桌宠消息气泡，`popup_duration_seconds` 控制气泡显示时长（默认 12 秒），`speak` 与 `home.auto_speak` 共同控制播报，`max_chars` 限制关怀语长度。截图仅存于系统临时目录并在每轮结束后删除。
 - `prompt_wake`：**新增配置节**，控制提示词唤醒直接输入功能。`enabled`（默认 `false`）启用/禁用唤醒功能；`wake_words` 为唤醒词列表（默认 `["苏苏", "小助手", "你好苏苏", "嘿苏苏"]`）；`auto_send_after_wake`（默认 `true`）控制唤醒后是否自动发送命令；`wake_confirmation_sound`（默认 `true`）控制唤醒时是否播放确认音；`wake_timeout_seconds`（默认 10）控制唤醒超时时间。启用后，语音输入以唤醒词开头时会自动提取后面的命令并执行。设置窗口新增"唤醒"标签页，可直接配置唤醒词、启用/禁用及自动发送选项。
@@ -105,7 +105,7 @@
 
 ### 桌面工具（整屏视觉）
 
-- `desktop_screenshot()`：主显示器截图（返回 MCP 图片）。
+- `desktop_screenshot()`：主显示器截图（返回 MCP 图片）。Windows GDI 截图会串行并最多重试 3 次；整屏 BitBlt 不可用时退回当前前台窗口的 HWND 截图。
 - `desktop_click(instruction, topk=3)`、`desktop_type_text(instruction, text)`、`desktop_type_active_text(text, clear=True)`。
 - `desktop_read_clipboard()`：读取用户刚明确复制的文本。
 - `desktop_scroll(direction="down", amount=600)`、`desktop_hotkey(keys)`（如 `['ctrl','l']`）。
@@ -130,3 +130,22 @@ GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露 `vision_gui_task`；`pr
 | GPT-SoVITS TTS | `127.0.0.1:9879` | `/api/tts`、`/api/options` |
 | vision-gui MCP | `127.0.0.1:8765/mcp` | `stdio` 或 `streamable-http` |
 | sound-asr MCP | `127.0.0.1:8766/mcp` | SenseVoice 本地识别 |
+## 模型视觉任务计划字段（2026-07-22）
+
+- `visual_required: bool`：任务是否必须读取当前屏幕；视觉路由仅依据该模型计划字段，不依据关键词表。
+- `interaction_mode: none|observe|solve|game`：分别表示不需要视觉、只观察、读题求解、逐步游戏操作；要求计算、回答、选择答案或解谜时规划器必须输出 `solve`，不能降级为 `observe`。
+- `ui_analyze_screen(question)`：截取当前桌面并把模型为本轮任务编写的具体问题交给 MiMo；返回观察、模型和原问题。截图为临时文件，分析后删除。整屏抓取遇到暂态 GDI 错误时重试，并以当前前台窗口截图作为兜底，避免一次 `screen grab failed` 中断观察任务。
+
+## 总任务规划字段（2026-07-22）
+
+- `is_task` 判断是否要求取得结果、检查、查找、修改或执行；闲聊、致谢和确认不是任务。`actionable` 单独表示是否必须调用工具，两者不能混为一谈。
+- `response_mode: answer|execute|clarify` 与 `execution_strategy: direct_answer|tool_loop|vision_loop|web_loop|code_loop` 决定如何处理；网页和视觉路由只读取这份已验证计划。
+- `preferred_tools`、`required_capabilities`、`steps`、`success_criteria` 和 `final_action_requires_verification` 构成执行合同；`risk_level` 供本地权限层判断。
+- `needs_clarification` 只在关键信息缺失会改变目标、阻止执行或带来风险时使用，具体问题由 `clarification_question` 提供。
+- 当前规划器、完成检查和记忆分类维持提示词约束 JSON 并由本地解析校验，未启用 API `response_format`。模型返回的布尔和整数必须通过严格类型检查，不能用字符串冒充。
+
+## 剪贴板截图输入（2026-07-22）
+
+- Qt `ClipboardImageTextEdit` 拦截包含图片的粘贴操作，Tk 后备界面通过 `ImageGrab.grabclipboard` 读取；普通文本粘贴维持编辑器默认行为。
+- `HomeAgent.chat(..., image_path=...)` 接受本轮临时图片，`_image_message_content` 构造 `image_url + text` 的 MiMo 兼容内容数组，编码上限 10 MB。
+- 只分析已附图片时不等同于读取实时屏幕：规划器应输出 `visual_required=false`，无需调用 `ui_analyze_screen`。

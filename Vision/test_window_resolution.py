@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from PIL import Image
 
@@ -22,6 +23,24 @@ WINDOWS = [
 
 
 class WindowResolutionTests(unittest.TestCase):
+    def test_media_stop_uses_idempotent_windows_command(self):
+        class SendMessage:
+            argtypes = None
+            restype = None
+
+            def __call__(self, *_args):
+                return 1
+
+        fake_user32 = SimpleNamespace(
+            GetForegroundWindow=lambda: 101,
+            SendMessageTimeoutW=SendMessage(),
+        )
+        with patch.object(agent.ctypes, "windll", SimpleNamespace(user32=fake_user32)):
+            result = agent.desktop_media_stop()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["idempotent"])
+        self.assertEqual(result["requested_state"], "stopped")
+
     def resolve(self, value):
         def fake_list_windows(query=""):
             if not query:
@@ -47,6 +66,15 @@ class WindowResolutionTests(unittest.TestCase):
         with patch.object(agent.ImageGrab, "grab", side_effect=[OSError("PrintWindow failed"), captured]) as grab:
             result = agent._grab_windows_image(hwnd=101, bbox=(0, 0, 8, 6), attempts=1)
         self.assertEqual(result.size, (8, 6))
+        self.assertEqual(grab.call_count, 2)
+        result.close()
+
+    def test_window_capture_rejects_black_hwnd_frame_and_uses_bounds(self):
+        black = Image.new("RGB", (8, 6), "black")
+        visible = Image.new("RGB", (8, 6), "white")
+        with patch.object(agent.ImageGrab, "grab", side_effect=[black, visible]) as grab:
+            result = agent._grab_windows_image(hwnd=101, bbox=(0, 0, 8, 6), attempts=1)
+        self.assertEqual(result.getpixel((0, 0)), (255, 255, 255))
         self.assertEqual(grab.call_count, 2)
         result.close()
 

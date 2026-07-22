@@ -149,3 +149,10 @@ GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露 `vision_gui_task`；`pr
 - Qt `ClipboardImageTextEdit` 拦截包含图片的粘贴操作，Tk 后备界面通过 `ImageGrab.grabclipboard` 读取；普通文本粘贴维持编辑器默认行为。
 - `HomeAgent.chat(..., image_path=...)` 接受本轮临时图片，`_image_message_content` 构造 `image_url + text` 的 MiMo 兼容内容数组，编码上限 10 MB。
 - 只分析已附图片时不等同于读取实时屏幕：规划器应输出 `visual_required=false`，无需调用 `ui_analyze_screen`。
+
+## 媒体停止、进程终止与时序证据（2026-07-22）
+
+- `media_stop()` / Vision `desktop_media_stop` 使用 Windows `WM_APPCOMMAND_MEDIA_STOP`，是幂等的“停止播放”，不会关闭播放器，也不能用 Space 代替。
+- 计划 `operation=stop_media` 只允许媒体 Stop。明确退出应用使用 `close_app`；明确结束进程或常规退出失败需要强制终止时使用 `terminate_process` 与 `process_termination`，此时允许 `Stop-Process/taskkill`。
+- `process_status(name)` 把“进程不存在”规范为 `ok=true,running=false`，避免把 `tasklist`/筛选命令的非零退出码误判为执行失败。
+- 每个工具证据带 `task_submitted_at`、`tool_submitted_at`、`tool_completed_at`、`tool_elapsed_ms` 和 `tool_sequence`。Vision 另带 `vision_request_submitted_at`、截图采集时间与分析完成时间；核验器按序号和时间采用同一对象的最新状态。

@@ -98,6 +98,46 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("只读任务", captured["messages"][1]["content"])
         self.assertIn("不得额外要求被观察对象达到终态", captured["messages"][1]["content"])
 
+    async def test_completion_check_orders_evidence_by_capture_time(self):
+        client = MiMoMultimodalClient()
+        captured = {}
+
+        async def fake_post(session, payload):
+            captured.update(payload)
+            return '{"passed":true,"reason":"最新证据充分","next_action":""}'
+
+        client._post = fake_post
+        await client.verify_completion(Session(), "停止音乐", {"actionable": True}, "已停止", [
+            {"tool_sequence": 1, "tool_completed_at": "2026-01-01T10:00:00+08:00", "state": "playing"},
+            {"tool_sequence": 2, "tool_completed_at": "2026-01-01T10:00:01+08:00", "state": "stopped"},
+        ])
+        prompt = captured["messages"][1]["content"]
+        self.assertIn("tool_sequence", prompt)
+        self.assertIn("较新状态覆盖较早状态", prompt)
+        self.assertIn("截图采集时刻", prompt)
+
+    async def test_media_stop_plan_blocks_toggle_hotkey_before_starting_vision(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"vision_mcp": {"enabled": True}}
+        agent.current_task_plan = {"operation": "stop_media"}
+        agent.ensure_vision_service = Mock(side_effect=AssertionError("unsafe hotkey must be rejected first"))
+        result = await agent._run_tool("ui_hotkey", {"keys": ["space"]})
+        self.assertFalse(result["executed"])
+        self.assertIn("media_stop", result["error"])
+        agent.ensure_vision_service.assert_not_called()
+
+    async def test_vision_tool_result_contains_submission_and_completion_times(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"vision_mcp": {"enabled": True}}
+        agent.current_task_plan = {"operation": "stop_media"}
+        agent.ensure_vision_service = Mock(return_value=True)
+        agent._vision_mcp_call = AsyncMock(return_value="{'ok': True, 'requested_state': 'stopped', 'idempotent': True}")
+        result = await agent._run_tool("media_stop", {})
+        self.assertTrue(result["ok"])
+        self.assertIn("vision_request_submitted_at", result)
+        self.assertIn("vision_response_completed_at", result)
+        self.assertGreaterEqual(result["vision_elapsed_ms"], 0)
+
     async def test_completion_check_rejects_string_false(self):
         with patch.dict(os.environ, {"MIMO_API_KEY": "hidden"}):
             client = MiMoMultimodalClient()

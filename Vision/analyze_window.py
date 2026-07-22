@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 
 import aiohttp
 import yaml
@@ -18,7 +19,7 @@ import agent as vision_agent
 ROOT = Path(__file__).resolve().parents[1]
 
 
-async def analyze(title: str, prompt: str) -> dict:
+async def analyze(title: str, prompt: str, request_submitted_at: str = "") -> dict:
     config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
     settings = config.get("image_understanding", {})
     key_name = str(settings.get("api_key_env", "MIMO_API_KEY"))
@@ -26,6 +27,7 @@ async def analyze(title: str, prompt: str) -> dict:
     key = str(env.get(key_name) or os.getenv(key_name) or "").strip()
     if not key:
         raise RuntimeError(f"Missing {key_name}")
+    captured_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
     image = vision_agent.window_screenshot_pil(title)
     buffer = io.BytesIO(); image.save(buffer, "PNG")
     data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -51,16 +53,22 @@ async def analyze(title: str, prompt: str) -> dict:
     text = str(data["choices"][0]["message"].get("content") or "").strip()
     if not text:
         raise RuntimeError("MiMo window analysis returned no text")
-    return {"ok": True, "analysis": text, "window": title}
+    return {
+        "ok": True, "analysis": text, "window": title,
+        "request_submitted_at": request_submitted_at,
+        "screenshot_captured_at": captured_at,
+        "analysis_completed_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", required=True)
     parser.add_argument("--prompt", required=True)
+    parser.add_argument("--request-submitted-at", default="")
     args = parser.parse_args()
     try:
-        result = asyncio.run(analyze(args.title, args.prompt))
+        result = asyncio.run(analyze(args.title, args.prompt, args.request_submitted_at))
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
     print(json.dumps(result, ensure_ascii=False))

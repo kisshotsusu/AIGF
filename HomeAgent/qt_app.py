@@ -266,6 +266,8 @@ class ChatWorker(QThread):
         except asyncio.CancelledError:
             self.bridge.answer.emit("当前任务已停止。")
         except Exception as exc:
+            self.agent.log_event("chat_error", error=str(exc), prompt=self.prompt)
+            self.agent.self_upgrade.fail(str(exc))
             self.bridge.error.emit(str(exc))
         finally:
             if self.clock:

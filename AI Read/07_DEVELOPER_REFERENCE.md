@@ -176,3 +176,11 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `ChatWorker(..., image_path=None)` 与 `HomeAgent.chat(..., image_path=None)`：图片随队列项进入工作线程，工作线程 `finally` 负责删除文件。
 - `HomeAgent._image_message_content(text, image_path)`：验证图片、Base64 上限并返回 MiMo/OpenAI 兼容的 `image_url` 与 `text` 内容数组。
 - 当前用户历史仍是纯文本字典；构造 API `messages` 时只替换本轮最后一条用户消息，禁止把数据 URL写回 `self.history`。
+
+## 停止语义与子升级执行合同（2026-07-22）
+
+- `_is_media_stop_plan(plan)` 与 `_allows_application_termination(plan)` 必须互斥：前者控制幂等播放停止，后者仅接受 `close_app/terminate_process` 或对应能力字段。修改规划枚举时必须同步两处安全检查和测试。
+- `_run_tool` 在调用 Vision 前拒绝 stop-media 计划中的 Space/Alt+F4，并在 shell/cmd 层阻止仅针对媒体停止的进程终止命令；显式进程终止计划不受此阻止。
+- `CodeEditorModule.read_file(path, start_line, max_lines, max_chars)` 用搜索返回的行号读取局部内容。代码循环的只读计数在成功写入/替换后清零，验证成功才设置 `current_code_verified`。
+- `_codex_exec_command` 的最后一个参数固定为 `-`，完整提示通过 asyncio 子进程 stdin 写入。自升级失败必须调用 `SelfUpgradeManager.fail`；`status=failed` 的恢复文件只保留诊断，不会由 `resume_prompt()` 重放。
+- `finalize_task_recovery` 对自升级实行 fail-closed：没有写入并通过代码验证的证据时不得清除为成功、触发重启或声称升级完成。

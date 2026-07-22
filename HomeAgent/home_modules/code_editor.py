@@ -30,6 +30,8 @@ class CodeEditorModule:
         "AI Read/02_COMPONENTS.md",
         "AI Read/05_OPERATIONS_AND_RULES.md",
         "AI Read/06_CURRENT_STATE.md",
+        "AI Read/07_DEVELOPER_REFERENCE.md",
+        "AI Read/08_TESTING.md",
     )
 
     def __init__(self, root: Path, home_agent: Path, require_validation: bool = True,
@@ -101,15 +103,26 @@ class CodeEditorModule:
         except ValueError: display_target = str(target)
         return {"ok": True, "path": display_target, "files": files, "count": len(files)}
 
-    def read_file(self, path: str, self_edit: bool = False, max_chars: int = 30000) -> dict[str, Any]:
+    def read_file(self, path: str, self_edit: bool = False, max_chars: int = 30000,
+                  start_line: int = 1, max_lines: int = 500) -> dict[str, Any]:
         target = self._resolve_read_path(path, self_edit)
         if not target.is_file():
             raise FileNotFoundError(f"文件不存在：{path}")
         content = target.read_text(encoding="utf-8")
         limit = max(1000, min(100000, int(max_chars)))
+        lines = content.splitlines(keepends=True)
+        first = max(1, int(start_line))
+        line_limit = max(1, min(2000, int(max_lines)))
+        selected = "".join(lines[first - 1:first - 1 + line_limit])
+        clipped = selected[:limit]
         try: display = target.relative_to(self.root).as_posix()
         except ValueError: display = str(target)
-        return {"ok": True, "path": display, "content": content[:limit], "truncated": len(content) > limit, "chars": len(content)}
+        return {
+            "ok": True, "path": display, "content": clipped,
+            "start_line": first, "end_line": min(len(lines), first + line_limit - 1),
+            "total_lines": len(lines), "truncated": first > 1 or len(selected) > limit or first - 1 + line_limit < len(lines),
+            "chars": len(content),
+        }
 
     def search_text(self, query: str, path: str = "Projects", self_edit: bool = False, limit: int = 100) -> dict[str, Any]:
         target = self._resolve_read_path(path, self_edit)
@@ -307,7 +320,7 @@ class CodeEditorModule:
             sections.append(f"===== {relative} =====\n{content}")
         return "\n\n".join(sections), loaded
 
-    def build_execution_contract(self, self_edit: bool = True) -> tuple[str, list[str]]:
+    def build_execution_contract(self, self_edit: bool = True, include_document_contents: bool = True) -> tuple[str, list[str]]:
         documents, loaded = self.load_engineering_documents() if self_edit else ("", [])
         scope = (
             "主要写入范围是 HomeAgent，只有共享接口确实需要时才修改相关模块。"
@@ -325,7 +338,8 @@ class CodeEditorModule:
             "6. 使用适合技术栈的编译、语法检查和测试命令自行测试并修复失败。\n"
             "7. 最终报告必须列出真实变更文件、文档同步范围、启动方式和验证结果；没有写入文件、AI Read 未同步或测试未通过时明确返回失败。\n"
             "禁止读取或输出 .env 密钥。\n"
-            + (f"委派前已经实际读取：{', '.join(loaded)}。以下是当前磁盘内容：\n\n{documents}\n\n" if self_edit else
+            + (f"工程文档清单：{', '.join(loaded)}。" +
+               (f"以下是当前磁盘内容：\n\n{documents}\n\n" if include_document_contents else "执行前必须从磁盘重新读取这些文件的相关章节。\n\n") if self_edit else
                "完成后 HomeAgent 的独立校验模块会再次运行语法检查和项目测试；不得伪造测试结果。\n\n")
         )
         return contract, loaded

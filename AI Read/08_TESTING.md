@@ -16,7 +16,7 @@
 
 ## 2. 一键自动测试
 
-### HomeAgent（当前 70 项）
+### HomeAgent（当前 77 项）
 
 必须从 `HomeAgent` 目录运行，否则 `agent` 和本地模块导入路径不正确：
 
@@ -31,8 +31,8 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 |---|---:|---|
 | `tests/test_command_executor.py` | 4 | PowerShell/CMD 执行、工作目录、非零退出码、CMD 内部双引号保持 |
 | `tests/test_input_queue.py` | 5 | 剪贴板截图、忙碌时 FIFO 排队、任务完成续跑、重启时不误启动队列 |
-| `tests/test_mimo_multimodal.py` | 12 | MiMo 图片/ASR 请求、完成检查、严格布尔值、关闭 thinking、截图重试、GB18030、关怀上下文与消息/TTS 顺序 |
-| `tests/test_self_programming_and_delivery.py` | 40 | 本地代码工具、规划路由、绝对路径权限、伪工具调用、失败轮预算、重启恢复清理、自升级验证、原子写入与测试门禁 |
+| `tests/test_mimo_multimodal.py` | 15 | MiMo 图片/ASR 请求、完成检查、严格布尔值、关闭 thinking、证据时序、媒体 Stop 防反转、Vision 请求时间、截图重试、GB18030、关怀上下文与消息/TTS 顺序 |
+| `tests/test_self_programming_and_delivery.py` | 44 | 本地代码工具、按行读取、Codex stdin、规划路由、停止/强制终止区分、绝对路径权限、伪工具调用、失败轮预算、重启恢复清理、自升级验证、原子写入与测试门禁 |
 | `tests/test_system_startup.py` | 4 | 开机启动标记、手动启动保护、联网失败最多重启 5 次、成功后计数清零 |
 | `tests/test_task_progress_card.py` | 5 | 任务卡片、关怀设置即时生效、提醒/关怀消息与桌宠气泡同步显示 |
 
@@ -55,7 +55,7 @@ Set-Location E:\Doc\AIAgent
 
 `modules/live/tests/test_reliable_speech.py` 覆盖：登录 Cookie 身份、不同进场事件、GPT-SoVITS 暂态失败重试、欢迎成功后才写冷却、重复进场只保留一个待播欢迎。测试中出现预期的 `GPU busy` 重试输出不代表失败，以最终 `OK` 和退出码为准。
 
-### Vision（当前 5 项）
+### Vision（当前 7 项）
 
 Vision 导入依赖其目录下的 GUI-Actor 包，因此从根目录运行时要设置 `PYTHONPATH`：
 
@@ -65,7 +65,7 @@ $env:PYTHONPATH = "E:\Doc\AIAgent\Vision"
 & .\.venv\Scripts\python.exe -m unittest Vision\test_window_resolution.py -v
 ```
 
-覆盖标题、进程路径、进程名和 HWND 窗口解析；HWND 截图失败后边界截图兜底；操作后截图失败必须返回未验证失败，不能伪造状态变化或成功。
+覆盖标题、进程路径、进程名和 HWND 窗口解析；HWND 截图失败或纯黑时边界截图兜底；操作后截图失败必须返回未验证失败；Win32 Media Stop 必须返回幂等 stopped 状态。
 
 ## 3. 静态检查
 
@@ -179,3 +179,17 @@ HomeAgent 应新增 `long_term_memory_migration`；由它拉起 Vision 时应新
 6. 更新本文件中的数量、命令或流程，以及其他受影响的 `AI Read` 当前事实。
 
 禁止通过删除断言、放宽失败条件、把异常改成成功、跳过真实终态验证来“修绿”测试。
+
+## 8. 音乐停止、证据时序与子升级专项（2026-07-22）
+
+专项用例必须覆盖：stop-media 拒绝 Space 且在启动 Vision 前返回；`media_stop` 结果含请求/完成时间；强制终止计划不被误识别为媒体停止；完成核验提示要求较新证据覆盖较早证据；纯黑 HWND 截图退回边界截图；按行读取搜索命中；Codex 命令以 `-` 读取 stdin；失败升级不自动恢复。
+
+```powershell
+Set-Location E:\Doc\AIAgent\HomeAgent
+& ..\.venv\Scripts\python.exe -m unittest tests.test_mimo_multimodal tests.test_self_programming_and_delivery -v
+
+Set-Location E:\Doc\AIAgent\Vision
+& ..\.venv\Scripts\python.exe -m unittest test_window_resolution -v
+```
+
+Codex stdin 真实冒烟应使用 `--sandbox read-only -` 和不会修改文件的短提示。通过标准是输出含 `thread.started`、最终 assistant message 与 `turn.completed`；网络重连或 HTTP 回退应单独记录为环境延迟，不能把缺少 `turn.completed` 当成功。

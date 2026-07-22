@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import base64
+import csv
 import difflib
 import json
 import mimetypes
@@ -29,6 +30,11 @@ from dotenv import dotenv_values
 ROOT = Path(__file__).resolve().parents[1]
 HOME_AGENT = ROOT / "HomeAgent"
 _SCREEN_GRAB_LOCK = threading.Lock()
+
+
+def _iso_now() -> str:
+    """Return an ordered, timezone-aware timestamp for tool evidence."""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
 def _grab_screen_with_retry(*, all_screens: bool = False, attempts: int = 3):
@@ -198,6 +204,11 @@ class HomeAgent:
             self.self_upgrade.clear()
             upgrade_restart = False
         else:
+            state = self.self_upgrade.read()
+            if state.get("is_self_upgrade") and not bool(getattr(self, "current_code_verified", False)):
+                self.self_upgrade.fail("自升级执行未取得写入并通过测试的证据")
+                self.log_event("task_recovery_failed", reason="self_upgrade_not_verified")
+                return False
             upgrade_restart = self.self_upgrade.finalize(answer)
         self.restart_requested = direct_restart or upgrade_restart
         self.log_event("task_recovery_finalized", restart_requested=self.restart_requested)
@@ -360,6 +371,18 @@ class HomeAgent:
         if self._codex_config().get("isolated_home", True):
             return HOME_AGENT / "state" / "codex-home"
         return Path.home() / ".codex"
+
+    @staticmethod
+    def _codex_exec_command(codex_command: list[str], cfg: dict[str, Any]) -> list[str]:
+        """Build a bounded Windows command line; the full prompt is sent on stdin."""
+        command = [*codex_command, "exec", "--json"]
+        if cfg.get("skip_git_repo_check", True):
+            command.append("--skip-git-repo-check")
+        sandbox = str(cfg.get("sandbox", "danger-full-access")).strip()
+        if sandbox:
+            command += ["--sandbox", sandbox]
+        command.append("-")
+        return command
 
     def _prepare_codex_home(self) -> Path:
         """Isolate CLI cache/plugins from the newer desktop build while sharing login."""
@@ -645,18 +668,22 @@ class HomeAgent:
                 "response_mode只能是answer/execute/clarify；execution_strategy只能是direct_answer/tool_loop/vision_loop/web_loop/code_loop。"
                 "只有缺少的信息会实质改变目标、阻止执行或带来风险时才clarify，并给出具体clarification_question；不要为可从屏幕或工具观察的信息追问。"
                 "当前消息明确指定的平台、软件和对象必须覆盖历史上下文；不要把泛称‘音乐/歌曲/视频’当作具体搜索词。"
+                "用户说停止、暂停或关掉音乐时，operation=stop_media、required_capabilities包含media_control、preferred_tools包含media_stop；"
+                "这表示停止声音而不是退出应用，禁止规划Space切换、Alt+F4、Stop-Process或taskkill。"
+                "用户明确要求关闭/退出应用时用operation=close_app；明确要求结束/强制终止进程，或常规停止失败且目标必须退出时，"
+                "用operation=terminate_process并加入process_termination能力，此类计划允许Stop-Process/taskkill。"
                 "query必须是用户真正指定的目标对象原文（例如标题、人名或关键词），不能包含操作动词或连接词，不能自行截短或改写；"
                 "一句话含多个动作时要理解动作之间的关系，不要把动作之间的文字误当成目标。"
                 "只负责理解和规划，不得声称任务已经完成。必须输出全部字段："
                 "is_task, response_mode, execution_strategy, domain(conversation/web/desktop/file/code/memory), site(bilibili/cloudmusic/空), "
-                "operation(open/search/play/control/favorites/form/file/code/conversation/observe_screen/solve_screen/play_game), handler, query, "
+                "operation(open/search/play/control/stop_media/close_app/terminate_process/favorites/form/file/code/conversation/observe_screen/solve_screen/play_game), handler, query, "
                 "favorite_folder, index(整数或null), actionable, multi_step, requires_mcp, browser_policy, risk_level(low/medium/high), "
                 "visual_required(是否必须读取当前屏幕), interaction_mode(none/observe/solve/game), "
                 "只描述画面使用observe；要求读取题目后计算、回答、选择答案或解谜必须使用solve；要求持续操控游戏使用game。"
                 "preferred_tools(工具名字符串数组), required_capabilities(能力字符串数组), steps(字符串数组), "
                 "needs_clarification, clarification_question, final_action_requires_verification(是否要求播放/提交等终态), "
                 "success_criteria, confidence(0到1), reasoning_short。工具可从ui_analyze_screen/ui_inspect_target/web_read/web_fill/web_click_text/"
-                "ui_list_windows/ui_analyze_window/ui_click/ui_hotkey/ui_type_active_text/read_text_file/write_text_file/code_tools/专用站点工具中选择，不要发明工具。\n"
+                "ui_list_windows/ui_analyze_window/ui_click/ui_hotkey/ui_type_active_text/media_stop/read_text_file/write_text_file/code_tools/专用站点工具中选择，不要发明工具。\n"
                 f"最近上下文：{context[-1200:]}\n当前请求：{text}"
             )
             timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
@@ -784,6 +811,28 @@ class HomeAgent:
             return normalized
         if isinstance(result, list): return {"status": "success", "tool": name, "count": len(result), "items": result}
         return {"status": "success", "tool": name, "result": result}
+
+    @staticmethod
+    def _is_media_stop_plan(plan: dict[str, Any]) -> bool:
+        """Recognize the validated plan shape used for idempotent media stopping."""
+        if HomeAgent._allows_application_termination(plan):
+            return False
+        capabilities = {str(value).strip().lower() for value in plan.get("required_capabilities", [])}
+        combined = " ".join(str(plan.get(key) or "") for key in ("goal", "success_criteria", "query"))
+        return bool(
+            plan.get("operation") == "stop_media"
+            or plan.get("handler") == "cloudmusic_control"
+            or "media_control" in capabilities
+            or ("音乐" in combined and any(word in combined for word in ("停止", "关掉", "暂停")))
+        )
+
+    @staticmethod
+    def _allows_application_termination(plan: dict[str, Any]) -> bool:
+        capabilities = {str(value).strip().lower() for value in plan.get("required_capabilities", [])}
+        return (
+            plan.get("operation") in {"close_app", "terminate_process"}
+            or bool({"application_close", "process_termination"} & capabilities)
+        )
 
     @staticmethod
     def _parse_tool_arguments(value: Any) -> dict[str, Any]:
@@ -1410,7 +1459,9 @@ class HomeAgent:
         self_code_contract = ""
         if code_task:
             if status: status("正在准备代码工程和自动测试约束…")
-            self_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract(self_edit=self_code_task)
+            self_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract(
+                self_edit=self_code_task, include_document_contents=False,
+            )
             self.log_event("code_task_prepared", self_edit=self_code_task, documents=loaded_documents)
         prompt = (
             "你是家庭 AI 助手的执行代理。请使用可用的 CLI、文件和 MCP 工具完成任务，"
@@ -1442,25 +1493,38 @@ class HomeAgent:
             + self_code_contract
             + f"角色与规则：\n{self.workspace.prompt_documents('home')}\n\n用户任务：{task}"
         )
-        command = [*codex_command, "exec", "--json"]
-        if cfg.get("skip_git_repo_check", True):
-            command.append("--skip-git-repo-check")
-        sandbox = str(cfg.get("sandbox", "danger-full-access")).strip()
-        if sandbox:
-            command += ["--sandbox", sandbox]
-        command.append(prompt)
+        # Large self-upgrade contracts exceed Windows' command-line limit when
+        # passed as an argument. A lone '-' makes Codex read the prompt on stdin.
+        command = self._codex_exec_command(codex_command, cfg)
         if status:
             status("Codex CLI 正在执行…")
         self.log_event("codex_task_started", task=task, require_mcp=require_mcp, working_directory=working_directory, task_plan=plan, previous_failure=previous_failure)
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         env = self._codex_environment(codex_command)
-        proc = await asyncio.create_subprocess_exec(
-            *command, cwd=str(working_directory), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE, stdin=subprocess.DEVNULL,
-            creationflags=creationflags, env=env,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command, cwd=str(working_directory), stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
+                creationflags=creationflags, env=env,
+            )
+        except OSError as exc:
+            self.log_event("codex_process_start_failed", error=str(exc), prompt_chars=len(prompt))
+            return {"error": f"Codex CLI 启动失败：{exc}", "prompt_chars": len(prompt)}
         with self.active_process_lock:
             self.active_process = proc
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            try: proc.kill()
+            except ProcessLookupError: pass
+            await proc.wait()
+            with self.active_process_lock:
+                if self.active_process is proc: self.active_process = None
+            self.log_event("codex_prompt_delivery_failed", error=str(exc), prompt_chars=len(prompt))
+            return {"error": f"Codex CLI 未能接收任务内容：{exc}", "prompt_chars": len(prompt)}
         if self.cancel_event.is_set():
             self.stop_current_task()
             raise asyncio.CancelledError
@@ -1632,7 +1696,7 @@ class HomeAgent:
         if getattr(self, "current_code_task", False) and self.config.get("agent", {}).get("prefer_local_code_tools", True):
             tools += [
                 {"type": "function", "function": {"name": "code_list_files", "description": "列出当前代码任务允许目录中的文件。独立项目只能访问 Projects；自修改任务可访问工程源码区。", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "工程根目录相对路径"}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}}}},
-                {"type": "function", "function": {"name": "code_read_file", "description": "读取代码文本。修改现有文件前必须先读取；禁止密钥、日志、模型、缓存和运行状态。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer", "minimum": 1000, "maximum": 100000}}, "required": ["path"]}}},
+                {"type": "function", "function": {"name": "code_read_file", "description": "读取代码文本。code_search_text 返回行号后必须用 start_line 从该行附近读取，不能反复读取文件开头；禁止密钥、日志、模型、缓存和运行状态。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000}, "max_chars": {"type": "integer", "minimum": 1000, "maximum": 100000}}, "required": ["path"]}}},
                 {"type": "function", "function": {"name": "code_search_text", "description": "在允许的代码目录中搜索文本并返回文件、行号和内容，用于先定位再修改。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": ["query"]}}},
                 {"type": "function", "function": {"name": "code_write_file", "description": "原子创建或完整写入一个代码/测试/README 文件。独立项目写到 Projects/<name>/。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
                 {"type": "function", "function": {"name": "code_replace_text", "description": "在已读取文件中精确替换原文，适合小范围修改，找不到原文会失败。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["path", "old", "new"]}}},
@@ -1642,6 +1706,8 @@ class HomeAgent:
             tools += [
                 {"type": "function", "function": {"name": "bilibili_open_favorite_video", "description": "在用户已经打开且已登录的普通浏览器中，按B站收藏夹真实数据顺序打开指定收藏夹第N个视频。B站收藏夹任务应优先调用；不会创建Chrome、Chromium或临时浏览器。", "parameters": {"type": "object", "properties": {"favorite_folder": {"type": "string", "description": "用户说出的收藏夹名称，例如二次元好看或默认收藏夹"}, "index": {"type": "integer", "minimum": 1, "description": "从1开始的视频序号"}}, "required": ["favorite_folder", "index"]}}},
                 {"type": "function", "function": {"name": "cloudmusic_search_and_play", "description": "在本地网易云音乐客户端搜索并播放指定歌曲，内置多轮精确选择、Enter备用策略和窗口标题验证。网易云指定歌曲播放任务必须优先调用，禁止用底部全局播放按钮代替选择搜索结果。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "任务计划给出的准确歌曲名"}}, "required": ["query"]}}},
+                {"type": "function", "function": {"name": "media_stop", "description": "幂等地向当前媒体会话发送系统“停止播放”命令。用户要求停止、暂停或关掉音乐时必须调用；禁止用 Space 切换播放状态，也禁止退出或终止音乐应用进程。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "process_status", "description": "只读查询指定 Windows 进程是否正在运行。进程不存在也返回 ok=true、running=false，避免把查询命令的退出码误当成工具失败。", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "进程映像名，例如 cloudmusic.exe"}}, "required": ["name"]}}},
                 {"type": "function", "function": {"name": "ui_analyze_screen", "description": "截取当前桌面并使用 MiMo 回答任务模型提出的视觉问题。用于判断用户在做什么、读取屏幕题目、识别游戏状态和每轮操作后的画面验证；question 必须说明本轮要识别的目标和证据。", "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "针对当前屏幕的具体分析问题，例如识别题干选项并求解，或判断游戏状态和下一步动作"}}, "required": ["question"]}}},
                 {"type": "function", "function": {"name": "ui_inspect_target", "description": "观察当前活动目标，判断是可读DOM网页、视觉网页还是原生程序。任何网页/界面任务第一步调用。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "ui_list_windows", "description": "读取当前可见窗口标题和进程，用于找到并验证目标程序以及媒体播放标题。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}}}},
@@ -1650,7 +1716,7 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "ui_click_window", "description": "在指定原生窗口中定位并单击目标。目标描述必须包含当前任务对象，不能用它代替播放指定搜索结果。失败重试时可用candidate_index切换视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
                 {"type": "function", "function": {"name": "ui_double_click_window", "description": "在指定原生窗口中定位并双击目标，适合选择并播放搜索结果行。必须明确描述目标标题，禁止描述底部全局播放按钮。若标题未变化，用candidate_index 1或2重试其他视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
                 {"type": "function", "function": {"name": "ui_analyze_window", "description": "使用 MiMo 图像理解读取指定窗口当前画面并返回文字观察。搜索提交后、选择结果前以及最终验证时调用。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "question": {"type": "string"}}, "required": ["title_contains", "question"]}}},
-                {"type": "function", "function": {"name": "ui_hotkey", "description": "向当前活动窗口发送按键组合。", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}, "required": ["keys"]}}},
+                {"type": "function", "function": {"name": "ui_hotkey", "description": "向当前活动窗口发送按键组合。媒体停止任务禁止使用 Space 或 Alt+F4，必须使用 media_stop。", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}, "required": ["keys"]}}},
                 {"type": "function", "function": {"name": "ui_type_active_text", "description": "向现有活动窗口已聚焦的输入框输入文字；浏览器无DOM时可在Ctrl+L后填写网址，绝不启动新浏览器。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "clear": {"type": "boolean"}}, "required": ["text"]}}},
                 {"type": "function", "function": {"name": "web_read", "description": "读取当前网页DOM/HTML的正文、链接、按钮和输入框。网页操作优先调用。", "parameters": {"type": "object", "properties": {"max_chars": {"type": "integer", "minimum": 1000, "maximum": 30000}}}}},
                 {"type": "function", "function": {"name": "web_navigate", "description": "仅在现有浏览器已开放CDP DOM时导航；无DOM时返回失败，绝不新建浏览器，改用现有窗口Ctrl+L。", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
@@ -1679,7 +1745,7 @@ class HomeAgent:
             ]
             shell_cfg = self.config.get("shell_execution", {})
             if shell_cfg.get("shell_enabled", True):
-                tools.append({"type": "function", "function": {"name": "run_shell", "description": "在本机非交互 PowerShell 中执行命令。由你根据任务和已观察信息决定命令、工作目录与超时；适合 PowerShell cmdlet、系统查询、文件和进程操作。执行后必须检查 exit_code、stdout、stderr，不得把调用本身当作成功。", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "完整 PowerShell 命令"}, "cwd": {"type": "string", "description": "可选工作目录"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"]}}})
+                tools.append({"type": "function", "function": {"name": "run_shell", "description": "在本机非交互 PowerShell 中执行命令。由你根据任务和已观察信息决定命令、工作目录与超时；适合 PowerShell cmdlet、系统查询和文件操作。停止音乐不等于退出应用，禁止为媒体停止任务执行 Stop-Process、taskkill 或其他进程终止命令。执行后必须检查 exit_code、stdout、stderr。", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "完整 PowerShell 命令"}, "cwd": {"type": "string", "description": "可选工作目录"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"]}}})
             if shell_cfg.get("cmd_enabled", True):
                 tools.append({"type": "function", "function": {"name": "run_cmd", "description": "在本机非交互 CMD 中执行命令。由你在 BAT/CMD 语法、传统 Windows 命令或需要 cmd.exe 时自主选择；执行后必须检查 exit_code、stdout、stderr。", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "完整 CMD 命令"}, "cwd": {"type": "string", "description": "可选工作目录"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300}}, "required": ["command"]}}})
         if self.config.get("agent", {}).get("model_driven_computer_actions", True):
@@ -1889,12 +1955,14 @@ class HomeAgent:
     async def analyze_current_screen(self, question: str, status=None) -> dict[str, Any]:
         """Capture the desktop and answer a visual question chosen by the task model."""
         screenshot = None
+        request_submitted_at = _iso_now()
         try:
             if status: status("正在截取屏幕…")
             
             with tempfile.NamedTemporaryFile(prefix="home-agent-screen-read-", suffix=".png", delete=False) as handle:
                 screenshot = Path(handle.name)
             image = await asyncio.to_thread(_grab_screen_with_retry, all_screens=False)
+            screenshot_captured_at = _iso_now()
             try:
                 await asyncio.to_thread(image.save, screenshot, "PNG")
             finally:
@@ -1912,7 +1980,12 @@ class HomeAgent:
                 
                 if not answer:
                     return {"ok": False, "error": "屏幕分析没有返回内容"}
-                response = {"ok": True, "observation": answer, "model": result.get("model"), "question": prompt}
+                response = {
+                    "ok": True, "observation": answer, "model": result.get("model"), "question": prompt,
+                    "request_submitted_at": request_submitted_at,
+                    "screenshot_captured_at": screenshot_captured_at,
+                    "analysis_completed_at": _iso_now(),
+                }
                 self.log_event("screen_analysis_completed", question=prompt[:200], answer=answer[:300])
                 return response
                 
@@ -1947,6 +2020,7 @@ class HomeAgent:
         return has_target and imperative
 
     async def chat(self, text: str, status=None, confirm=None, answer_ready=None, image_path: str | Path | None = None) -> str:
+        self.current_task_submitted_at = _iso_now()
         if self.is_restart_request(text):
             answer = "好的主人，Home Agent 正在重启。"
             self.restart_requested = True
@@ -1980,6 +2054,7 @@ class HomeAgent:
         self.current_code_task = code_task
         self.current_file_authoring_task = bool(task_plan.get("is_task") and task_plan.get("actionable") and task_plan.get("domain") == "file")
         self.current_code_self_edit = bool(code_task and self.self_upgrade.is_upgrade_request(text))
+        self.current_code_verified = not self.current_code_self_edit
         self.log_event("task_plan_created", task_plan=task_plan)
         if task_plan.get("requires_clarification"):
             answer = str(task_plan.get("clarification_question") or "我还缺少完成这项任务所需的关键信息，请补充一下具体目标。").strip()
@@ -2106,12 +2181,18 @@ class HomeAgent:
                 "每次工具返回后重新判断下一步，不得跳过选择目标和终态验证。"
                 "点击、输入、快捷键和滚动工具会自动等待并重新截图；必须读取 state_changed、post_action_verified 和 next_action。"
                 "若返回 status=uncertain 或 state_changed=false，不得继续假设操作成功，必须重新识别、切换候选点或使用另一种操作方式。"
+                "所有工具证据都带 task_submitted_at、tool_submitted_at、tool_completed_at 和 tool_sequence；判断状态时必须让较新的同对象证据覆盖旧证据。"
+                "Vision 的 vision_request_submitted_at/screenshot_captured_at 表示画面所属时刻，分析完成较晚时不得把旧画面当成当前状态。"
                 + ("当前是B站收藏夹任务：直接调用 bilibili_open_favorite_video，并把任务计划中的 favorite_folder 和 index 原样传入。"
                    "该工具会读取真实收藏夹顺序、复用现有登录浏览器并验证最终BV地址；不要用截图猜收藏夹入口。"
                    if task_plan.get("handler") == "bilibili_favorites" else "") +
                 ("当前是网易云指定歌曲任务：直接调用 cloudmusic_search_and_play，并把任务计划中的 query 原样传入。"
                  "该工具会在本地客户端进行多轮选择与标题验证；禁止自行点击底部全局播放按钮。"
-                 if task_plan.get("handler") == "cloudmusic_search" else "") +
+                if task_plan.get("handler") == "cloudmusic_search" else "") +
+                ("当前是停止媒体任务：只调用幂等 media_stop。停止音乐不等于退出应用；禁止 Space、播放按钮、Alt+F4、Stop-Process 和 taskkill。"
+                 if self._is_media_stop_plan(task_plan) else "") +
+                ("当前计划明确要求关闭应用或终止进程，可以在常规关闭无效后使用 Stop-Process/taskkill；执行后用 process_status 验证进程已退出。"
+                 if self._allows_application_termination(task_plan) else "") +
                 "网页先调用 ui_inspect_target；若是 browser_dom，优先 web_read/web_fill/web_click_text。"
                 "若是 browser_visual，必须保持现有浏览器，用 ui_hotkey Ctrl+L、ui_type_active_text、Enter 和窗口视觉工具操作。"
                 "禁止调用 launch_app 启动 Chrome/Edge/Firefox，也禁止为了DOM能力创建新浏览器。"
@@ -2172,6 +2253,8 @@ class HomeAgent:
             media_target_preexisting = False
             tool_failures: list[dict[str, str]] = []
             completion_evidence: list[dict[str, Any]] = []
+            tool_sequence = 0
+            code_inspection_iterations = 0
             completion_check_failures = 0
             local_code_verified = False
             max_failed_rounds = max(1, int(self.config["agent"].get("max_tool_rounds", 8)))
@@ -2279,7 +2362,9 @@ class HomeAgent:
                         await self._speak_home(session, answer, status)
                     return answer
                 for call in calls:
+                    tool_sequence += 1
                     name = call["function"]["name"]
+                    post_tool_instruction = ""
                     try:
                         args = self._parse_tool_arguments(call["function"].get("arguments"))
                     except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -2293,8 +2378,16 @@ class HomeAgent:
                         messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
                         continue
                     if status: status(f"正在调用工具：{name}")
-                    self.log_event("tool_started", tool=name, arguments=args)
+                    tool_submitted_at = _iso_now()
+                    tool_started = time.monotonic()
+                    self.log_event("tool_started", tool=name, arguments=args, sequence=tool_sequence, task_submitted_at=self.current_task_submitted_at, tool_submitted_at=tool_submitted_at)
                     result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
+                    if isinstance(result, dict):
+                        result.setdefault("task_submitted_at", self.current_task_submitted_at)
+                        result.setdefault("tool_submitted_at", tool_submitted_at)
+                        result.setdefault("tool_completed_at", _iso_now())
+                        result.setdefault("tool_elapsed_ms", int((time.monotonic() - tool_started) * 1000))
+                        result.setdefault("tool_sequence", tool_sequence)
                     completion_evidence.append({"tool": name, "result": result})
                     if isinstance(result, dict) and result.get("status") == "failed":
                         round_failed = True
@@ -2354,9 +2447,25 @@ class HomeAgent:
                         long_term_stored = True
                     if name == "code_validate_project" and isinstance(result, dict) and result.get("ok") is True:
                         local_code_verified = True
+                        if self.current_code_self_edit:
+                            self.current_code_verified = True
+                    if code_task:
+                        if name in {"code_write_file", "code_replace_text"} and isinstance(result, dict) and result.get("ok"):
+                            code_inspection_iterations = 0
+                        elif name in {"code_list_files", "code_read_file", "code_search_text"}:
+                            code_inspection_iterations += 1
+                            if code_inspection_iterations == 8:
+                                post_tool_instruction = "已经连续8次只读检查而没有编辑。请使用搜索结果的行号调用 code_read_file(start_line=行号附近)，随后立即 code_replace_text/code_write_file；禁止再次读取文件开头。"
+                            elif code_inspection_iterations >= 12:
+                                round_failed = True
+                                failure_reason = "本地代码工具连续12次只读检查且没有产生编辑，已停止无进展循环"
+                                tool_failures.append({"tool": name, "reason": failure_reason})
+                                post_tool_instruction = failure_reason + "。必须立即编辑并验证，或结束本地路径交给后备执行器。"
                     self.log_event("tool_completed", tool=name, result=result)
                     if status: status(f"已完成：工具 {name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
+                    if post_tool_instruction:
+                        messages.append({"role": "system", "content": post_tool_instruction})
                 if round_failed:
                     failed_rounds += 1
         failure_summary = "；".join(f"{row['tool']}：{row['reason']}" for row in tool_failures[-6:])
@@ -2370,6 +2479,8 @@ class HomeAgent:
             if result.get("error"):
                 answer = f"本地代码工具未能完成验证，Codex 后备也失败了：{result['error']}"
             else:
+                if self.current_code_self_edit:
+                    self.current_code_verified = True
                 answer = str(result.get("answer", "代码任务已通过后备执行器完成。"))
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
             self._publish_answer(answer, answer_ready)
@@ -2395,7 +2506,11 @@ class HomeAgent:
                     default_path = "HomeAgent" if self_edit else "Projects"
                     return await asyncio.to_thread(editor.list_files, str(args.get("path") or default_path), self_edit, int(args.get("limit", 300)))
                 if name == "code_read_file":
-                    return await asyncio.to_thread(editor.read_file, str(args.get("path", "")), self_edit, int(args.get("max_chars", 30000)))
+                    return await asyncio.to_thread(
+                        editor.read_file, str(args.get("path", "")), self_edit,
+                        int(args.get("max_chars", 30000)), int(args.get("start_line", 1)),
+                        int(args.get("max_lines", 500)),
+                    )
                 if name == "code_search_text":
                     default_path = "HomeAgent" if self_edit else "Projects"
                     return await asyncio.to_thread(editor.search_text, str(args.get("query", "")), str(args.get("path") or default_path), self_edit, int(args.get("limit", 100)))
@@ -2417,6 +2532,25 @@ class HomeAgent:
             plan = getattr(self, "current_task_plan", {})
             query = str(args.get("query") or plan.get("query") or "").strip()
             return await self._run_cloudmusic_search_and_play(query, status)
+        if name == "process_status":
+            process_name = str(args.get("name") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_. -]{1,120}(?:\.exe)?", process_name):
+                return {"error": "进程名格式无效"}
+            if not process_name.lower().endswith(".exe"):
+                process_name += ".exe"
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                ["tasklist", "/fo", "csv", "/nh", "/fi", f"imagename eq {process_name}"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                check=False,
+            )
+            stdout = CommandExecutor._decode(completed.stdout)
+            rows = []
+            for row in csv.reader(stdout.splitlines()):
+                if row and row[0].casefold() == process_name.casefold():
+                    rows.append({"name": row[0], "pid": int(row[1]) if len(row) > 1 and row[1].isdigit() else None})
+            return {"ok": True, "process_name": process_name, "running": bool(rows), "processes": rows, "observed_at": _iso_now()}
         if name == "bilibili_open_favorite_video":
             plan = getattr(self, "current_task_plan", {})
             folder_name = str(args.get("favorite_folder") or plan.get("favorite_folder") or "默认收藏夹").strip()
@@ -2512,7 +2646,13 @@ class HomeAgent:
             vision_python = ROOT / ".venv" / "Scripts" / "python.exe"
             python_executable = str(vision_python if vision_python.exists() else Path(sys.executable))
             analysis_env = os.environ.copy(); analysis_env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
-            proc = await asyncio.create_subprocess_exec(python_executable, str(script), "--title", title, "--prompt", question, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, env=analysis_env)
+            request_submitted_at = _iso_now()
+            proc = await asyncio.create_subprocess_exec(
+                python_executable, str(script), "--title", title, "--prompt", question,
+                "--request-submitted-at", request_submitted_at,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, env=analysis_env,
+            )
             out, err = await proc.communicate()
             try: result = json.loads(out.decode("utf-8", "replace").splitlines()[-1])
             except (json.JSONDecodeError, IndexError): result = {"ok": False, "error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
@@ -2525,6 +2665,7 @@ class HomeAgent:
             "ui_click_window": ("window_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "topk": 3, "idx": max(0, min(2, int(a.get("candidate_index", 0))))}),
             "ui_double_click_window": ("window_double_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "topk": 3, "idx": max(0, min(2, int(a.get("candidate_index", 0))))}),
             "ui_hotkey": ("desktop_hotkey", lambda a: {"keys": [str(key) for key in a.get("keys", [])]}),
+            "media_stop": ("desktop_media_stop", lambda a: {}),
             "ui_type_active_text": ("desktop_type_active_text", lambda a: {"text": str(a.get("text", "")), "clear": bool(a.get("clear", True))}),
             "web_read": ("web_read", lambda a: {"max_chars": max(1000, min(30000, int(a.get("max_chars", 12000))))}),
             "web_navigate": ("navigate", lambda a: {"url": str(a.get("url", ""))}),
@@ -2534,21 +2675,37 @@ class HomeAgent:
             "web_get_url": ("get_url", lambda a: {}),
         }
         if name in vision_tool_map:
+            tool_name, build_arguments = vision_tool_map[name]
+            arguments = build_arguments(args)
+            plan = getattr(self, "current_task_plan", {})
+            if name == "ui_hotkey" and self._is_media_stop_plan(plan):
+                keys = {str(key).strip().lower() for key in arguments.get("keys", [])}
+                if "space" in keys or ({"alt", "f4"} <= keys):
+                    return {
+                        "error": "媒体停止任务禁止使用可反转的 Space 或关闭应用的 Alt+F4；请调用 media_stop",
+                        "executed": False, "executed_tool": tool_name,
+                    }
             if not self.config.get("vision_mcp", {}).get("enabled", False):
                 return {"error": "网页/界面执行服务未启用"}
             if not await asyncio.to_thread(self.ensure_vision_service, True):
                 return {"error": "网页/界面执行服务未就绪"}
-            tool_name, build_arguments = vision_tool_map[name]
-            arguments = build_arguments(args)
             if name == "web_navigate" and not str(arguments.get("url", "")).lower().startswith(("http://", "https://")):
                 return {"error": "只允许导航到 HTTP/HTTPS 地址"}
             try:
+                vision_submitted_at = _iso_now()
+                vision_started = time.monotonic()
                 observation_raw = await self._vision_mcp_call(tool_name, arguments)
+                vision_completed_at = _iso_now()
                 try:
                     observation = ast.literal_eval(observation_raw)
                 except (ValueError, SyntaxError):
                     observation = observation_raw
-                result = {"ok": True, "observation": observation, "executed_tool": tool_name}
+                result = {
+                    "ok": True, "observation": observation, "executed_tool": tool_name,
+                    "vision_request_submitted_at": vision_submitted_at,
+                    "vision_response_completed_at": vision_completed_at,
+                    "vision_elapsed_ms": int((time.monotonic() - vision_started) * 1000),
+                }
                 if isinstance(observation, dict) and "state_changed" in observation:
                     changed = bool(observation.get("state_changed"))
                     result.update({"post_action_verified": changed, "status": "success" if changed else "uncertain", "next_action": observation.get("next_action")})
@@ -2644,6 +2801,14 @@ class HomeAgent:
             cwd = self._allowed_path(cwd_value)
             if not cwd.is_dir(): return {"error": f"工作目录不存在：{cwd}"}
             command = str(args.get("command") or "").strip()
+            plan = getattr(self, "current_task_plan", {})
+            termination = bool(re.search(r"(?i)\b(stop-process|taskkill|kill|terminate-process)\b", command))
+            media_process = bool(re.search(r"(?i)\b(cloudmusic|netease|spotify|music)\b", command))
+            if self._is_media_stop_plan(plan) and termination and media_process and not self._allows_application_termination(plan):
+                return {
+                    "error": "用户要求停止媒体播放，不是退出应用；已阻止终止音乐进程，请调用 media_stop",
+                    "executed": False, "blocked_by": "media_process_termination_guard",
+                }
             if cfg.get("confirm_before_execute", False) and not await self._confirm_control(f"使用 {kind} 执行命令：{command[:200]}", confirm): return {"cancelled": True}
             executor = getattr(self, "command_executor", None) or CommandExecutor(ROOT)
             return await asyncio.to_thread(

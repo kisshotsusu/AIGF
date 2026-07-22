@@ -271,6 +271,7 @@ class DesktopPet:
             self.set_status("已停止")
         except Exception as exc:
             self.agent.log_event("chat_error", error=str(exc))
+            self.agent.self_upgrade.fail(str(exc))
             self.root.after(0, lambda e=str(exc): self._append("error", "错误", e))
             self.set_status("发生错误")
         finally:

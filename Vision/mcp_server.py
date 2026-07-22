@@ -231,6 +231,12 @@ def desktop_hotkey(keys: list[str]) -> str:
     return str(agent.desktop_hotkey(keys))
 
 
+@mcp.tool()
+def desktop_media_stop() -> str:
+    """幂等停止当前媒体播放，不切换播放状态，也不退出媒体应用。"""
+    return str(agent.desktop_media_stop())
+
+
 if __name__ == "__main__":
     from pathlib import Path
     from modules.live.ai_live_assistant.instance_lock import InstanceLock

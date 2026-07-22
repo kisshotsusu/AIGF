@@ -17,11 +17,13 @@ import sys
 import io
 import ctypes
 import ctypes.wintypes
+from ctypes import wintypes
 import subprocess
 import time
 import json
 import urllib.request
 import threading
+from datetime import datetime
 
 import torch
 from PIL import Image, ImageChops, ImageGrab, ImageStat
@@ -493,6 +495,18 @@ def _grab_windows_image(*, hwnd: int | None = None, bbox=None, all_screens: bool
                 try:
                     source = ImageGrab.grab(**kwargs)
                     converted = source.convert("RGB")
+                    if label == "hwnd":
+                        sample = converted.resize((32, 32))
+                        stats = ImageStat.Stat(sample)
+                        if max(stats.mean) < 2.0 and max(stats.stddev) < 1.0:
+                            errors.append("hwnd: captured image is blank; falling back to screen bounds")
+                            if sample is not converted:
+                                sample.close()
+                            if converted is not source:
+                                converted.close()
+                            continue
+                        if sample is not converted:
+                            sample.close()
                     if converted is source:
                         if hasattr(converted, "copy"):
                             return converted.copy()
@@ -801,6 +815,35 @@ def desktop_hotkey(keys: list[str]):
         delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
         evidence = _visual_change_evidence(before, desktop_screenshot_pil()); evidence["waited_ms"] = delay
     return {**result, **evidence}
+
+
+def desktop_media_stop():
+    """Send the idempotent Windows media-stop command without closing an app."""
+    if os.name != "nt":
+        raise RuntimeError("media stop currently only supports Windows")
+    user32 = ctypes.windll.user32
+    send_message_timeout = user32.SendMessageTimeoutW
+    send_message_timeout.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    send_message_timeout.restype = wintypes.LPARAM
+    hwnd = int(user32.GetForegroundWindow())
+    if not hwnd:
+        raise RuntimeError("no foreground window is available for media stop")
+    result = ctypes.c_size_t()
+    delivered = bool(send_message_timeout(
+        hwnd, 0x0319, hwnd, 13 << 16, 0x0002, 1500, ctypes.byref(result),
+    ))
+    if not delivered:
+        raise RuntimeError("Windows media-stop command was not delivered")
+    return {
+        "ok": True, "requested_state": "stopped", "command": "media_stop",
+        "idempotent": True, "target_hwnd": hwnd,
+        "action_sent_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "execution_likely_succeeded": True,
+        "next_action": "媒体停止命令已送达；不要再发送 Space、播放命令或终止应用进程",
+    }
 
 
 def desktop_type_text(instruction: str, text: str):

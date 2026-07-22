@@ -98,12 +98,16 @@ class MiMoMultimodalClient:
     async def verify_completion(self, session: aiohttp.ClientSession, task: str, plan: dict[str, Any], answer: str, evidence: list[dict[str, Any]]) -> dict[str, Any]:
         if not self.config.get("enabled") or not self.config.get("completion_check_enabled"):
             return {"passed": True, "reason": "完成检查已关闭", "next_action": ""}
-        compact_evidence = json.dumps(evidence[-12:], ensure_ascii=False, default=str)[:12000]
+        compact_evidence = json.dumps(evidence[-20:], ensure_ascii=False, default=str)[:18000]
         prompt = (
             "你是独立任务完成核验器。只根据工具证据判断任务是否真正完成，不能依据助手的口头声明。"
             "先按任务计划区分类型：observe、查询、读取、分析等只读任务，只要成功的工具证据已取得用户所问信息，"
             "就应判定完成，不得额外要求被观察对象达到终态；点击、输入、播放、提交、修改等操作任务，"
-            "没有成功状态、终态字段或可验证观察时必须判定失败。只输出 JSON："
+            "没有成功状态、终态字段或可验证观察时必须判定失败。证据包含 task_submitted_at、tool_submitted_at、"
+            "tool_completed_at 和 tool_sequence；必须按 tool_sequence/完成时间判断新旧，同一对象的较新状态覆盖较早状态，"
+            "不得用操作前或分析耗时期间已经过期的窗口/进程状态否定较新的终态证据。视觉分析只代表其截图采集时刻，"
+            "返回较晚不等于画面仍然新鲜。媒体停止命令若明确为 idempotent、requested_state=stopped 且已成功送达，"
+            "不得要求用可反转的播放切换键再次确认。只输出 JSON："
             '{"passed":true或false,"reason":"简短依据","next_action":"失败时给出下一步工具动作"}。\n'
             f"用户任务：{task}\n任务计划：{json.dumps(plan, ensure_ascii=False)}\n候选回复：{answer}\n工具证据：{compact_evidence}"
         )

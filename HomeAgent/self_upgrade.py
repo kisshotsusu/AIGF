@@ -130,6 +130,18 @@ class SelfUpgradeManager:
     def cancel(self) -> None:
         self.clear()
 
+    def fail(self, error: str) -> None:
+        """Keep diagnostics for a handled failure without auto-resuming it."""
+        state = self.read()
+        if not state:
+            return
+        state.update({
+            "status": "failed", "current_step": "任务执行失败",
+            "last_error": str(error)[:2000],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        self._write(state)
+
     def resume_prompt(self) -> str:
         state = self.read()
         status = state.get("status")

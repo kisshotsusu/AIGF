@@ -137,7 +137,7 @@
 
 ## 本轮新增验证
 
-HomeAgent 当前 70 项测试通过，其中覆盖 MiMo 图片请求结构、剪贴板截图、ASR 请求结构、格式限制、完成检查 JSON、CMD 引号、GB18030 日志、截图重试、非法工具参数、截断响应、模型规划路由与主动关怀上下文；Vision 5 项窗口/截图可靠性测试和直播 5 项测试通过。
+HomeAgent 当前 77 项测试通过，其中覆盖 MiMo 图片请求结构、剪贴板截图、ASR 请求结构、格式限制、完成检查 JSON、证据时间排序、媒体停止与强制终止区分、Codex stdin、CMD 引号、GB18030 日志、截图重试、非法工具参数、截断响应、模型规划路由与主动关怀上下文；Vision 7 项窗口/截图/媒体停止可靠性测试和直播 5 项测试通过。
 
 `modules/live/tests/test_reliable_speech.py` 已覆盖：
 
@@ -227,3 +227,11 @@ HomeAgent 当前 70 项测试通过，其中覆盖 MiMo 图片请求结构、剪
 - HomeAgent 与 Vision 截图统一串行、最多重试 3 次；窗口截图优先使用 HWND，再退回边界截图，整屏 GDI 不可用时退回当前前台窗口。操作后截图失败改为未验证失败，不再伪造 `state_changed=true`。
 - `run_cmd` 改用 Windows CMD 的原生字符串调用，修复内部双引号被转义后 `tasklist /fi "imagename eq devenv.exe"` 报 `Invalid argument - eq`。
 - `read_text_file` 在 UTF-8 之外支持带 BOM 的 UTF-16 与 GB18030 文本日志，同时继续拒绝含 NUL 的二进制内容；最近失败的 `logs/assistant.log` 与 `Vision/logs/vision-mcp.log` 均已实读验证。
+
+## 2026-07-22 音乐停止确认与子升级修复
+
+- 最近日志中的音乐任务先发送 Space 暂停、随后再次发送 Space 恢复播放，又误用点击、Alt+F4 和 `Stop-Process`；最终核验还用旧窗口证据覆盖较新的进程状态。现在停止音乐只走幂等系统 Media Stop，明确退出/终止进程的任务仍保留强制终止能力。
+- 工具、Vision 请求、窗口截图与分析结果统一记录带时区的提交/采集/完成时间和递增序号；MiMo 完成检查按最新证据判断，分析完成较晚不会让旧截图变成当前状态。纯黑 HWND 截图自动退回窗口边界截图。
+- 子升级日志中的 112 次无进展读取来自搜索命中后反复读取 `agent.py` 文件开头。代码读取新增 `start_line/max_lines`，连续 8 次只读会纠偏，12 次仍无编辑则熔断并交给后备执行器。
+- Codex 后备任务不再把大型开发合同作为 Windows 命令行参数，而使用 `codex exec ... -` 从 stdin 接收；进程启动/提示投递异常会写明失败并把恢复状态标记为 `failed`，不会在重启后重复执行。真实只读冒烟已确认 CLI 能启动、接收 stdin 并返回 `turn.completed`；本次网络曾发生 WebSocket 超时并自动退回 HTTPS。
+- 重启后的真实 Vision MCP `desktop_media_stop` 已返回 `ok=true`、`requested_state=stopped`、`idempotent=true` 与 `action_sent_at`；8765 只有一个监听进程，失败升级遗留的 `task-recovery.json` 未被重新创建。

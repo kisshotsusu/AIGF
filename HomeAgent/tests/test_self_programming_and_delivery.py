@@ -150,6 +150,54 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SelfProgrammingTests(unittest.TestCase):
+    def test_code_reader_can_jump_to_search_match_line(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            target = root / "Projects" / "demo.py"
+            target.parent.mkdir()
+            target.write_text("".join(f"line_{number}\n" for number in range(1, 31)), encoding="utf-8")
+            editor = CodeEditorModule(root, home)
+            result = editor.read_file("Projects/demo.py", start_line=17, max_lines=3)
+        self.assertEqual(result["start_line"], 17)
+        self.assertEqual(result["end_line"], 19)
+        self.assertEqual(result["content"], "line_17\nline_18\nline_19\n")
+
+    def test_codex_exec_reads_large_prompt_from_stdin(self) -> None:
+        command = HomeAgent._codex_exec_command(
+            [r"C:\node.exe", r"E:\codex.js"],
+            {"skip_git_repo_check": True, "sandbox": "danger-full-access"},
+        )
+        self.assertEqual(command[-1], "-")
+        self.assertEqual(command[:4], [r"C:\node.exe", r"E:\codex.js", "exec", "--json"])
+        self.assertNotIn("用户任务", " ".join(command))
+
+    def test_failed_self_upgrade_is_diagnostic_not_auto_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {"enabled": True}})
+            manager.begin("修改 HomeAgent 代码")
+            manager.fail("Codex CLI 启动失败")
+            state = manager.read()
+            self.assertEqual(state["status"], "failed")
+            self.assertEqual(state["last_error"], "Codex CLI 启动失败")
+            self.assertEqual(manager.resume_prompt(), "")
+
+    def test_media_stop_and_forced_process_termination_are_distinct_plans(self) -> None:
+        self.assertTrue(HomeAgent._is_media_stop_plan({
+            "operation": "stop_media", "required_capabilities": ["media_control"],
+        }))
+        forced = {
+            "operation": "terminate_process",
+            "handler": "cloudmusic_control",
+            "required_capabilities": ["process_termination"],
+        }
+        self.assertTrue(HomeAgent._allows_application_termination(forced))
+        self.assertFalse(HomeAgent._is_media_stop_plan(forced))
+
     def test_malformed_tool_arguments_are_rejected_instead_of_becoming_empty(self) -> None:
         with self.assertRaises(json.JSONDecodeError):
             HomeAgent._parse_tool_arguments('{"path":')

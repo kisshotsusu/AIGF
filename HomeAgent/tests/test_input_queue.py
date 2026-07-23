@@ -13,7 +13,7 @@ if str(HOME_AGENT) not in sys.path:
 
 from PySide6.QtCore import QMimeData
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 from qt_app import ClipboardImageTextEdit, HomeAgentWindow
 
 
@@ -46,6 +46,28 @@ class InputQueueTests(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual((received[0].width(), received[0].height()), (12, 8))
         self.assertEqual(editor.toPlainText(), "")
+
+    def test_pasted_image_displays_thumbnail_preview_and_remove_clears_it(self):
+        window = self.make_window_stub()
+        window.bridge = Mock()
+        window.attachment_preview = QLabel()
+        window.attachment_preview.setFixedSize(180, 96)
+        window.attachment_label = QLabel()
+        window.remove_attachment_btn = QPushButton()
+        image = QImage(320, 180, QImage.Format_ARGB32)
+        image.fill(0xFF3A7F72)
+        with tempfile.TemporaryDirectory() as folder, patch("qt_app.tempfile.gettempdir", return_value=folder):
+            window.accept_pasted_image(image)
+            saved = Path(window.pending_image_path)
+            self.assertTrue(saved.is_file())
+            self.assertFalse(window.attachment_preview.pixmap().isNull())
+            self.assertFalse(window.attachment_preview.isHidden())
+            self.assertIn("320×180", window.attachment_label.text())
+            window.remove_pending_attachment()
+            self.assertIsNone(window.pending_image_path)
+            self.assertTrue(window.attachment_preview.isHidden())
+            self.assertTrue(window.attachment_preview.pixmap().isNull())
+            self.assertFalse(saved.exists())
 
     def test_busy_image_only_send_keeps_attachment_in_queue(self):
         window = self.make_window_stub(); window.worker = Mock(); window.worker.isRunning.return_value = True

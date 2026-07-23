@@ -147,6 +147,7 @@ GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露 `vision_gui_task`；`pr
 ## 剪贴板截图输入（2026-07-22）
 
 - Qt `ClipboardImageTextEdit` 拦截包含图片的粘贴操作，Tk 后备界面通过 `ImageGrab.grabclipboard` 读取；普通文本粘贴维持编辑器默认行为。
+- Qt 附件区使用 `attachment_preview` 显示按比例缩放的 180×96 截图缩略图；替换、移除或发送附件时同步清空预览，原始临时 PNG 尺寸不受影响。
 - `HomeAgent.chat(..., image_path=...)` 接受本轮临时图片，`_image_message_content` 构造 `image_url + text` 的 MiMo 兼容内容数组，编码上限 10 MB。
 - 只分析已附图片时不等同于读取实时屏幕：规划器应输出 `visual_required=false`，无需调用 `ui_analyze_screen`。
 

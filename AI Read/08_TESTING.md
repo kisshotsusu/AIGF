@@ -16,7 +16,7 @@
 
 ## 2. 一键自动测试
 
-### HomeAgent（当前 77 项）
+### HomeAgent（当前 78 项）
 
 必须从 `HomeAgent` 目录运行，否则 `agent` 和本地模块导入路径不正确：
 
@@ -30,7 +30,7 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 | 文件 | 数量 | 覆盖内容 |
 |---|---:|---|
 | `tests/test_command_executor.py` | 4 | PowerShell/CMD 执行、工作目录、非零退出码、CMD 内部双引号保持 |
-| `tests/test_input_queue.py` | 5 | 剪贴板截图、忙碌时 FIFO 排队、任务完成续跑、重启时不误启动队列 |
+| `tests/test_input_queue.py` | 6 | 剪贴板截图、实际缩略图预览与移除清理、忙碌时 FIFO 排队、任务完成续跑、重启时不误启动队列 |
 | `tests/test_mimo_multimodal.py` | 15 | MiMo 图片/ASR 请求、完成检查、严格布尔值、关闭 thinking、证据时序、媒体 Stop 防反转、Vision 请求时间、截图重试、GB18030、关怀上下文与消息/TTS 顺序 |
 | `tests/test_self_programming_and_delivery.py` | 44 | 本地代码工具、按行读取、Codex stdin、规划路由、停止/强制终止区分、绝对路径权限、伪工具调用、失败轮预算、重启恢复清理、自升级验证、原子写入与测试门禁 |
 | `tests/test_system_startup.py` | 4 | 开机启动标记、手动启动保护、联网失败最多重启 5 次、成功后计数清零 |
@@ -193,3 +193,20 @@ Set-Location E:\Doc\AIAgent\Vision
 ```
 
 Codex stdin 真实冒烟应使用 `--sandbox read-only -` 和不会修改文件的短提示。通过标准是输出含 `thread.started`、最终 assistant message 与 `turn.completed`；网络重连或 HTTP 回退应单独记录为环境延迟，不能把缺少 `turn.completed` 当成功。
+
+## 9. hatch-pet 技能（2026-07-23）
+
+必须使用 `load_workspace_dependencies` 返回的 Python，不能使用裸 `python`。从技能目录运行自带测试，并确认 Home Agent 能在 `list_skills()` 中发现 `hatch-pet`：
+
+```powershell
+$PYTHON = "<load_workspace_dependencies 返回的 Python 路径>"
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+Set-Location E:\Doc\AIAgent\Skill\hatch-pet
+& $PYTHON -m unittest discover -s tests -p "test_*.py" -v
+
+Set-Location E:\Doc\AIAgent\HomeAgent
+& ..\.venv\Scripts\python.exe -c "from agent import HomeAgent; print(any(x['name']=='hatch-pet' for x in HomeAgent.__new__(HomeAgent).list_skills()))"
+```
+
+通过标准：6 个技能测试文件中的 28 个用例全部通过，发现检查输出 `True`，项目副本没有 `__pycache__`、`.pyc` 或缺失的脚本/参考文件。Windows 上必须启用 UTF-8 模式，否则测试中的无参数 `Path.read_text()` 会按系统 GBK 解码生成的 UTF-8 提示文件。

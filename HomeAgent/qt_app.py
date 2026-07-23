@@ -588,6 +588,13 @@ class HomeAgentWindow(QMainWindow):
         composer = QFrame(); composer.setObjectName("composer"); c = QHBoxLayout(composer); c.setContentsMargins(14, 10, 14, 12); c.setSpacing(8)
         input_box = QVBoxLayout(); input_box.setSpacing(4)
         self.input = ClipboardImageTextEdit(); self.input.setObjectName("input"); self.input.setPlaceholderText("输入任务或直接粘贴截图…  Ctrl + Enter 发送"); self.input.setMaximumHeight(76); self.input.setMinimumHeight(56); input_box.addWidget(self.input)
+        self.attachment_preview = QLabel()
+        self.attachment_preview.setObjectName("attachmentPreview")
+        self.attachment_preview.setAlignment(Qt.AlignCenter)
+        self.attachment_preview.setFixedSize(180, 96)
+        self.attachment_preview.setToolTip("待发送截图预览")
+        self.attachment_preview.hide()
+        input_box.addWidget(self.attachment_preview, 0, Qt.AlignLeft)
         attachment_row = QHBoxLayout(); self.attachment_label = QLabel("已粘贴截图"); self.attachment_label.setObjectName("attachmentLabel"); self.remove_attachment_btn = QPushButton("移除"); self.remove_attachment_btn.setObjectName("attachmentRemove"); self.remove_attachment_btn.setFixedSize(58, 24); attachment_row.addWidget(self.attachment_label); attachment_row.addStretch(); attachment_row.addWidget(self.remove_attachment_btn); input_box.addLayout(attachment_row); self.attachment_label.hide(); self.remove_attachment_btn.hide(); c.addLayout(input_box, 1)
         actions = QVBoxLayout(); actions.setSpacing(8); top = QHBoxLayout(); self.voice_btn = QPushButton("语音"); self.voice_btn.setObjectName("softButton"); self.send_btn = QPushButton("发送"); self.send_btn.setObjectName("primaryButton"); top.addWidget(self.voice_btn); top.addWidget(self.send_btn); actions.addLayout(top)
         self.stop_btn = QPushButton("停止当前任务"); self.stop_btn.setObjectName("stopButton"); self.stop_btn.setEnabled(False); actions.addWidget(self.stop_btn); c.addLayout(actions); root.addWidget(composer)
@@ -623,16 +630,31 @@ class HomeAgentWindow(QMainWindow):
         self.worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action, image_path=image_path); self.worker.start()
 
     def accept_pasted_image(self, image):
+        if not isinstance(image, QImage) or image.isNull():
+            self.bridge.error.emit("剪贴板图片无效，无法预览")
+            return
         folder = Path(tempfile.gettempdir()) / "home-agent-clipboard"; folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"clipboard_{uuid.uuid4().hex}.png"
         if not image.save(str(path), "PNG"):
             self.bridge.error.emit("无法保存剪贴板截图")
             return
         self.remove_pending_attachment()
-        self.pending_image_path = str(path); self.attachment_label.setText(f"已粘贴截图 · {image.width()}×{image.height()}"); self.attachment_label.show(); self.remove_attachment_btn.show(); self.set_status("截图已附加，可输入问题后发送")
+        preview = QPixmap.fromImage(image).scaled(
+            self.attachment_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.pending_image_path = str(path)
+        self.attachment_preview.setPixmap(preview)
+        self.attachment_preview.show()
+        self.attachment_label.setText(f"已粘贴截图 · {image.width()}×{image.height()}")
+        self.attachment_label.show()
+        self.remove_attachment_btn.show()
+        self.set_status("截图已附加，可预览内容并输入问题后发送")
 
     def _take_pending_attachment(self):
         path = getattr(self, "pending_image_path", None); self.pending_image_path = None
+        if hasattr(self, "attachment_preview"):
+            self.attachment_preview.clear()
+            self.attachment_preview.hide()
         if hasattr(self, "attachment_label"): self.attachment_label.hide()
         if hasattr(self, "remove_attachment_btn"): self.remove_attachment_btn.hide()
         return path
@@ -892,6 +914,7 @@ QScrollArea {{ background: {COLORS['window']}; }} QScrollArea > QWidget > QWidge
 #progressCard {{ background: #F7F9F9; border: 1px solid #DFE7E7; border-radius: 12px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #FAFBFB; border-color: #E4EAEA; }} #progressToggle {{ min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #526568; font-size: 19px; font-weight: 500; }} #progressToggle:hover {{ background: #E7EFEE; color: #16766F; }} #progressTitle {{ color: #263638; font-size: 13px; font-weight: 700; }} #progressSummary {{ color: #657578; font-size: 12px; }} #progressElapsed {{ color: #809093; font-size: 11px; }} #progressDetails {{ border-top: 1px solid #E4EAEA; }} #progressCurrent {{ color: #34484B; font-size: 12px; }} #progressDone {{ color: #657578; font-size: 12px; }}
 #composer {{ background: {COLORS['panel']}; border-top: 1px solid {COLORS['line']}; border-bottom-left-radius: 22px; border-bottom-right-radius: 22px; }}
 #input, QLineEdit, QComboBox, QTextBrowser {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 12px; padding: 10px; selection-background-color: {COLORS['accent']}; }} #input:focus, QLineEdit:focus {{ border: 1px solid {COLORS['accent']}; }}
+#attachmentPreview {{ background: #F7FBFA; border: 1px solid {COLORS['line']}; border-radius: 10px; padding: 3px; }}
 #attachmentLabel {{ color: {COLORS['accent']}; font-size: 12px; }} #attachmentRemove {{ min-height: 22px; padding: 0 9px; background: {COLORS['soft']}; color: {COLORS['accent']}; border: 0; font-size: 11px; }}
 QPushButton {{ min-height: 34px; padding: 0 15px; border-radius: 10px; font-weight: 600; }} #primaryButton {{ background: {COLORS['accent']}; color: white; border: 0; }} #primaryButton:hover {{ background: {COLORS['accent_hover']}; }} #softButton {{ background: {COLORS['soft']}; color: {COLORS['accent']}; border: 0; }} #stopButton {{ background: white; color: {COLORS['danger']}; border: 1px solid #EBC1BF; }} #stopButton:disabled {{ color: #AAB4B5; border-color: {COLORS['line']}; }}
 QDialog {{ background: {COLORS['window']}; }} #dialogTitle {{ font-size: 22px; font-weight: 700; }} QTabWidget::pane {{ border: 1px solid {COLORS['line']}; border-radius: 12px; background: white; }} QTabBar::tab {{ padding: 9px 18px; }} QTabBar::tab:selected {{ color: {COLORS['accent']}; font-weight: 700; }}

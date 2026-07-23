@@ -10,6 +10,8 @@
 | `Vision/` | 网页 DOM MCP、可选 GUI 图像识别 | `mcp_server.py`，端口 8765 |
 | `Sound/` | SenseVoice 本地 STT MCP | `Sound/mcp_server.py` |
 | `Skill/` | 可复用 Agent 技能 | 每个目录的 `SKILL.md` 与 `scripts/` |
+
+`Skill/hatch-pet/` 是从 Codex 本地技能复制并项目化的完整 v2 桌宠生产工具包，包含技能合同、17 个确定性图片处理脚本、3 份参考规范、代理配置、许可证和 6 个回归测试文件。它负责 8×11 动画图集的准备、帧提取、方向检查、透明边缘处理、校验和打包；视觉生成仍按技能合同调用 `$imagegen`。
 | `workspace/` | 身份、人格、场景规则、旧式每日记忆、角色图片 | 动态读取 |
 | `LongTermMemory/` | SQLite 长期记忆 | `memory.db` |
 | `Task/` | 一次性与周期提醒任务 | HomeAgent 调度器 |

@@ -1,6 +1,6 @@
 # 测试项目与验证流程
 
-最后核对：2026-07-22。所有命令默认在 `E:\Doc\AIAgent` 执行；除特别说明外均使用项目虚拟环境 `.venv\Scripts\python.exe`。
+最后核对：2026-07-24。所有命令默认在 `E:\Doc\AIAgent` 执行；除特别说明外均使用项目虚拟环境 `.venv\Scripts\python.exe`。
 
 ## 1. 测试层级与通过标准
 
@@ -16,7 +16,7 @@
 
 ## 2. 一键自动测试
 
-### HomeAgent（当前 81 项）
+### HomeAgent（当前 97 项）
 
 必须从 `HomeAgent` 目录运行，否则 `agent` 和本地模块导入路径不正确：
 
@@ -30,11 +30,11 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 | 文件 | 数量 | 覆盖内容 |
 |---|---:|---|
 | `tests/test_command_executor.py` | 4 | PowerShell/CMD 执行、工作目录、非零退出码、CMD 内部双引号保持 |
-| `tests/test_input_queue.py` | 10 | 剪贴板多图片、文件选择器、用户原文件保护、独立缩略图与单张移除、后台原图编码、保存完成后发送、稳定预览面板、边缘/四角缩放与最小尺寸、忙碌时 FIFO 排队、任务完成续跑、重启门禁 |
-| `tests/test_mimo_multimodal.py` | 16 | MiMo 单图/多图/ASR 请求、完成检查、严格布尔值、关闭 thinking、证据时序、媒体 Stop 防反转、Vision 请求时间、截图重试、GB18030、关怀上下文与消息/TTS 顺序 |
-| `tests/test_self_programming_and_delivery.py` | 44 | 本地代码工具、按行读取、Codex stdin、规划路由、停止/强制终止区分、绝对路径权限、伪工具调用、失败轮预算、重启恢复清理、自升级验证、原子写入与测试门禁 |
+| `tests/test_input_queue.py` | 11 | 剪贴板多图片、文件选择器、用户原文件保护、独立缩略图与单张移除、后台原图编码、保存完成后发送、稳定预览面板、边缘/四角缩放与最小尺寸、忙碌时 FIFO 排队、任务完成续跑、QThread 完整退出后再释放、重启门禁 |
+| `tests/test_mimo_multimodal.py` | 17 | MiMo 单图/多图/ASR 请求、完成检查、严格布尔值、关闭 thinking、证据时序、媒体 Stop 防反转、代码任务媒体工具越权拦截、Vision 请求时间、截图重试、GB18030、关怀上下文与消息/TTS 顺序 |
+| `tests/test_self_programming_and_delivery.py` | 54 | 本地代码工具、按行读取、Codex stdin、规划路由、实现修改禁止误读屏、角色图库绝对路径输出、三视图文件名/ID/标签/主形象解析、图片分析路径传递、窗口/屏幕活动摘要脱敏、网易云通用播放/具体搜索区分、模型 UI 原子工具集、按计划裁剪媒体工具、停止/强制终止区分、绝对路径权限、伪工具调用、失败轮预算、重启恢复清理、自升级验证、原子写入与测试门禁 |
 | `tests/test_system_startup.py` | 4 | 开机启动标记、手动启动保护、联网失败最多重启 5 次、成功后计数清零 |
-| `tests/test_task_progress_card.py` | 5 | 任务卡片、关怀设置即时生效、提醒/关怀消息与桌宠气泡同步显示 |
+| `tests/test_task_progress_card.py` | 7 | 默认展开的任务活动卡片、判断摘要、编号计划、最近 8 条工具活动、窄窗口自适应、完成状态、关怀设置即时生效、提醒/关怀消息与桌宠气泡同步显示 |
 
 单文件或单用例定位方法：
 
@@ -52,6 +52,15 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 Set-Location E:\Doc\AIAgent
 & .\.venv\Scripts\python.exe -m unittest discover -s modules\live\tests -p "test_*.py"
 ```
+
+### 角色管理器（当前 4 项）
+
+```powershell
+Set-Location E:\Doc\AIAgent\CharacterManager
+& ..\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+覆盖千问/Grok 预设字段、预设对象隔离、DashScope 原生请求体与输出图片提取，以及 xAI `/images/generations` 请求不携带通用 `size` 字段。
 
 `modules/live/tests/test_reliable_speech.py` 覆盖：登录 Cookie 身份、不同进场事件、GPT-SoVITS 暂态失败重试、欢迎成功后才写冷却、重复进场只保留一个待播欢迎。测试中出现预期的 `GPU busy` 重试输出不代表失败，以最终 `OK` 和退出码为准。
 
@@ -154,6 +163,11 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 8. 在角色工作台缩放窗口，确认“模型 API → MiMo 多模态”表单可滚动、保存按钮始终可见。
 9. 将鼠标放到聊天窗口四边和四角，确认光标变化并能连续拖动缩放；窗口不能缩小到 640×300 以下，标题栏仍可移动窗口。
 10. 粘贴一张 4K 截图，确认缩略图立即出现、窗口仍可拖动和输入；原图准备完成后状态变化，期间点击发送会自动在准备完成后继续，附件区不挤乱操作按钮。
+11. 只调用 `_plan_task`（不要进入 `chat` 或工具循环）分别规划“打开网易云音乐播放音乐”和“打开网易云音乐播放稻香”：两者均应使用 `model_ui`，前者必须为空查询且步骤中没有搜索，后者必须保留“稻香”并规划识别搜索框、输入、重新识别结果、点击及终态验证。确认执行工具只有通用窗口/视觉原子工具，不存在网易云一键搜索播放工具。
+12. 只调用 `_plan_task` 规划“执行命令后优先读取了屏幕，这是硬编码错误，检查并修复；检查 Home Agent 程序页面并减少任务过程细节”，并附一段窗口 observation JSON。必须得到 `implementation_change=true`、`domain=code`、`visual_required=false`、`execution_strategy=code_loop`，且不能实际调用任何视觉工具。
+13. 给 `_tool_activity_result("ui_list_windows", ...)` 传入含 hwnd、PID、bounds 和 process_path 的结果，任务卡摘要只能是“找到 N 个可用窗口”；给屏幕识别结果传入私人画面描述，活动摘要不得回显该内容。任务卡超过 8 条活动时只显示最近 8 条。
+14. 给任务卡填入超长、无空格的状态、计划和活动内容，把卡片宽度缩到 380 像素。确认任务卡最小宽度不随文本增长，详情标签采用可收缩尺寸策略，消息区不出现横向滚动或反向撑大聊天窗口。
+15. 让 `ChatWorker` 发出界面完成信号时仍保持 `isRunning=true`，确认窗口继续持有该 worker、不会启动下一项；随后模拟 `QThread.finished`，确认才释放引用并继续队列。真实运行中发送一个会产生多段 TTS 的普通问题，等待最后一段语音完成后确认桌宠进程和图标仍存在。
 
 人工验收不能包含真实点击、提交、发弹幕或修改外部文件，除非本次任务明确授权了对应副作用。
 

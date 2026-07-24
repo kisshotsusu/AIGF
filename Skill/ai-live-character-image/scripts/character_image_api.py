@@ -75,6 +75,17 @@ def extract_image(data: dict[str, Any]) -> tuple[bytes | None, str | None]:
         if isinstance(value, str):
             if value.startswith("data:image/"): return base64.b64decode(value.split(",", 1)[1]), None
             if value.startswith("http"): return None, value
+    output_message = ((((data.get("output") or {}).get("choices") or [{}])[0]).get("message") or {})
+    for item in list(message.get("content") or []) + list(output_message.get("content") or []):
+        if not isinstance(item, dict):
+            continue
+        value = item.get("image") or item.get("url")
+        if isinstance(value, str):
+            if value.startswith("data:image/"): return base64.b64decode(value.split(",", 1)[1]), None
+            if value.startswith("http"): return None, value
+    results = (data.get("output") or {}).get("results") or []
+    if results and isinstance(results[0], dict) and results[0].get("url"):
+        return None, str(results[0]["url"])
     content = message.get("content", "")
     if isinstance(content, list): content = "\n".join(str(x.get("image_url", {}).get("url") or x.get("text") or "") for x in content if isinstance(x, dict))
     match = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", str(content))
@@ -89,14 +100,44 @@ async def call_api(settings: dict[str, Any], key: str, prompt: str, operation: s
     timeout = aiohttp.ClientTimeout(total=float(settings.get("timeout_seconds", 180)))
     mode = settings.get("mode", "images")
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        if mode == "images" and operation == "edit":
+        if mode == "dashscope_multimodal":
+            content: list[dict[str, Any]] = []
+            if reference:
+                mime = mimetypes.guess_type(reference.name)[0] or "image/png"
+                encoded = base64.b64encode(reference.read_bytes()).decode()
+                content.append({"image": f"data:{mime};base64,{encoded}"})
+            content.append({"text": prompt})
+            parameters = dict(settings.get("extra_body", {}))
+            if settings.get("size"):
+                parameters.setdefault("size", str(settings["size"]).replace("x", "*"))
+            body = {
+                "model": settings["model"],
+                "input": {"messages": [{"role": "user", "content": content}]},
+                "parameters": parameters,
+            }
+            response = await session.post(base + "/services/aigc/multimodal-generation/generation", json=body)
+        elif mode == "xai_images":
+            body: dict[str, Any] = {
+                "model": settings["model"], "prompt": prompt, "response_format": "url",
+                **settings.get("extra_body", {}),
+            }
+            if operation == "edit":
+                if not reference: raise SystemExit("Edit operation requires --reference")
+                mime = mimetypes.guess_type(reference.name)[0] or "image/png"
+                encoded = base64.b64encode(reference.read_bytes()).decode()
+                body["image"] = {"url": f"data:{mime};base64,{encoded}", "type": "image_url"}
+                response = await session.post(base + "/images/edits", json=body)
+            else:
+                response = await session.post(base + "/images/generations", json=body)
+        elif mode == "images" and operation == "edit":
             if not reference: raise SystemExit("Edit operation requires --reference")
             form = aiohttp.FormData()
             form.add_field("model", str(settings["model"])); form.add_field("prompt", prompt); form.add_field("size", str(settings.get("size", "1024x1024")))
             form.add_field("image", reference.read_bytes(), filename=reference.name, content_type=mimetypes.guess_type(reference.name)[0] or "image/png")
             response = await session.post(base + "/images/edits", data=form)
         elif mode == "images":
-            body = {"model": settings["model"], "prompt": prompt, "size": settings.get("size", "1024x1024"), "n": 1, **settings.get("extra_body", {})}
+            body = {"model": settings["model"], "prompt": prompt, "n": 1, **settings.get("extra_body", {})}
+            if settings.get("size"): body["size"] = settings["size"]
             response = await session.post(base + "/images/generations", json=body)
         else:
             content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]

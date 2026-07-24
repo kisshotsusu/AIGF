@@ -646,12 +646,37 @@ class HomeAgent:
         return {
             "goal": value, "is_task": False, "response_mode": "answer", "execution_strategy": "direct_answer",
             "domain": "conversation", "actionable": False, "multi_step": False, "requires_mcp": False,
-            "site": "", "operation": "conversation", "handler": None, "query": "", "index": None,
+            "site": "", "operation": "conversation", "handler": None, "query": "", "query_is_explicit": False, "index": None,
             "favorite_folder": "", "steps": [], "preferred_tools": [], "required_capabilities": [],
             "browser_policy": "not_applicable", "visual_required": False, "interaction_mode": "none",
+            "implementation_change": False,
             "requires_clarification": False, "clarification_question": "", "risk_level": "low",
             "final_action_requires_verification": False, "success_criteria": "给出准确、直接的回答",
         }
+
+    @staticmethod
+    def _apply_cloudmusic_handler(plan: dict[str, Any]) -> dict[str, Any]:
+        """Keep only the planner's target semantics; execution stays model-driven."""
+        operation = str(plan.get("operation") or "")
+        explicit_target = bool(plan.get("query_is_explicit"))
+        search_requested = operation == "search" and bool(plan.get("query"))
+        if not (explicit_target or search_requested):
+            plan["query"] = ""
+        plan["handler"] = "model_ui"
+        return plan
+
+    @staticmethod
+    def _apply_implementation_change_plan(plan: dict[str, Any]) -> dict[str, Any]:
+        """Enforce the model's semantic decision that the requested result is code."""
+        if not plan.get("implementation_change"):
+            return plan
+        plan.update({
+            "domain": "code", "operation": "code", "actionable": True,
+            "requires_mcp": False, "visual_required": False, "interaction_mode": "none",
+            "execution_strategy": "code_loop", "response_mode": "execute",
+            "browser_policy": "not_applicable", "handler": None, "site": "",
+        })
+        return plan
 
     async def _plan_task(self, text: str, context: str = "") -> dict[str, Any]:
         """Use the LLM for semantic planning, then enforce deterministic safety invariants."""
@@ -668,31 +693,55 @@ class HomeAgent:
             provider, key = self._provider()
             prompt = (
                 "你是 Home Agent 的总任务判定器和执行规划器。结合当前请求与最近上下文，输出一个JSON对象，不要输出解释或Markdown。"
+                "最重要的语义边界：先找用户最终要求取得的结果，不要把故障描述当成待执行动作。"
+                "“执行某请求后读取了屏幕/调用了某工具/输出了某JSON”中的“读取、调用、输出”是在报告已经发生的错误，绝不能规划为下一步。"
+                "只要最终诉求是检查并修复、修改程序、优化页面行为、减少程序输出或防止错误再次发生，implementation_change必须为true，"
+                "即使消息多次出现屏幕、页面、窗口、观察结果、工具名，或粘贴完整窗口JSON，也禁止visual_required和任何UI观察工具。"
+                "故障证据中的工具名不得复制到preferred_tools或steps；需要改的是产生错误的代码。"
+                "完整示例：“执行命令后优先读取了屏幕，这是硬编码错误，检查并修复；Home Agent程序页面展示任务过程细节过多，减少细节；"
+                "后附窗口observation JSON”必须判定implementation_change=true、domain=code、visual_required=false、execution_strategy=code_loop。"
                 "先判断当前消息是否要求助手取得结果、检查状态、查找信息、修改内容或执行动作：是则is_task=true；闲聊、致谢、确认、简单回应为false。"
                 "知识问答、解释、总结、翻译、建议、计算等即使不需要工具，也属于任务：例如‘解释递归’必须is_task=true、actionable=false、direct_answer；"
                 "‘好的/谢谢/你好吗’属于非任务对话。domain=code只用于检查或修改代码，domain=file用于普通文件读写。"
+                "编辑角色设定、固定外观说明、提示词、记忆、普通Markdown文档、数据或图片素材属于内容/资产任务："
+                "必须判定implementation_change=false、domain=file、execution_strategy=tool_loop；持久写入文件本身不等于修改程序实现。"
+                "例如“读取你自己的角色三视图，并完善固定外观文档”应先列出已登记角色图片，使用清单返回的绝对路径分析三视图，"
+                "再读取、写入并重新读取CHARACTER.md；不得进入code_loop或调用code_validate_project。"
                 "若当前请求标记已附带剪贴板截图，图片会直接随执行消息提供：仅分析附件时actionable=false、visual_required=false、direct_answer；"
                 "visual_required只表示还必须读取当前实时屏幕，不要把已有图片附件误判为实时读屏。"
+                "implementation_change表示用户要持久修改程序实现、程序界面、页面行为、任务路由或输出方式，而不是临时操作正在运行的界面。"
+                "implementation_change=true时必须使用domain=code、operation=code、visual_required=false、interaction_mode=none、execution_strategy=code_loop；"
+                "页面、窗口、屏幕等词只是被修改的软件对象，不能据此优先读屏。用户粘贴的日志、窗口列表或工具JSON只是故障证据，不是要求执行这些工具。"
+                "例如“检查你自己的Home Agent程序页面，减少任务过程展示的细节”是implementation_change=true的代码修改任务；"
+                "“看看当前Home Agent窗口显示了什么”才是implementation_change=false、visual_required=true的实时观察任务。"
                 "is_task不等于actionable：可以仅靠模型知识回答的任务actionable=false；必须读取外部状态或调用工具才为true。"
                 "response_mode只能是answer/execute/clarify；execution_strategy只能是direct_answer/tool_loop/vision_loop/web_loop/code_loop。"
                 "只有缺少的信息会实质改变目标、阻止执行或带来风险时才clarify，并给出具体clarification_question；不要为可从屏幕或工具观察的信息追问。"
-                "当前消息明确指定的平台、软件和对象必须覆盖历史上下文；不要把泛称‘音乐/歌曲/视频’当作具体搜索词。"
+                "当前消息明确指定的平台、软件和对象必须覆盖历史上下文；不要把泛称当作具体搜索词。"
                 "用户说停止、暂停或关掉音乐时，operation=stop_media、required_capabilities包含media_control、preferred_tools包含media_stop；"
                 "这表示停止声音而不是退出应用，禁止规划Space切换、Alt+F4、Stop-Process或taskkill。"
                 "用户明确要求关闭/退出应用时用operation=close_app；明确要求结束/强制终止进程，或常规停止失败且目标必须退出时，"
                 "用operation=terminate_process并加入process_termination能力，此类计划允许Stop-Process/taskkill。"
-                "query必须是用户真正指定的目标对象原文（例如标题、人名或关键词），不能包含操作动词或连接词，不能自行截短或改写；"
+                "query必须是用户真正指定的内容对象原文（例如歌曲、视频标题、人名或搜索关键词），不能包含操作动词、连接词、平台名或软件名；"
+                "site已经表示平台，绝对不能再把网易云音乐、B站、浏览器等平台/软件名称填进query。"
+                "query_is_explicit表示用户是否明确给出了要搜索/选择的具体内容；只要求打开软件、播放当前/任意内容时为false且query必须为空，明确给出歌名、歌手、标题或明确要求搜索某关键词时才为true。"
+                "例1：‘打开网易云音乐播放音乐’应为site=cloudmusic、operation=play、query=''、query_is_explicit=false；"
+                "例2：‘打开网易云音乐播放稻香’应为site=cloudmusic、operation=play、query='稻香'、query_is_explicit=true；"
+                "桌面任务的steps必须由你按目标规划成可执行流程，并使用条件步骤：先检查程序是否已打开，再读取当前窗口；"
+                "只有query_is_explicit=true或operation=search时才规划点击搜索框和输入query；结果出现后先识别匹配项，再点击播放并重新识别终态。"
+                "query为空的通用播放任务禁止规划搜索，应打开/激活程序、识别当前播放区，并按当前状态决定是否点击播放。"
                 "一句话含多个动作时要理解动作之间的关系，不要把动作之间的文字误当成目标。"
                 "只负责理解和规划，不得声称任务已经完成。必须输出全部字段："
                 "is_task, response_mode, execution_strategy, domain(conversation/web/desktop/file/code/memory), site(bilibili/cloudmusic/空), "
-                "operation(open/search/play/control/stop_media/close_app/terminate_process/favorites/form/file/code/conversation/observe_screen/solve_screen/play_game), handler, query, "
+                "operation(open/search/play/control/stop_media/close_app/terminate_process/favorites/form/file/code/conversation/observe_screen/solve_screen/play_game), handler, query, query_is_explicit, "
                 "favorite_folder, index(整数或null), actionable, multi_step, requires_mcp, browser_policy, risk_level(low/medium/high), "
-                "visual_required(是否必须读取当前屏幕), interaction_mode(none/observe/solve/game), "
+                "visual_required(是否必须读取当前屏幕), interaction_mode(none/observe/solve/game), implementation_change(是否要求持久修改程序实现或程序UI), "
                 "只描述画面使用observe；要求读取题目后计算、回答、选择答案或解谜必须使用solve；要求持续操控游戏使用game。"
-                "preferred_tools(工具名字符串数组), required_capabilities(能力字符串数组), steps(字符串数组), "
+                "preferred_tools(工具名字符串数组), required_capabilities(能力字符串数组), steps(字符串数组；执行动作后必须包含重新观察并验证终态), "
                 "needs_clarification, clarification_question, final_action_requires_verification(是否要求播放/提交等终态), "
                 "success_criteria, confidence(0到1), reasoning_short。工具可从ui_analyze_screen/ui_inspect_target/web_read/web_fill/web_click_text/"
-                "ui_list_windows/ui_analyze_window/ui_click/ui_hotkey/ui_type_active_text/media_stop/read_text_file/write_text_file/code_tools/专用站点工具中选择，不要发明工具。\n"
+                "ui_list_windows/ui_activate_window/ui_analyze_window/ui_click_window/ui_double_click_window/ui_hotkey/ui_type_active_text/"
+                "launch_app/media_stop/list_character_images/analyze_image/read_text_file/write_text_file/code_tools中选择，不要发明工具。\n"
                 f"最近上下文：{context[-1200:]}\n当前请求：{text}"
             )
             timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
@@ -718,11 +767,11 @@ class HomeAgent:
             required_fields = {"is_task", "response_mode", "execution_strategy", "actionable"}
             if not required_fields.issubset(proposed):
                 raise ValueError("planner response is missing task-decision fields")
-            for boolean_field in ("is_task", "actionable", "multi_step", "requires_mcp", "final_action_requires_verification", "visual_required", "needs_clarification"):
+            for boolean_field in ("is_task", "actionable", "multi_step", "requires_mcp", "final_action_requires_verification", "visual_required", "needs_clarification", "query_is_explicit", "implementation_change"):
                 if boolean_field in proposed and not isinstance(proposed[boolean_field], bool):
                     raise ValueError(f"planner field {boolean_field} must be boolean")
             plan = dict(fallback)
-            allowed_handlers = {None, "", "bilibili_favorites", "bilibili_search", "cloudmusic_search", "cloudmusic_control"}
+            allowed_handlers = {None, "", "bilibili_favorites", "bilibili_search", "cloudmusic_search", "cloudmusic_control", "model_ui"}
             for key_name in ("domain", "site", "operation", "query", "favorite_folder", "browser_policy", "success_criteria", "reasoning_short", "clarification_question"):
                 if key_name in proposed:
                     plan[key_name] = str(proposed.get(key_name) or "").strip()
@@ -730,7 +779,7 @@ class HomeAgent:
                 plan["domain"] = "conversation"
             if plan.get("site") not in {"", "bilibili", "cloudmusic"}:
                 plan["site"] = ""
-            for key_name in ("is_task", "actionable", "multi_step", "requires_mcp", "final_action_requires_verification", "visual_required"):
+            for key_name in ("is_task", "actionable", "multi_step", "requires_mcp", "final_action_requires_verification", "visual_required", "query_is_explicit", "implementation_change"):
                 if key_name in proposed:
                     plan[key_name] = bool(proposed[key_name])
             for list_name in ("steps", "preferred_tools", "required_capabilities"):
@@ -751,6 +800,12 @@ class HomeAgent:
             plan["requires_clarification"] = bool(proposed.get("needs_clarification")) or plan["response_mode"] == "clarify"
             interaction_mode = str(proposed.get("interaction_mode") or "none").strip().lower()
             plan["interaction_mode"] = interaction_mode if interaction_mode in {"none", "observe", "solve", "game"} else "none"
+            if plan.get("implementation_change"):
+                # This is enforced from the planner's semantic decision, not from
+                # request keywords. Live pixels are not a prerequisite for a
+                # persistent implementation change, even when the evidence names
+                # windows, pages, screenshots, or UI tools.
+                self._apply_implementation_change_plan(plan)
             if plan.get("visual_required"):
                 plan["domain"] = "desktop"
                 plan["actionable"] = True
@@ -765,9 +820,7 @@ class HomeAgent:
             # Specialized handlers are selected only from the model's structured
             # site/operation decision. Raw request keywords never override it.
             if plan.get("site") == "cloudmusic":
-                if plan.get("operation") in {"play", "control", "open"} and plan.get("query", "").strip() in {"音乐", "歌曲", "歌", "一首歌", "当前音乐", "随便一首歌"}:
-                    plan["query"] = ""
-                plan["handler"] = "cloudmusic_search" if plan.get("query") else "cloudmusic_control"
+                self._apply_cloudmusic_handler(plan)
             elif plan.get("site") == "bilibili":
                 if plan.get("operation") == "favorites":
                     plan["handler"] = "bilibili_favorites"
@@ -822,6 +875,89 @@ class HomeAgent:
         return {"status": "success", "tool": name, "result": result}
 
     @staticmethod
+    def _emit_activity(status, payload: dict[str, Any], fallback: str) -> None:
+        """Expose concise decision/action summaries without revealing hidden reasoning."""
+        if not status:
+            return
+        status(payload if getattr(status, "supports_structured_status", False) else fallback)
+
+    @staticmethod
+    def _activity_text(value: Any, limit: int = 96) -> str:
+        text = " ".join(str(value or "").split())
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    @classmethod
+    def _tool_activity_arguments(cls, name: str, args: dict[str, Any]) -> str:
+        """Describe intent without echoing payloads, coordinates, or private UI state."""
+        if name == "ui_list_windows":
+            return "检查当前可用的应用窗口"
+        if name in {"ui_analyze_screen", "ui_analyze_window"}:
+            return "读取画面并判断下一步"
+        if name in {"ui_click_window", "ui_double_click_window"}:
+            target = args.get("target") or args.get("description") or args.get("element")
+            return f"目标：{cls._activity_text(target, 54)}" if target else "按识别结果操作目标控件"
+        if name == "ui_type_active_text":
+            return f"向当前输入位置写入 {len(str(args.get('text') or ''))} 个字符"
+        if name == "ui_hotkey":
+            return "发送所需快捷键"
+        if name == "launch_app":
+            return f"应用：{cls._activity_text(args.get('app') or args.get('name'), 54)}"
+        if name in {"read_text_file", "write_text_file", "code_read_file", "code_write_file", "code_replace_text"}:
+            path = args.get("path") or args.get("file_path")
+            return f"文件：{cls._activity_text(path, 76)}" if path else "处理目标文件"
+        if name == "code_search_text":
+            query = args.get("query") or args.get("text") or args.get("pattern")
+            return f"查找：{cls._activity_text(query, 64)}" if query else "定位相关实现"
+        if name == "code_validate_project":
+            return "运行项目检查和相关测试"
+        return ""
+
+    @classmethod
+    def _tool_activity_result(cls, name: str, result: Any) -> str:
+        """Summarize evidence; never render raw tool JSON in the task card."""
+        if not isinstance(result, dict):
+            return "工具已返回结果"
+        state = str(result.get("status") or "success")
+        if state in {"failed", "uncertain"}:
+            reason = result.get("error") or result.get("warning") or result.get("reason") or result.get("next_action")
+            return cls._activity_text(reason or ("执行失败" if state == "failed" else "结果仍需确认"), 110)
+        if name == "ui_list_windows":
+            observation = result.get("observation")
+            count = len(observation) if isinstance(observation, list) else int(result.get("count") or 0)
+            return f"找到 {count} 个可用窗口"
+        if name in {"ui_analyze_screen", "ui_analyze_window"}:
+            return "画面识别完成，已获得状态摘要"
+        if name in {"ui_click_window", "ui_double_click_window", "ui_type_active_text", "ui_hotkey"}:
+            observation = result.get("observation")
+            changed = isinstance(observation, dict) and (
+                observation.get("changed") or observation.get("title_changed")
+            )
+            return "操作完成，界面状态已变化" if changed else "操作已发送，等待后续验证"
+        if name in {"code_search_text", "code_list_files"}:
+            matches = result.get("matches") or result.get("items")
+            count = len(matches) if isinstance(matches, list) else result.get("count")
+            return f"定位到 {count} 项相关内容" if count is not None else "已定位相关内容"
+        if name == "code_validate_project":
+            return "项目检查和相关测试已通过" if result.get("ok", True) else "验证完成"
+        if name.startswith("code_") or name in {"read_text_file", "write_text_file"}:
+            return "文件处理完成"
+        return cls._activity_text(result.get("next_action") or result.get("message") or "执行完成", 96)
+
+    @staticmethod
+    def _tool_display_name(name: str) -> str:
+        labels = {
+            "ui_list_windows": "读取可见窗口", "ui_activate_window": "激活目标窗口",
+            "ui_analyze_window": "识别窗口画面", "ui_analyze_screen": "识别当前屏幕",
+            "ui_click_window": "点击界面目标", "ui_double_click_window": "双击界面目标",
+            "ui_type_active_text": "输入文字", "ui_hotkey": "执行快捷键",
+            "launch_app": "启动应用", "read_text_file": "读取文件", "write_text_file": "写入文件",
+            "code_read_file": "读取代码", "code_search_text": "搜索代码",
+            "code_replace_text": "修改代码", "code_write_file": "写入代码",
+            "code_validate_project": "验证代码和测试", "media_stop": "停止媒体",
+        }
+        return labels.get(name, name)
+
+    @staticmethod
     def _is_media_stop_plan(plan: dict[str, Any]) -> bool:
         """Recognize the validated plan shape used for idempotent media stopping."""
         if HomeAgent._allows_application_termination(plan):
@@ -830,7 +966,6 @@ class HomeAgent:
         combined = " ".join(str(plan.get(key) or "") for key in ("goal", "success_criteria", "query"))
         return bool(
             plan.get("operation") == "stop_media"
-            or plan.get("handler") == "cloudmusic_control"
             or "media_control" in capabilities
             or ("音乐" in combined and any(word in combined for word in ("停止", "关掉", "暂停")))
         )
@@ -1101,9 +1236,9 @@ class HomeAgent:
             return {"error": "视觉服务未就绪"}
         query = str((task_plan or {}).get("query") or "").strip()
         if not query and is_cloud:
-            return {"error": "任务规划器没有给出明确的歌曲或搜索对象，已停止执行以避免误操作"}
-        if is_cloud and "播放" in text and not any(word in text for word in ("搜索", "查找", "找一首", "搜一首")) and query.strip() in {"音乐", "歌曲", "歌", "一首歌", "当前音乐", "随便一首歌"}:
-            query = ""
+            operation = str((task_plan or {}).get("operation") or "")
+            if operation not in {"open", "play", "control"}:
+                return {"error": "任务规划器没有给出明确的搜索对象，已停止执行以避免误操作"}
         if not query and not is_cloud: return None
         self.log_event("direct_vision_started", target="bilibili" if is_bili else "cloudmusic", query=query)
         try:
@@ -1687,13 +1822,13 @@ class HomeAgent:
             if name: result.append({"name": name.group(1).strip(), "description": desc.group(1).strip() if desc else "", "path": str(skill_md)})
         return result
 
-    def _tools(self) -> list[dict[str, Any]]:
+    def _tools(self, scoped: bool = False) -> list[dict[str, Any]]:
         tools = [
             {"type": "function", "function": {"name": "search_memories", "description": "搜索旧式共享记忆索引。用户询问个人过去经历或‘你记得吗’时不得使用本工具，必须调用 long_term_memory 的 retrieve。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
             {"type": "function", "function": {"name": "list_skills", "description": "列出本地可用技能", "parameters": {"type": "object", "properties": {}}}},
-            {"type": "function", "function": {"name": "list_character_images", "description": "列出角色形象库和主形象", "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "list_character_images", "description": "列出角色形象库、主形象及每张图片可直接传给 analyze_image 的绝对路径。查找自己的立绘、三视图或角色参考图时先调用本工具，不要猜测相对路径。", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "generate_character_image", "description": "调用 ai-live-character-image 技能生成或编辑角色形象", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "operation": {"type": "string", "enum": ["generate", "edit"]}, "reference": {"type": "string", "description": "编辑时使用 primary 或图片路径"}, "label": {"type": "string"}, "tags": {"type": "string"}, "set_primary": {"type": "boolean"}}, "required": ["prompt"]}}},
-            {"type": "function", "function": {"name": "analyze_image", "description": "使用 MiMo 多模态 API 理解图片内容、识别画面细节或文字；不用于生成图片", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "项目内图片路径"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
+            {"type": "function", "function": {"name": "analyze_image", "description": "使用 MiMo 多模态 API 理解图片内容、识别画面细节或文字；不用于生成图片。已登记角色图可传 primary、图片ID、文件名、标签或 list_character_images 返回的绝对路径。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片绝对路径；已登记角色图也可用 primary、ID、文件名或标签"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
             {"type": "function", "function": {"name": "mimo_transcribe_audio", "description": "使用 MiMo API 识别项目内 WAV 或 MP3 语音文件", "parameters": {"type": "object", "properties": {"audio": {"type": "string", "description": "项目内音频路径"}, "language": {"type": "string", "enum": ["auto", "zh", "en"]}}, "required": ["audio"]}}},
             {"type": "function", "function": {"name": "sing_song", "description": "当用户要求唱歌、唱一首、哼唱或朗读歌词时调用。默认使用角色当前本地 TTS/SVC 音色朗读最多十行歌词；MiMo 唱歌仅作为已关闭的备用分支。", "parameters": {"type": "object", "properties": {"song": {"type": "string", "description": "歌曲名称或演唱主题"}, "lyrics": {"type": "string", "description": "最多十行需要朗读的歌词或测试文本"}, "style": {"type": "string", "description": "演唱或朗读情绪"}, "voice": {"type": "string", "description": "仅备用 MiMo 分支使用"}}, "required": ["song", "lyrics"]}}},
             {"type": "function", "function": {"name": "create_scheduled_task", "description": "创建TTS语音提醒或闹钟。一次性任务成功执行后自动删除；重复任务会保留并等待下一次。必须根据当前本地时间解析用户的自然语言时间。", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "message": {"type": "string", "description": "触发时由TTS播放的文本"}, "recurrence": {"type": "string", "enum": ["once", "daily", "weekdays", "weekly"]}, "scheduled_at": {"type": "string", "description": "仅once使用，本地ISO时间，如2026-07-17T15:00"}, "time": {"type": "string", "description": "重复任务使用的24小时HH:MM"}, "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 7}, "description": "仅weekly使用，周一为1、周日为7"}, "action": {"type": "string", "enum": ["tts"]}}, "required": ["title", "message", "recurrence"]}}},
@@ -1714,7 +1849,6 @@ class HomeAgent:
         if self.config.get("vision_mcp", {}).get("enabled", False) and self.config.get("agent", {}).get("model_driven_computer_actions", True):
             tools += [
                 {"type": "function", "function": {"name": "bilibili_open_favorite_video", "description": "在用户已经打开且已登录的普通浏览器中，按B站收藏夹真实数据顺序打开指定收藏夹第N个视频。B站收藏夹任务应优先调用；不会创建Chrome、Chromium或临时浏览器。", "parameters": {"type": "object", "properties": {"favorite_folder": {"type": "string", "description": "用户说出的收藏夹名称，例如二次元好看或默认收藏夹"}, "index": {"type": "integer", "minimum": 1, "description": "从1开始的视频序号"}}, "required": ["favorite_folder", "index"]}}},
-                {"type": "function", "function": {"name": "cloudmusic_search_and_play", "description": "在本地网易云音乐客户端搜索并播放指定歌曲，内置多轮精确选择、Enter备用策略和窗口标题验证。网易云指定歌曲播放任务必须优先调用，禁止用底部全局播放按钮代替选择搜索结果。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "任务计划给出的准确歌曲名"}}, "required": ["query"]}}},
                 {"type": "function", "function": {"name": "media_stop", "description": "幂等地向当前媒体会话发送系统“停止播放”命令。用户要求停止、暂停或关掉音乐时必须调用；禁止用 Space 切换播放状态，也禁止退出或终止音乐应用进程。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "process_status", "description": "只读查询指定 Windows 进程是否正在运行。进程不存在也返回 ok=true、running=false，避免把查询命令的退出码误当成工具失败。", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "进程映像名，例如 cloudmusic.exe"}}, "required": ["name"]}}},
                 {"type": "function", "function": {"name": "ui_analyze_screen", "description": "截取当前桌面并使用 MiMo 回答任务模型提出的视觉问题。用于判断用户在做什么、读取屏幕题目、识别游戏状态和每轮操作后的画面验证；question 必须说明本轮要识别的目标和证据。", "parameters": {"type": "object", "properties": {"question": {"type": "string", "description": "针对当前屏幕的具体分析问题，例如识别题干选项并求解，或判断游戏状态和下一步动作"}}, "required": ["question"]}}},
@@ -1766,6 +1900,14 @@ class HomeAgent:
             blocked = {"codex_cli_task", "mcp_task", "launch_app", "open_path"}
             tools = [item for item in tools if item.get("function", {}).get("name") not in blocked
                      and not item.get("function", {}).get("name", "").startswith(("ui_", "web_", "vision_"))]
+        if scoped:
+            plan = getattr(self, "current_task_plan", {})
+            blocked = {"cloudmusic_search_and_play"}
+            if not self._is_media_stop_plan(plan):
+                blocked.add("media_stop")
+            if plan.get("handler") != "bilibili_favorites":
+                blocked.add("bilibili_open_favorite_video")
+            tools = [item for item in tools if item.get("function", {}).get("name") not in blocked]
         return tools
 
     def _home_tts_chunks(self, text: str) -> list[str]:
@@ -2068,6 +2210,15 @@ class HomeAgent:
         self.current_code_self_edit = bool(code_task and self.self_upgrade.is_upgrade_request(text))
         self.current_code_verified = not self.current_code_self_edit
         self.log_event("task_plan_created", task_plan=task_plan)
+        self._emit_activity(status, {
+            "type": "plan",
+            "title": "任务计划已生成",
+            "detail": f"{task_plan.get('domain', '任务')} · {task_plan.get('operation', 'execute')}",
+            "reasoning_summary": str(task_plan.get("reasoning_short") or "根据当前请求和最近上下文确定执行方式。"),
+            "steps": list(task_plan.get("steps") or []),
+            "success_criteria": str(task_plan.get("success_criteria") or ""),
+            "state": "completed",
+        }, "任务计划已生成")
         if task_plan.get("requires_clarification"):
             answer = str(task_plan.get("clarification_question") or "我还缺少完成这项任务所需的关键信息，请补充一下具体目标。").strip()
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
@@ -2092,7 +2243,8 @@ class HomeAgent:
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True): await self._speak_home(session, answer, status)
             return answer
-        if task_plan.get("handler") and not self.config.get("agent", {}).get("model_driven_computer_actions", True):
+        legacy_direct_site = task_plan.get("site") in {"cloudmusic", "bilibili"}
+        if legacy_direct_site and not self.config.get("agent", {}).get("model_driven_computer_actions", True):
             visual_query = str(task_plan.get("query") or "")
             visual_target = "B站" if task_plan.get("site") == "bilibili" else "网易云"
             gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", True))
@@ -2198,9 +2350,12 @@ class HomeAgent:
                 + ("当前是B站收藏夹任务：直接调用 bilibili_open_favorite_video，并把任务计划中的 favorite_folder 和 index 原样传入。"
                    "该工具会读取真实收藏夹顺序、复用现有登录浏览器并验证最终BV地址；不要用截图猜收藏夹入口。"
                    if task_plan.get("handler") == "bilibili_favorites" else "") +
-                ("当前是网易云指定歌曲任务：直接调用 cloudmusic_search_and_play，并把任务计划中的 query 原样传入。"
-                 "该工具会在本地客户端进行多轮选择与标题验证；禁止自行点击底部全局播放按钮。"
-                if task_plan.get("handler") == "cloudmusic_search" else "") +
+                ("当前是模型驱动的网易云界面任务。严格执行计划中的steps，并在每一步后读取最新窗口。"
+                 "先用ui_list_windows判断程序是否存在；不存在才用launch_app，存在则激活。"
+                 "用ui_analyze_window识别当前界面和可操作控件，再根据观察选择ui_click_window、ui_type_active_text或ui_hotkey。"
+                 "query为空时禁止进入搜索框；query非空时只能输入计划中的原始query，搜索后必须重新识别结果并选择匹配项。"
+                 "点击后再次调用ui_analyze_window验证实际播放对象和状态；不得用固定坐标、固定候选或预设页面结构。"
+                if task_plan.get("site") == "cloudmusic" and not self._is_media_stop_plan(task_plan) else "") +
                 ("当前是停止媒体任务：只调用幂等 media_stop。停止音乐不等于退出应用；禁止 Space、播放按钮、Alt+F4、Stop-Process 和 taskkill。"
                  if self._is_media_stop_plan(task_plan) else "") +
                 ("当前计划明确要求关闭应用或终止进程，可以在常规关闭无效后使用 Stop-Process/taskkill；执行后用 process_status 验证进程已退出。"
@@ -2278,7 +2433,7 @@ class HomeAgent:
                 round_failed = False
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
-                payload = {"model": provider["model"], "messages": messages, "tools": self._tools(), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
+                payload = {"model": provider["model"], "messages": messages, "tools": self._tools(scoped=True), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
                 self._set_token_limit(payload, provider, int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600))))
                 async with session.post(url, json=payload, headers=self._provider_headers(provider, key)) as response:
                     raw = await response.text()
@@ -2320,7 +2475,7 @@ class HomeAgent:
                         continue
                     requires_automated_media_proof = bool(
                         task_plan.get("site") == "cloudmusic"
-                        and task_plan.get("handler") == "cloudmusic_search"
+                        and bool(task_plan.get("query_is_explicit"))
                         and str(task_plan.get("query") or "").strip()
                         and bool(task_plan.get("final_action_requires_verification") or task_plan.get("operation") == "play")
                     )
@@ -2356,6 +2511,16 @@ class HomeAgent:
                         except Exception as exc:
                             verification = {"passed": not bool(self.mimo_multimodal.config.get("fail_closed", True)), "reason": f"MiMo 完成检查不可用：{exc}", "next_action": "检查 MiMo 配置和网络后，继续收集本地终态证据"}
                         self.log_event("mimo_completion_check", result=verification, evidence_count=len(completion_evidence), round=round_index)
+                        self._emit_activity(status, {
+                            "type": "verification",
+                            "title": "完成验证" + (" · 通过" if verification.get("passed") else " · 未通过"),
+                            "detail": self._activity_text(
+                                verification.get("reason")
+                                or ("已取得足够的完成证据" if verification.get("passed") else verification.get("next_action")),
+                                110,
+                            ),
+                            "state": "success" if verification.get("passed") else "failed",
+                        }, "完成检查已通过" if verification.get("passed") else "完成检查未通过")
                         if not verification.get("passed"):
                             completion_check_failures += 1
                             failed_rounds += 1
@@ -2389,7 +2554,11 @@ class HomeAgent:
                         if status: status(f"没有执行工具 {name}：参数不完整；正在要求模型重新生成…")
                         messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
                         continue
-                    if status: status(f"正在调用工具：{name}")
+                    display_name = self._tool_display_name(name)
+                    self._emit_activity(status, {
+                        "type": "tool_start", "title": display_name,
+                        "detail": self._tool_activity_arguments(name, args), "tool": name, "state": "running",
+                    }, f"正在执行：{display_name}")
                     tool_submitted_at = _iso_now()
                     tool_started = time.monotonic()
                     self.log_event("tool_started", tool=name, arguments=args, sequence=tool_sequence, task_submitted_at=self.current_task_submitted_at, tool_submitted_at=tool_submitted_at)
@@ -2423,7 +2592,7 @@ class HomeAgent:
                             )
                             if media_target_preexisting:
                                 self.log_event("media_target_preexisting", query=query)
-                    if name == "ui_double_click_window" and isinstance(result, dict):
+                    if name in {"ui_click_window", "ui_double_click_window"} and isinstance(result, dict):
                         observation = result.get("observation")
                         after_title = str(observation.get("after_title", "")) if isinstance(observation, dict) else ""
                         title_changed = bool(observation.get("title_changed")) if isinstance(observation, dict) else False
@@ -2474,7 +2643,12 @@ class HomeAgent:
                                 tool_failures.append({"tool": name, "reason": failure_reason})
                                 post_tool_instruction = failure_reason + "。必须立即编辑并验证，或结束本地路径交给后备执行器。"
                     self.log_event("tool_completed", tool=name, result=result)
-                    if status: status(f"已完成：工具 {name}")
+                    result_state = str(result.get("status") or "success") if isinstance(result, dict) else "success"
+                    self._emit_activity(status, {
+                        "type": "tool_failed" if result_state in {"failed", "uncertain"} else "tool_complete",
+                        "title": f"{display_name} · {'失败' if result_state == 'failed' else '待确认' if result_state == 'uncertain' else '完成'}",
+                        "detail": self._tool_activity_result(name, result), "tool": name, "state": result_state,
+                    }, f"已完成：{display_name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
                     if post_tool_instruction:
                         messages.append({"role": "system", "content": post_tool_instruction})
@@ -2510,6 +2684,13 @@ class HomeAgent:
         return answer
 
     async def _run_tool(self, name: str, args: dict[str, Any], confirm=None, status=None) -> Any:
+        if name == "media_stop" and not self._is_media_stop_plan(getattr(self, "current_task_plan", {})):
+            self.log_event("tool_scope_rejected", tool=name, task_plan=getattr(self, "current_task_plan", {}), arguments=args)
+            return {
+                "error": "当前任务计划未授权停止媒体；未执行任何媒体操作",
+                "executed": False,
+                "blocked_by": "task_plan_scope",
+            }
         if name.startswith("code_"):
             editor = self.self_upgrade.code_editor
             self_edit = bool(getattr(self, "current_code_self_edit", False))
@@ -2542,7 +2723,30 @@ class HomeAgent:
                 return {"error": str(exc)}
         if name == "cloudmusic_search_and_play":
             plan = getattr(self, "current_task_plan", {})
-            query = str(args.get("query") or plan.get("query") or "").strip()
+            planned_query = str(plan.get("query") or "").strip()
+            requested_query = str(args.get("query") or "").strip()
+            authorized = bool(
+                plan.get("is_task")
+                and plan.get("actionable")
+                and plan.get("site") == "cloudmusic"
+                and plan.get("handler") == "cloudmusic_search"
+                and planned_query
+            )
+            if not authorized:
+                self.log_event("tool_scope_rejected", tool=name, task_plan=plan, arguments=args)
+                return {
+                    "error": "当前任务计划未授权网易云搜索；未执行任何搜索或播放操作",
+                    "executed": False,
+                    "blocked_by": "task_plan_scope",
+                }
+            if requested_query and requested_query != planned_query:
+                self.log_event("tool_argument_scope_rejected", tool=name, planned_query=planned_query, requested_query=requested_query)
+                return {
+                    "error": "工具参数与任务计划中的明确搜索对象不一致；未执行",
+                    "executed": False,
+                    "blocked_by": "task_plan_query",
+                }
+            query = planned_query
             return await self._run_cloudmusic_search_and_play(query, status)
         if name == "process_status":
             process_name = str(args.get("name") or "").strip()
@@ -2741,8 +2945,7 @@ class HomeAgent:
             return [x for x in shared if q in json.dumps(x, ensure_ascii=False).lower()][-20:]
         if name == "list_skills": return self.list_skills()
         if name == "list_character_images":
-            path = ROOT / "workspace" / "character_images" / "manifest.json"
-            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"primary": None, "images": []}
+            return self._character_image_catalog()
         if name == "generate_character_image":
             if not self.config["agent"].get("allow_character_image_skill", True): return {"error": "角色图像技能已禁用"}
             script = project_path(self.config["agent"].get("skill_root", "Skill")) / "ai-live-character-image" / "scripts" / "character_image_api.py"
@@ -2756,11 +2959,10 @@ class HomeAgent:
             except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}
         if name == "analyze_image":
             image_value = str(args.get("image") or "").strip()
-            if image_value == "primary":
-                manifest = ROOT / "workspace" / "character_images" / "manifest.json"
-                data = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
-                image_value = str((ROOT / "workspace" / "character_images" / str(data.get("primary") or "")))
-            path = self._allowed_path(image_value)
+            registered_path = self._resolve_character_image(image_value)
+            path = registered_path if registered_path is not None else self._allowed_path(image_value)
+            if not path.is_file():
+                return {"status": "failed", "error": f"图片不存在：{path}"}
             try:
                 timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -3017,6 +3219,53 @@ class HomeAgent:
         roots = [Path(x).expanduser().resolve() for x in self.config.get("computer_control", {}).get("allowed_roots", [])]
         if not any(path == root or root in path.parents for root in roots): raise PermissionError(f"路径不在允许范围：{path}")
         return path
+
+    @staticmethod
+    def _character_image_catalog() -> dict[str, Any]:
+        """Return registered character images with canonical paths for tool chaining."""
+        image_root = (ROOT / "workspace" / "character_images").resolve()
+        manifest = image_root / "manifest.json"
+        if not manifest.exists():
+            return {"primary": None, "primary_path": None, "images": []}
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        images: list[dict[str, Any]] = []
+        primary_path: str | None = None
+        primary_id = str(data.get("primary") or "")
+        for raw_item in data.get("images", []):
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            path = (image_root / str(item.get("filename") or "")).resolve()
+            item["path"] = str(path)
+            item["exists"] = path.is_file()
+            images.append(item)
+            if str(item.get("id") or "") == primary_id:
+                primary_path = str(path)
+        return {"primary": data.get("primary"), "primary_path": primary_path, "images": images}
+
+    @classmethod
+    def _resolve_character_image(cls, value: str) -> Path | None:
+        """Resolve a registered image by primary alias, id, filename or human label."""
+        query = str(value or "").strip()
+        if not query:
+            return None
+        catalog = cls._character_image_catalog()
+        if query.casefold() == "primary":
+            primary_path = catalog.get("primary_path")
+            return Path(primary_path) if primary_path else None
+        query_key = query.casefold()
+        query_name = Path(query).name.casefold()
+        for item in catalog.get("images", []):
+            candidates = {
+                str(item.get("id") or "").casefold(),
+                str(item.get("filename") or "").casefold(),
+                str(item.get("original_name") or "").casefold(),
+                str(item.get("label") or "").casefold(),
+                Path(str(item.get("filename") or "")).stem.casefold(),
+            }
+            if query_key in candidates or query_name in candidates:
+                return Path(str(item["path"]))
+        return None
 
     async def _confirm_control(self, description: str, confirm) -> bool:
         if not self.config.get("computer_control", {}).get("confirm_before_action", True): return True

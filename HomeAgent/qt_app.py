@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QScrollArea, QSpinBox, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from agent import HOME_AGENT, ROOT, HomeAgent
@@ -303,7 +303,7 @@ class ChatWorker(QThread):
         self.image_paths = [item["path"] for item in self.attachments if item.get("kind") == "image"]
         self.file_paths = [item["path"] for item in self.attachments if item.get("kind") == "file"]
         self.cleanup_paths = [item["path"] for item in self.attachments if item.get("owned")]
-        self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False
+        self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.activity_events = []; self.plan_steps = []; self.reasoning_summary = ""; self.success_criteria = ""; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False
         self.agent.begin_task(prompt, resumed=prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"))
 
     def publish_answer(self, answer: str) -> None:
@@ -323,6 +323,21 @@ class ChatWorker(QThread):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     def report_status(self, text):
+        if isinstance(text, dict):
+            event = dict(text)
+            value = str(event.get("title") or event.get("current") or "正在处理任务").strip()
+            detail = str(event.get("detail") or "").strip()
+            event["title"] = value; event["detail"] = detail
+            event.setdefault("elapsed", max(0, int(time.monotonic() - self.started_at)))
+            event.setdefault("state", "running")
+            if event.get("type") == "plan":
+                self.plan_steps = [str(step) for step in event.get("steps", []) if str(step).strip()]
+                self.reasoning_summary = str(event.get("reasoning_summary") or "")
+                self.success_criteria = str(event.get("success_criteria") or "")
+            else:
+                self.activity_events.append(event)
+                self.activity_events = self.activity_events[-16:]
+            text = value
         value = str(text).strip()
         if not value: return
         if self.current_step and self.current_step != value and self.current_step not in self.completed_steps:
@@ -333,7 +348,11 @@ class ChatWorker(QThread):
             if done and done not in self.completed_steps: self.completed_steps.append(done)
         else: self.current_step = value
         elapsed = max(0, int(time.monotonic() - self.started_at))
-        snapshot = {"current": self.current_step, "completed": list(self.completed_steps), "elapsed": elapsed, "state": "running"}
+        snapshot = {
+            "current": self.current_step, "completed": list(self.completed_steps), "elapsed": elapsed, "state": "running",
+            "events": list(self.activity_events), "plan_steps": list(self.plan_steps),
+            "reasoning_summary": self.reasoning_summary, "success_criteria": self.success_criteria,
+        }
         self.agent.update_task_recovery(self.current_step, self.completed_steps)
         self.bridge.status.emit(value); self.bridge.progress.emit(snapshot)
         cfg = self.agent.config.get("progress_reporting", {})
@@ -342,6 +361,8 @@ class ChatWorker(QThread):
         if cfg.get("enabled", True) and reportable and elapsed >= threshold and self.report_count < limit and time.monotonic() - self.last_report_at >= cooldown and self.loop:
             self.last_report_at = time.monotonic(); self.report_count += 1
             report = self.loop.create_task(self.agent.speak_progress_report(self.prompt, list(self.completed_steps), self.current_step, elapsed)); self.report_tasks.add(report); report.add_done_callback(self.report_tasks.discard)
+
+    report_status.supports_structured_status = True
 
     def run(self):
         self.loop = asyncio.new_event_loop(); self.started_at = time.monotonic()
@@ -411,7 +432,9 @@ class TaskProgressCard(QFrame):
     def __init__(self):
         super().__init__()
         self.setObjectName("progressCard")
-        self._expanded = False
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._expanded = True
         self._completed_count = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 7, 12, 8)
@@ -428,6 +451,8 @@ class TaskProgressCard(QFrame):
         self.title.setObjectName("progressTitle")
         self.summary = QLabel("正在分析任务…")
         self.summary.setObjectName("progressSummary")
+        self.summary.setMinimumWidth(0)
+        self.summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.elapsed = QLabel("0 秒")
         self.elapsed.setObjectName("progressElapsed")
@@ -439,9 +464,17 @@ class TaskProgressCard(QFrame):
 
         self.details = QFrame()
         self.details.setObjectName("progressDetails")
+        self.details.setMinimumWidth(0)
+        self.details.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         detail_layout = QVBoxLayout(self.details)
         detail_layout.setContentsMargins(29, 2, 4, 2)
         detail_layout.setSpacing(5)
+        self.reasoning = QLabel("判断摘要：正在理解任务…")
+        self.reasoning.setWordWrap(True); self.reasoning.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.reasoning.setObjectName("progressReasoning")
+        self.plan = QLabel("计划：正在生成…")
+        self.plan.setWordWrap(True); self.plan.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.plan.setObjectName("progressPlan")
         self.current = QLabel("当前：正在分析任务…")
         self.current.setWordWrap(True)
         self.current.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -450,10 +483,21 @@ class TaskProgressCard(QFrame):
         self.done.setWordWrap(True)
         self.done.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.done.setObjectName("progressDone")
+        self.activity = QLabel("活动记录：暂无")
+        self.activity.setWordWrap(True); self.activity.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.activity.setObjectName("progressActivity")
+        for label in (self.reasoning, self.plan, self.current, self.activity, self.done):
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        detail_layout.addWidget(self.reasoning)
+        detail_layout.addWidget(self.plan)
         detail_layout.addWidget(self.current)
+        detail_layout.addWidget(self.activity)
         detail_layout.addWidget(self.done)
         layout.addWidget(self.details)
-        self.details.hide()
+        self.details.show()
+        self.toggle.setText("⌄")
+        self.toggle.setToolTip("收起任务进度")
 
         self.started = time.monotonic()
         self.timer = QTimer(self)
@@ -474,12 +518,38 @@ class TaskProgressCard(QFrame):
     def update_progress(self, data):
         current = str(data.get("current") or "正在处理…")
         completed = data.get("completed") or []
+        plan_steps = data.get("plan_steps") or []
+        reasoning_raw = str(data.get("reasoning_summary") or "").strip()
+        success_raw = str(data.get("success_criteria") or "").strip()
+        reasoning = self._compact(reasoning_raw, 120) if reasoning_raw else ""
+        success = self._compact(success_raw, 100) if success_raw else ""
+        events = data.get("events") or []
         self._completed_count = len(completed)
         self.elapsed.setText(f"{int(data.get('elapsed', 0))} 秒")
         self.summary.setText(self._compact(current))
         self.summary.setToolTip(current if len(current) > 72 else "")
+        self.reasoning.setText("判断摘要：" + (reasoning or "等待任务规划"))
+        plan_lines = "\n".join(
+            f"{index}. {self._compact(step, 90)}"
+            for index, step in enumerate(plan_steps[:6], 1)
+        ) or "等待任务规划"
+        if success:
+            plan_lines += f"\n完成标准：{success}"
+        self.plan.setText("计划：\n" + plan_lines)
         self.current.setText("当前：" + current)
-        self.done.setText("已完成：" + ("\n".join(f"• {item}" for item in completed[-8:]) if completed else "暂无"))
+        activity_lines = []
+        icons = {"tool_start": "→", "tool_complete": "✓", "tool_failed": "!", "verification": "◇", "decision": "•"}
+        for event in events[-8:]:
+            icon = icons.get(str(event.get("type")), "•")
+            elapsed = int(event.get("elapsed", 0))
+            title = str(event.get("title") or "活动")
+            detail = str(event.get("detail") or "").strip()
+            activity_lines.append(
+                f"{icon} {elapsed}s  {self._compact(title, 42)}"
+                + (f" · {self._compact(detail, 88)}" if detail else "")
+            )
+        self.activity.setText("活动记录：\n" + ("\n".join(activity_lines) if activity_lines else "暂无"))
+        self.done.setText("已完成：" + ("\n".join(f"• {item}" for item in completed[-5:]) if completed else "暂无"))
 
     def finish(self, cancelled=False):
         self.timer.stop()
@@ -680,7 +750,9 @@ class HomeAgentWindow(QMainWindow):
         for text, tip, slot, obj, width in (("☰", "日志与上下文", self.open_inspector, "titleButton", 42), ("⚙", "设置", self.open_settings, "titleButton", 42), ("—", "最小化", self.showMinimized, "titleButton", 38), ("×", "关闭", self.close, "closeButton", 38)):
             button = QPushButton(text); button.setToolTip(tip); button.setObjectName(obj); button.setFixedSize(width, 38); button.clicked.connect(slot); h.addWidget(button)
         root.addWidget(header)
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame); self.messages = QWidget(); self.message_layout = QVBoxLayout(self.messages); self.message_layout.setContentsMargins(18, 10, 18, 8); self.message_layout.setSpacing(6); self.message_layout.addStretch(); self.scroll.setWidget(self.messages); root.addWidget(self.scroll, 1)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame); self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.messages = QWidget(); self.messages.setMinimumWidth(0); self.messages.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.message_layout = QVBoxLayout(self.messages); self.message_layout.setContentsMargins(18, 10, 18, 8); self.message_layout.setSpacing(6); self.message_layout.addStretch(); self.scroll.setWidget(self.messages); root.addWidget(self.scroll, 1)
         composer = QFrame(); composer.setObjectName("composer"); c = QHBoxLayout(composer); c.setContentsMargins(14, 10, 14, 12); c.setSpacing(8)
         input_box = QVBoxLayout(); input_box.setSpacing(4)
         self.attachment_panel = QFrame(); self.attachment_panel.setObjectName("attachmentPanel"); self.attachment_panel.setFixedHeight(106)
@@ -732,7 +804,10 @@ class HomeAgentWindow(QMainWindow):
 
     def _start_task(self, text, attachments=None):
         self.progress_card=TaskProgressCard(); self.message_layout.insertWidget(self.message_layout.count()-1,self.progress_card); self.task_cancelled=False; self.agent.begin_task(); self.send_btn.setEnabled(True); self.stop_btn.setEnabled(True); self.set_status("正在思考…")
-        self.worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action, attachments=attachments); self.worker.start()
+        worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action, attachments=attachments)
+        self.worker = worker
+        worker.finished.connect(lambda worker=worker: self._worker_thread_finished(worker))
+        worker.start()
 
     def choose_attachments(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择图片或文件", "", "所有文件 (*.*)")
@@ -858,6 +933,18 @@ class HomeAgentWindow(QMainWindow):
     def finish_task(self):
         if self.progress_card:self.progress_card.finish(self.task_cancelled)
         self.send_btn.setEnabled(True); self.stop_btn.setEnabled(False); self.set_status("就绪"); self.input.setFocus()
+        # bridge.finished is emitted from ChatWorker.run() just before run()
+        # returns. Dropping the last Python reference here can destroy a QThread
+        # that Qt still considers running and abort the whole application.
+        if self.worker is None or not self.worker.isRunning():
+            self._worker_thread_finished(self.worker)
+
+    def _worker_thread_finished(self, worker):
+        """Release a worker only after QThread.finished confirms it has stopped."""
+        if worker is not None and self.worker is not worker:
+            return
+        if worker is not None:
+            worker.deleteLater()
         self.worker = None
         if self.input_queue and not self.agent.restart_requested:
             next_item = self.input_queue.popleft()
@@ -1198,7 +1285,7 @@ QScrollArea {{ background: {COLORS['window']}; }} QScrollArea > QWidget > QWidge
 #bubbleAgent {{ background: {COLORS['panel']}; border: 1px solid {COLORS['line']}; border-radius: 15px; }} #bubbleUser {{ background: {COLORS['accent']}; border-radius: 15px; }} #bubbleError {{ background: #FFF0EF; border: 1px solid #F5C9C7; border-radius: 15px; }}
 #bubbleUser QLabel {{ color: white; }} #bubbleName {{ font-size: 11px; font-weight: 700; color: {COLORS['muted']}; }} #bubbleText {{ font-size: 14px; }}
 #carePopup {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 16px; }} #carePopupText {{ color: {COLORS['ink']}; font-size: 14px; }}
-#progressCard {{ background: #F7F9F9; border: 1px solid #DFE7E7; border-radius: 12px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #FAFBFB; border-color: #E4EAEA; }} #progressToggle {{ min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #526568; font-size: 19px; font-weight: 500; }} #progressToggle:hover {{ background: #E7EFEE; color: #16766F; }} #progressTitle {{ color: #263638; font-size: 13px; font-weight: 700; }} #progressSummary {{ color: #657578; font-size: 12px; }} #progressElapsed {{ color: #809093; font-size: 11px; }} #progressDetails {{ border-top: 1px solid #E4EAEA; }} #progressCurrent {{ color: #34484B; font-size: 12px; }} #progressDone {{ color: #657578; font-size: 12px; }}
+#progressCard {{ background: #F7F9F9; border: 1px solid #DFE7E7; border-radius: 12px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #FAFBFB; border-color: #E4EAEA; }} #progressToggle {{ min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #526568; font-size: 19px; font-weight: 500; }} #progressToggle:hover {{ background: #E7EFEE; color: #16766F; }} #progressTitle {{ color: #263638; font-size: 13px; font-weight: 700; }} #progressSummary {{ color: #657578; font-size: 12px; }} #progressElapsed {{ color: #809093; font-size: 11px; }} #progressDetails {{ border-top: 1px solid #E4EAEA; }} #progressReasoning {{ color: #355E5A; font-size: 12px; background: #EDF6F4; border-radius: 7px; padding: 6px; }} #progressPlan {{ color: #34484B; font-size: 12px; }} #progressCurrent {{ color: #1E6761; font-size: 12px; font-weight: 600; }} #progressActivity {{ color: #42575A; font-size: 12px; font-family: Consolas, "Microsoft YaHei UI"; }} #progressDone {{ color: #657578; font-size: 12px; }}
 #composer {{ background: {COLORS['panel']}; border-top: 1px solid {COLORS['line']}; border-bottom-left-radius: 22px; border-bottom-right-radius: 22px; }}
 #input, QLineEdit, QComboBox, QTextBrowser {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 12px; padding: 10px; selection-background-color: {COLORS['accent']}; }} #input:focus, QLineEdit:focus {{ border: 1px solid {COLORS['accent']}; }}
 #attachmentPanel {{ background: #F7FBFA; border: 1px solid {COLORS['line']}; border-radius: 10px; }}

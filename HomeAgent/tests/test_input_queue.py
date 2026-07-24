@@ -199,6 +199,27 @@ class InputQueueTests(unittest.TestCase):
         single_shot.assert_not_called()
         self.assertEqual(["稍后任务"], list(window.input_queue))
 
+    @patch("qt_app.QTimer.singleShot", side_effect=lambda _delay, callback: callback())
+    def test_bridge_completion_keeps_running_worker_alive_until_qthread_finishes(self, _single_shot):
+        window = self.make_window_stub()
+        worker = Mock()
+        worker.isRunning.return_value = True
+        window.worker = worker
+        window.input_queue.append("下一项")
+        window._start_task = Mock()
+
+        window.finish_task()
+
+        self.assertIs(window.worker, worker)
+        worker.deleteLater.assert_not_called()
+        window._start_task.assert_not_called()
+
+        window._worker_thread_finished(worker)
+
+        self.assertIsNone(window.worker)
+        worker.deleteLater.assert_called_once()
+        window._start_task.assert_called_once_with("下一项")
+
 
 if __name__ == "__main__":
     unittest.main()

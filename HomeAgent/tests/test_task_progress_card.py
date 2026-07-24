@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSizePolicy
 
 from qt_app import HomeAgentWindow, TaskProgressCard
 
@@ -15,17 +15,17 @@ class TaskProgressCardTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_details_are_collapsed_by_default_and_can_be_toggled(self):
+    def test_details_are_expanded_by_default_and_can_be_toggled(self):
         card = TaskProgressCard()
-        self.assertTrue(card.details.isHidden())
-        self.assertEqual(card.toggle.text(), "›")
-
-        card.toggle.click()
         self.assertFalse(card.details.isHidden())
         self.assertEqual(card.toggle.text(), "⌄")
 
         card.toggle.click()
         self.assertTrue(card.details.isHidden())
+        self.assertEqual(card.toggle.text(), "›")
+
+        card.toggle.click()
+        self.assertFalse(card.details.isHidden())
 
     def test_running_summary_and_finished_state_remain_compact(self):
         card = TaskProgressCard()
@@ -33,15 +33,50 @@ class TaskProgressCardTests(unittest.TestCase):
             "current": "正在检查网页点击后的页面状态",
             "completed": ["打开网页", "定位搜索框"],
             "elapsed": 12,
+            "reasoning_summary": "用户要求打开目标并确认点击后的结果。",
+            "plan_steps": ["打开网页", "定位搜索框", "验证页面状态"],
+            "success_criteria": "页面显示目标结果",
+            "events": [
+                {"type": "tool_start", "title": "读取网页", "detail": '{"max_chars":12000}', "elapsed": 2},
+                {"type": "tool_complete", "title": "读取网页 · 完成", "detail": '{"status":"success"}', "elapsed": 3},
+            ],
         })
         self.assertEqual(card.summary.text(), "正在检查网页点击后的页面状态")
         self.assertIn("• 打开网页", card.done.text())
-        self.assertTrue(card.details.isHidden())
-
+        self.assertIn("用户要求打开目标", card.reasoning.text())
+        self.assertIn("3. 验证页面状态", card.plan.text())
+        self.assertIn("✓ 3s", card.activity.text())
+        self.assertFalse(card.details.isHidden())
         card.finish()
         self.assertEqual(card.title.text(), "任务已完成")
         self.assertEqual(card.summary.text(), "执行完成 · 2 个步骤")
-        self.assertTrue(card.details.isHidden())
+        self.assertFalse(card.details.isHidden())
+
+    def test_activity_only_displays_latest_eight_summaries(self):
+        card = TaskProgressCard()
+        events = [
+            {"type": "tool_complete", "title": f"步骤 {index}", "detail": "简短摘要", "elapsed": index}
+            for index in range(10)
+        ]
+        card.update_progress({"current": "处理中", "events": events})
+        self.assertNotIn("步骤 0", card.activity.text())
+        self.assertNotIn("步骤 1", card.activity.text())
+        self.assertIn("步骤 2", card.activity.text())
+        self.assertIn("步骤 9", card.activity.text())
+
+    def test_long_task_content_does_not_force_a_wide_card(self):
+        card = TaskProgressCard()
+        card.update_progress({
+            "current": "正在处理" * 80,
+            "reasoning_summary": "很长的判断摘要" * 80,
+            "plan_steps": ["没有空格的超长任务步骤" * 80],
+            "events": [{"type": "tool_complete", "title": "窗口读取", "detail": "技术结果" * 100}],
+        })
+        self.assertEqual(card.minimumWidth(), 0)
+        self.assertEqual(card.summary.sizePolicy().horizontalPolicy(), QSizePolicy.Ignored)
+        for label in (card.reasoning, card.plan, card.current, card.activity, card.done):
+            self.assertEqual(label.minimumWidth(), 0)
+            self.assertEqual(label.sizePolicy().horizontalPolicy(), QSizePolicy.Ignored)
 
     def test_screen_care_settings_restart_or_stop_timer_immediately(self):
         class Timer:

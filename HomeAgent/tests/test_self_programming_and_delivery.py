@@ -14,6 +14,72 @@ from self_upgrade import SelfUpgradeManager
 
 
 class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_registered_character_images_expose_canonical_paths(self) -> None:
+        catalog = HomeAgent._character_image_catalog()
+        three_view = next(item for item in catalog["images"] if item["filename"] == "角色三视图.png")
+        self.assertTrue(Path(three_view["path"]).is_absolute())
+        self.assertTrue(Path(three_view["path"]).is_file())
+        self.assertEqual(Path(catalog["primary_path"]).name, "64db0915e4bf4f52a63a6e1b4da9bb58.png")
+
+    def test_registered_character_image_resolves_aliases_without_cwd_guessing(self) -> None:
+        expected = (Path(__file__).resolve().parents[2] / "workspace" / "character_images" / "角色三视图.png").resolve()
+        for alias in ("角色三视图.png", "generated-three-view-20260717", "角色正侧背三视图", "角色三视图"):
+            self.assertEqual(HomeAgent._resolve_character_image(alias), expected)
+        self.assertEqual(HomeAgent._resolve_character_image("primary").suffix.lower(), ".png")
+
+    async def test_analyze_registered_character_image_uses_resolved_absolute_path(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"computer_control": {"full_access": False, "allowed_roots": []}}
+        agent.mimo_multimodal = SimpleNamespace(
+            config={"timeout_seconds": 5},
+            analyze_image=AsyncMock(return_value={"status": "success", "text": "三视图"}),
+        )
+        result = await agent._run_tool("analyze_image", {"image": "角色三视图.png", "prompt": "分析固定外观"})
+        self.assertEqual(result["status"], "success")
+        used_path = agent.mimo_multimodal.analyze_image.await_args.args[1]
+        self.assertTrue(used_path.is_absolute())
+        self.assertEqual(used_path.name, "角色三视图.png")
+
+    def test_implementation_change_plan_cannot_become_live_screen_task(self) -> None:
+        plan = {
+            "implementation_change": True,
+            "domain": "desktop",
+            "operation": "observe_screen",
+            "visual_required": True,
+            "interaction_mode": "observe",
+            "execution_strategy": "vision_loop",
+            "requires_mcp": True,
+            "site": "cloudmusic",
+            "handler": "model_ui",
+        }
+        result = HomeAgent._apply_implementation_change_plan(plan)
+        self.assertEqual(result["domain"], "code")
+        self.assertEqual(result["execution_strategy"], "code_loop")
+        self.assertFalse(result["visual_required"])
+        self.assertFalse(result["requires_mcp"])
+        self.assertEqual(result["site"], "")
+
+    def test_window_activity_result_is_summary_not_raw_json(self) -> None:
+        result = {
+            "status": "success",
+            "observation": [{
+                "hwnd": "1182508",
+                "pid": "49696",
+                "bounds": [4739, 15, 6029, 585],
+                "process_path": r"C:\Python312\pythonw.exe",
+            }],
+        }
+        detail = HomeAgent._tool_activity_result("ui_list_windows", result)
+        self.assertEqual(detail, "找到 1 个可用窗口")
+        self.assertNotIn("hwnd", detail)
+        self.assertNotIn("49696", detail)
+
+    def test_screen_analysis_activity_does_not_echo_screen_content(self) -> None:
+        result = {"status": "success", "observation": "屏幕中显示了用户的私人聊天内容"}
+        detail = HomeAgent._tool_activity_result("ui_analyze_screen", result)
+        self.assertEqual(detail, "画面识别完成，已获得状态摘要")
+        self.assertNotIn("私人聊天", detail)
+
     async def test_scheduled_reminder_is_published_before_tts(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         task = {"id": "r1", "action": "tts", "message": "该喝水了", "reminder_attempts": 0}
@@ -198,6 +264,20 @@ class SelfProgrammingTests(unittest.TestCase):
         self.assertTrue(HomeAgent._allows_application_termination(forced))
         self.assertFalse(HomeAgent._is_media_stop_plan(forced))
 
+    def test_cloudmusic_generic_play_does_not_become_a_search(self) -> None:
+        plan = HomeAgent._apply_cloudmusic_handler({
+            "site": "cloudmusic", "operation": "play", "query": "音乐", "query_is_explicit": False,
+        })
+        self.assertEqual(plan["handler"], "model_ui")
+        self.assertEqual(plan["query"], "")
+
+    def test_cloudmusic_specific_target_uses_planner_decision(self) -> None:
+        plan = HomeAgent._apply_cloudmusic_handler({
+            "site": "cloudmusic", "operation": "play", "query": "稻香", "query_is_explicit": True,
+        })
+        self.assertEqual(plan["handler"], "model_ui")
+        self.assertEqual(plan["query"], "稻香")
+
     def test_malformed_tool_arguments_are_rejected_instead_of_becoming_empty(self) -> None:
         with self.assertRaises(json.JSONDecodeError):
             HomeAgent._parse_tool_arguments('{"path":')
@@ -287,6 +367,41 @@ class SelfProgrammingTests(unittest.TestCase):
         self.assertIn("run_shell", tools)
         self.assertIn("run_cmd", tools)
         self.assertIn("由你", tools["run_shell"]["description"])
+
+    def test_execution_model_only_sees_media_tools_authorized_by_plan(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_code_task = True
+        agent.current_file_authoring_task = False
+        agent.current_task_plan = {"domain": "code", "operation": "code", "handler": None}
+        agent.config = {
+            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": True},
+            "computer_control": {"enabled": False},
+        }
+        names = {item["function"]["name"] for item in agent._tools(scoped=True)}
+        self.assertNotIn("cloudmusic_search_and_play", names)
+        self.assertNotIn("media_stop", names)
+        self.assertNotIn("bilibili_open_favorite_video", names)
+        self.assertIn("code_validate_project", names)
+
+    def test_cloudmusic_plan_uses_generic_visual_action_tools(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_code_task = False
+        agent.current_file_authoring_task = False
+        agent.current_task_plan = {
+            "is_task": True, "actionable": True, "domain": "desktop", "site": "cloudmusic",
+            "operation": "play", "handler": "model_ui", "query": "稻香", "query_is_explicit": True,
+        }
+        agent.config = {
+            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": True},
+            "computer_control": {"enabled": True}, "shell_execution": {"shell_enabled": False, "cmd_enabled": False},
+        }
+        names = {item["function"]["name"] for item in agent._tools(scoped=True)}
+        self.assertNotIn("cloudmusic_search_and_play", names)
+        for name in ("ui_list_windows", "ui_analyze_window", "ui_click_window", "ui_type_active_text", "launch_app"):
+            self.assertIn(name, names)
+
     def test_independent_project_request_prefers_local_tools(self) -> None:
         root = Path(__file__).resolve().parents[2]
         agent = HomeAgent.__new__(HomeAgent)

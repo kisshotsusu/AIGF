@@ -1,9 +1,8 @@
 {
   "action": "clear",
-  "token": "1784344768254114100",
-  "requested_at": "2026-07-18T11:19:28",
+  "token": "1784900101926373200",
+  "requested_at": "2026-07-24T21:35:01",
   "source": "home-agent",
-  "status": "completed",
-  "removed_messages": 12,
-  "completed_at": "2026-07-21T23:52:29"
+  "status": "storage_cleared",
+  "removed_messages": 0
 }

@@ -88,6 +88,8 @@ memory_write:
   ignore_keywords: ["测试", "111", "哈哈"]
 
 image_generation:
+  preset: custom
+  provider: custom
   mode: images                  # images | chat_multimodal
   base_url: https://api.example.com/v1
   api_key_env: IMAGE_API_KEY

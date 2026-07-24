@@ -1,4 +1,6 @@
 image_generation:
+  preset: custom
+  provider: custom
   # images 调用 /images/generations 与 /images/edits。
   # chat_multimodal 调用 /chat/completions 并发送图片 data URI。
   mode: images
@@ -13,4 +15,3 @@ workspace:
   path: workspace
   character_image_dir: character_images
   character_profile_file: CHARACTER.md
-

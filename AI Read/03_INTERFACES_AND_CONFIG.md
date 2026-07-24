@@ -17,7 +17,10 @@
 - `singing`：唱歌模式（`local_tts` 朗读歌词，MiMo `mimo-v2.5-tts` 为关闭的备用分支）、男女声预设。
 - `memory_write`：重要度判断、每日上限、强制/忽略关键词。
 - `context_cleanup`：直播上下文保留 120 分钟、检查间隔。
-- `image_generation` / `image_understanding`：图像生成与旧兼容图片理解配置。
+- `image_generation` / `image_understanding`：图像生成与旧兼容图片理解配置。图像生成增加 `preset: custom|qwen|grok`、`provider` 与供应商请求模式。角色管理器提供“自定义”“千问图像（阿里云百炼）”“Grok Imagine（xAI）”三个选项：
+  - 千问预设使用 `dashscope_multimodal`、`qwen-image-2.0-pro`、`DASHSCOPE_API_KEY` 和 `2048*2048`；Base URL 必须把 `{WorkspaceId}` 换成所属地域的百炼工作空间 ID。
+  - Grok 预设使用 `xai_images`、`https://api.x.ai/v1`、`grok-imagine-image-quality` 与 `XAI_API_KEY`，调用 `/images/generations` 或 `/images/edits`，不会发送通用 `size` 字段。
+  - 自定义模式继续支持 `images` 与 `chat_multimodal`，并保留配置中 UI 未识别的 `extra_body` 等供应商参数。
 - `mimo_multimodal`：统一 MiMo 多模态配置，包括总开关、Base URL、密钥环境变量、图片模型、ASR 模型/语言、完成检查模型、失败重试、超时和 `fail_closed`。当前图片模型 `mimo-v2.5`，语音模型 `mimo-v2.5-asr`，完成检查默认启用并重试 2 次。
 - `workspace`：人格、身份、记忆和图片相对路径。
 
@@ -43,7 +46,7 @@
 
 `HomeAgent/config.d/` 把 `computer_control`、`vision_mcp`、`context_maintenance`、`context_cleanup`（直播上下文清理）另存为独立文档。角色管理器写入时经 `CharacterService` 同时更新 `HomeAgent/config.yaml` 与对应 `config.d` 文件，并保留 UI 未识别字段。
 
-密钥只存 `.env`，常见变量：`DEEPSEEK_API_KEY`、`MIMO_API_KEY`、`CUSTOM_API_KEY`、`IMAGE_API_KEY`、`STT_API_KEY`、`BILIBILI_COOKIE`。角色工作台负责 `llm`/`tts`/图像/STT 密钥；直播控制台只维护 `BILIBILI_COOKIE`。
+密钥只存 `.env`，常见变量：`DEEPSEEK_API_KEY`、`MIMO_API_KEY`、`CUSTOM_API_KEY`、`IMAGE_API_KEY`、`DASHSCOPE_API_KEY`、`XAI_API_KEY`、`STT_API_KEY`、`BILIBILI_COOKIE`。角色工作台负责 `llm`/`tts`/图像/STT 密钥；直播控制台只维护 `BILIBILI_COOKIE`。
 
 角色管理器中，普通对话供应商和 MiMo 多模态均位于“模型 API”页面；“MiMo 多模态”标签管理图片、语音和任务完成检查，并只显示 API Key 是否已配置，不回显明文。
 
@@ -134,6 +137,7 @@ GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露 `vision_gui_task`；`pr
 
 - `visual_required: bool`：任务是否必须读取当前屏幕；视觉路由仅依据该模型计划字段，不依据关键词表。
 - `interaction_mode: none|observe|solve|game`：分别表示不需要视觉、只观察、读题求解、逐步游戏操作；要求计算、回答、选择答案或解谜时规划器必须输出 `solve`，不能降级为 `observe`。
+- `implementation_change: bool`：最终目标是否为持久修改程序实现、程序 UI、任务路由或输出行为。该语义由规划模型判断；为真时执行层固定使用代码任务并关闭实时读屏。消息里的窗口名、屏幕描述、工具名和原始 observation JSON 只作为故障证据，不能变成首个 UI 工具。
 - `ui_analyze_screen(question)`：截取当前桌面并把模型为本轮任务编写的具体问题交给 MiMo；返回观察、模型和原问题。截图为临时文件，分析后删除。整屏抓取遇到暂态 GDI 错误时重试，并以当前前台窗口截图作为兜底，避免一次 `screen grab failed` 中断观察任务。
 
 ## 总任务规划字段（2026-07-22）
@@ -166,3 +170,5 @@ GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露 `vision_gui_task`；`pr
 - 计划 `operation=stop_media` 只允许媒体 Stop。明确退出应用使用 `close_app`；明确结束进程或常规退出失败需要强制终止时使用 `terminate_process` 与 `process_termination`，此时允许 `Stop-Process/taskkill`。
 - `process_status(name)` 把“进程不存在”规范为 `ok=true,running=false`，避免把 `tasklist`/筛选命令的非零退出码误判为执行失败。
 - 每个工具证据带 `task_submitted_at`、`tool_submitted_at`、`tool_completed_at`、`tool_elapsed_ms` 和 `tool_sequence`。Vision 另带 `vision_request_submitted_at`、截图采集时间与分析完成时间；核验器按序号和时间采用同一对象的最新状态。
+- Qt 任务卡片接收结构化活动事件：`plan` 提供判断摘要、编号步骤和完成标准；`tool_start/tool_complete/tool_failed` 只提供中文动作名和简短结果摘要；`verification` 提供一句完成检查结论。窗口句柄、PID、坐标、进程路径、屏幕内容和原始工具 JSON 不进入任务卡。默认显示最近 8 条活动和 5 条完成项，详情可手动收起。这里展示的是可审计的计划与决策摘要，不包含模型隐藏思维链。
+- 任务卡、顶部摘要及所有详情标签不使用内容宽度撑开消息区；它们按聊天窗口可用宽度收缩并换行。消息滚动区禁用横向滚动，调整窗口宽度时任务提示会同步自适应。

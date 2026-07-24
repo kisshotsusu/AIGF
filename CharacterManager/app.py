@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import yaml
 from PIL import Image, ImageTk
+from image_api_presets import CUSTOM_PRESET, preset_config, preset_description, preset_items
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config.yaml"
@@ -802,16 +803,42 @@ class CharacterManager:
 
     def _build_api(self, tab):
         cfg = self.config.get("image_generation", {}); self.api_fields = {}
-        for row, (key, label) in enumerate((("mode", "接口模式"), ("base_url", "Base URL"), ("model", "模型名称"), ("size", "输出尺寸"))):
+        ttk.Label(tab, text="服务预设").grid(row=0, column=0, sticky="w", padx=(0, 14), pady=8)
+        self.image_preset_labels = {label: key for key, label in preset_items()}
+        self.image_preset = ttk.Combobox(tab, values=list(self.image_preset_labels), state="readonly")
+        selected = str(cfg.get("preset", CUSTOM_PRESET))
+        selected_label = next((label for label, key in self.image_preset_labels.items() if key == selected), "自定义")
+        self.image_preset.set(selected_label); self.image_preset.grid(row=0, column=1, sticky="ew", pady=8)
+        self.image_preset.bind("<<ComboboxSelected>>", self._apply_image_preset)
+        self.image_preset_note = ttk.Label(tab, text=preset_description(selected), foreground="#52615f", wraplength=620)
+        self.image_preset_note.grid(row=1, column=1, sticky="w", pady=(0, 6))
+        for row, (key, label) in enumerate((("mode", "接口模式"), ("base_url", "Base URL"), ("model", "模型名称"), ("size", "输出尺寸")), start=2):
             ttk.Label(tab, text=label).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=8)
-            if key == "mode": widget = ttk.Combobox(tab, values=["images", "chat_multimodal"], state="readonly")
+            if key == "mode": widget = ttk.Combobox(tab, values=["images", "chat_multimodal", "dashscope_multimodal", "xai_images"], state="readonly")
             else: widget = ttk.Entry(tab)
-            widget.insert(0, str(cfg.get(key, ""))); widget.grid(row=row, column=1, sticky="ew", pady=8); self.api_fields[key] = widget
-        ttk.Label(tab, text="API Key").grid(row=4, column=0, sticky="w", padx=(0, 14), pady=8)
-        self.image_key = ttk.Entry(tab, show="•"); self.image_key.grid(row=4, column=1, sticky="ew", pady=8)
-        ttk.Label(tab, text="密钥保存在主项目 .env，角色图片 Skill 与家庭 Agent 会共同使用。", foreground="#52615f").grid(row=5, column=1, sticky="w")
-        ttk.Button(tab, text="保存图片 API", command=self.save_api).grid(row=6, column=1, sticky="e", pady=18)
+            widget.set(str(cfg.get(key, ""))) if key == "mode" else widget.insert(0, str(cfg.get(key, "")))
+            widget.grid(row=row, column=1, sticky="ew", pady=8); self.api_fields[key] = widget
+        ttk.Label(tab, text="密钥环境变量").grid(row=6, column=0, sticky="w", padx=(0, 14), pady=8)
+        self.image_env = ttk.Entry(tab); self.image_env.insert(0, str(cfg.get("api_key_env", "IMAGE_API_KEY"))); self.image_env.grid(row=6, column=1, sticky="ew", pady=8)
+        ttk.Label(tab, text="API Key").grid(row=7, column=0, sticky="w", padx=(0, 14), pady=8)
+        self.image_key = ttk.Entry(tab, show="•"); self.image_key.grid(row=7, column=1, sticky="ew", pady=8)
+        ttk.Label(tab, text="密钥保存在主项目 .env，角色图片 Skill 与家庭 Agent 会共同使用。", foreground="#52615f").grid(row=8, column=1, sticky="w")
+        ttk.Button(tab, text="保存图片 API", command=self.save_api).grid(row=9, column=1, sticky="e", pady=18)
         tab.columnconfigure(1, weight=1)
+
+    def _apply_image_preset(self, _event=None):
+        key = self.image_preset_labels.get(self.image_preset.get(), CUSTOM_PRESET)
+        self.image_preset_note.configure(text=preset_description(key))
+        values = preset_config(key)
+        if key == CUSTOM_PRESET:
+            return
+        for field in ("mode", "base_url", "model", "size"):
+            widget = self.api_fields[field]
+            if field == "mode":
+                widget.set(str(values[field]))
+            else:
+                widget.delete(0, "end"); widget.insert(0, str(values[field]))
+        self.image_env.delete(0, "end"); self.image_env.insert(0, str(values["api_key_env"]))
 
     def _load_manifest(self):
         if not MANIFEST.exists(): return {"primary": None, "images": []}
@@ -897,10 +924,16 @@ class CharacterManager:
     def save_api(self):
         cfg = self.config.setdefault("image_generation", {})
         for key, widget in self.api_fields.items(): cfg[key] = widget.get().strip()
-        cfg.setdefault("api_key_env", "IMAGE_API_KEY")
+        preset = self.image_preset_labels.get(self.image_preset.get(), CUSTOM_PRESET)
+        cfg["preset"] = preset; cfg["provider"] = preset_config(preset).get("provider", "custom")
+        cfg["api_key_env"] = self.image_env.get().strip() or "IMAGE_API_KEY"
+        if preset == "qwen" and "{WorkspaceId}" in cfg["base_url"]:
+            return messagebox.showerror("配置未完成", "请先把千问 Base URL 中的 {WorkspaceId} 替换为百炼工作空间 ID。")
+        if not cfg["base_url"] or not cfg["model"]:
+            return messagebox.showerror("配置未完成", "Base URL 和模型名称不能为空。")
         self._atomic_write_yaml(CONFIG, self.config)
         key = self.image_key.get().strip()
-        if key: self._save_env("IMAGE_API_KEY", key); self.image_key.delete(0, "end")
+        if key: self._save_env(cfg["api_key_env"], key); self.image_key.delete(0, "end")
         messagebox.showinfo("保存成功", "图片 API 配置已保存。")
 
     @staticmethod

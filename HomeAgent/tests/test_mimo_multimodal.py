@@ -136,6 +136,19 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("media_stop", result["error"])
         agent.ensure_vision_service.assert_not_called()
 
+    async def test_code_task_cannot_invoke_cloudmusic_search(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_task_plan = {
+            "is_task": True, "actionable": True, "domain": "code",
+            "site": "", "handler": None, "query": "",
+        }
+        agent.log_event = Mock()
+        agent._run_cloudmusic_search_and_play = AsyncMock(side_effect=AssertionError("media side effect must be blocked"))
+        result = await agent._run_tool("cloudmusic_search_and_play", {"query": "音乐"})
+        self.assertFalse(result["executed"])
+        self.assertEqual(result["blocked_by"], "task_plan_scope")
+        agent._run_cloudmusic_search_and_play.assert_not_awaited()
+
     async def test_vision_tool_result_contains_submission_and_completion_times(self):
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"vision_mcp": {"enabled": True}}

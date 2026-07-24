@@ -60,13 +60,11 @@ class CodeEditorModule:
         if not raw:
             raise ValueError("代码工具只接受工程根目录内的相对路径")
         path = (self.root / raw).resolve()
-        allowed = [self.root / "Projects"]
-        if self_edit:
-            allowed.extend(self.root / area for area in self.TRACKED_AREAS if area != "Projects")
+        allowed = [self.root] if self_edit else [self.root / "Projects"]
         if not any(path == folder.resolve() or folder.resolve() in path.parents for folder in allowed):
             raise ValueError("路径不在当前代码任务允许的目录中")
-        if any(part in self.EXCLUDED_PARTS or part == "state" for part in path.parts):
-            raise ValueError("禁止编辑环境、模型、日志、缓存或运行状态目录")
+        if any(part in {".git", ".venv", "node_modules", "__pycache__"} for part in path.parts):
+            raise ValueError("依赖、缓存和 Git 元数据目录不作为源码编辑目标")
         if path.name.lower().startswith(".env"):
             raise ValueError("禁止读取或编辑密钥文件")
         return path
@@ -182,29 +180,20 @@ class CodeEditorModule:
 
     def _fingerprint(self) -> dict[str, str]:
         result: dict[str, str] = {}
-        for relative in self.ROOT_TRACKED_FILES:
-            path = self.root / relative
-            if path.is_file():
-                stat = path.stat()
-                result[relative] = hashlib.sha1(f"{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
-        for area in self.TRACKED_AREAS:
-            folder = self.root / area
-            if not folder.exists():
+        for path in self.root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in self.TRACKED_SUFFIXES:
                 continue
-            for path in folder.rglob("*"):
-                if not path.is_file() or path.suffix.lower() not in self.TRACKED_SUFFIXES:
-                    continue
-                if any(part in self.EXCLUDED_PARTS for part in path.parts):
-                    continue
-                if self.home_agent / "state" in path.parents:
-                    continue
-                try:
-                    stat = path.stat()
-                    result[path.relative_to(self.root).as_posix()] = hashlib.sha1(
-                        f"{stat.st_size}:{stat.st_mtime_ns}".encode()
-                    ).hexdigest()
-                except OSError:
-                    continue
+            if any(part in self.EXCLUDED_PARTS for part in path.parts):
+                continue
+            if self.home_agent / "state" in path.parents:
+                continue
+            try:
+                stat = path.stat()
+                result[path.relative_to(self.root).as_posix()] = hashlib.sha1(
+                    f"{stat.st_size}:{stat.st_mtime_ns}".encode()
+                ).hexdigest()
+            except OSError:
+                continue
         return result
 
     def begin_tracking(self) -> None:
@@ -245,22 +234,6 @@ class CodeEditorModule:
         changed = self.changed_files()
         if require_changes and not changed:
             return {"ok": False, "changed": [], "error": "自编程任务没有产生任何代码或配置变更"}
-        implementation_changed = any(
-            not Path(path).is_absolute() and not path.startswith(("AI Read/", "Projects/")) and path != "README.md"
-            for path in changed
-        )
-        documentation_changed = any(path.startswith("AI Read/") for path in changed)
-        if implementation_changed and not documentation_changed:
-            return {
-                "ok": False,
-                "changed": changed,
-                "error": "代码或配置已变更，但尚未同步更新 AI Read 中对应的架构、组件、接口、规则或当前状态说明",
-            }
-        changed_projects = {Path(path).parts[1] for path in changed if len(Path(path).parts) >= 3 and Path(path).parts[0].casefold() == "projects" and Path(path).name.casefold() != "readme.md"}
-        documented_projects = {Path(path).parts[1] for path in changed if len(Path(path).parts) >= 3 and Path(path).parts[0].casefold() == "projects" and Path(path).name.casefold() == "readme.md"}
-        missing_project_docs = sorted(changed_projects - documented_projects)
-        if missing_project_docs:
-            return {"ok": False, "changed": changed, "error": f"独立项目代码已变更但 README 未同步：{', '.join(missing_project_docs)}"}
         result = self.validate_files(changed)
         result["changed"] = changed
         return result

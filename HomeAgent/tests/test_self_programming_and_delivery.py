@@ -66,24 +66,9 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(used_path.is_absolute())
         self.assertEqual(used_path.name, "角色三视图.png")
 
-    def test_implementation_change_plan_cannot_become_live_screen_task(self) -> None:
-        plan = {
-            "implementation_change": True,
-            "domain": "desktop",
-            "operation": "observe_screen",
-            "visual_required": True,
-            "interaction_mode": "observe",
-            "execution_strategy": "vision_loop",
-            "requires_mcp": True,
-            "site": "cloudmusic",
-            "handler": "model_ui",
-        }
-        result = HomeAgent._apply_implementation_change_plan(plan)
-        self.assertEqual(result["domain"], "code")
-        self.assertEqual(result["execution_strategy"], "code_loop")
-        self.assertFalse(result["visual_required"])
-        self.assertFalse(result["requires_mcp"])
-        self.assertEqual(result["site"], "")
+    def test_local_code_does_not_rewrite_model_intent(self) -> None:
+        self.assertFalse(hasattr(HomeAgent, "_apply_implementation_change_plan"))
+        self.assertFalse(hasattr(HomeAgent, "_apply_cloudmusic_handler"))
 
     def test_window_activity_result_is_summary_not_raw_json(self) -> None:
         result = {
@@ -271,10 +256,12 @@ class SelfProgrammingTests(unittest.TestCase):
     def test_codex_exec_reads_large_prompt_from_stdin(self) -> None:
         command = HomeAgent._codex_exec_command(
             [r"C:\node.exe", r"E:\codex.js"],
-            {"skip_git_repo_check": True, "sandbox": "danger-full-access"},
+            {"skip_git_repo_check": True, "bypass_approvals_and_sandbox": True},
         )
         self.assertEqual(command[-1], "-")
         self.assertEqual(command[:4], [r"C:\node.exe", r"E:\codex.js", "exec", "--json"])
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--sandbox", command)
         self.assertNotIn("用户任务", " ".join(command))
 
     def test_failed_self_upgrade_is_diagnostic_not_auto_resumed(self) -> None:
@@ -290,31 +277,15 @@ class SelfProgrammingTests(unittest.TestCase):
             self.assertEqual(state["last_error"], "Codex CLI 启动失败")
             self.assertEqual(manager.resume_prompt(), "")
 
-    def test_media_stop_and_forced_process_termination_are_distinct_plans(self) -> None:
-        self.assertTrue(HomeAgent._is_media_stop_plan({
-            "operation": "stop_media", "required_capabilities": ["media_control"],
-        }))
-        forced = {
-            "operation": "terminate_process",
-            "handler": "cloudmusic_control",
-            "required_capabilities": ["process_termination"],
-        }
-        self.assertTrue(HomeAgent._allows_application_termination(forced))
-        self.assertFalse(HomeAgent._is_media_stop_plan(forced))
+    def test_tool_result_normalization_does_not_plan_next_action(self) -> None:
+        failed = HomeAgent._normalize_tool_result("demo", {"error": "failed"})
+        stale = HomeAgent._normalize_tool_result("demo", {"stale": True, "observation": "old"})
+        self.assertNotIn("next_action", failed)
+        self.assertNotIn("next_action", stale)
+        self.assertNotIn("observation", stale)
 
-    def test_cloudmusic_generic_play_does_not_become_a_search(self) -> None:
-        plan = HomeAgent._apply_cloudmusic_handler({
-            "site": "cloudmusic", "operation": "play", "query": "音乐", "query_is_explicit": False,
-        })
-        self.assertEqual(plan["handler"], "model_ui")
-        self.assertEqual(plan["query"], "")
-
-    def test_cloudmusic_specific_target_uses_planner_decision(self) -> None:
-        plan = HomeAgent._apply_cloudmusic_handler({
-            "site": "cloudmusic", "operation": "play", "query": "稻香", "query_is_explicit": True,
-        })
-        self.assertEqual(plan["handler"], "model_ui")
-        self.assertEqual(plan["query"], "稻香")
+    def test_site_specific_handler_rewriters_are_removed(self) -> None:
+        self.assertFalse(hasattr(HomeAgent, "_apply_cloudmusic_handler"))
 
     def test_malformed_tool_arguments_are_rejected_instead_of_becoming_empty(self) -> None:
         with self.assertRaises(json.JSONDecodeError):
@@ -374,7 +345,7 @@ class SelfProgrammingTests(unittest.TestCase):
         for prompt in ("不要重启自己", "如何重启自己？", "让他能自己重启自己", "完善重启自己的消息处理功能"):
             self.assertFalse(HomeAgent.is_restart_request(prompt), prompt)
 
-    def test_file_plan_uses_file_tools_not_ui_or_codex(self) -> None:
+    def test_file_plan_keeps_full_tool_surface_available(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = False
         agent.current_file_authoring_task = True
@@ -385,9 +356,9 @@ class SelfProgrammingTests(unittest.TestCase):
         }
         names = {item["function"]["name"] for item in agent._tools()}
         self.assertIn("write_text_file", names)
-        self.assertNotIn("ui_list_windows", names)
-        self.assertNotIn("launch_app", names)
-        self.assertNotIn("codex_cli_task", names)
+        self.assertIn("ui_list_windows", names)
+        self.assertIn("launch_app", names)
+        self.assertIn("codex_cli_task", names)
 
     def test_model_receives_shell_and_cmd_tools_when_enabled(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
@@ -402,21 +373,34 @@ class SelfProgrammingTests(unittest.TestCase):
         tools = {item["function"]["name"]: item["function"] for item in agent._tools()}
         self.assertIn("run_shell", tools)
         self.assertIn("run_cmd", tools)
-        self.assertIn("由你", tools["run_shell"]["description"])
+        self.assertIn("exit_code", tools["run_shell"]["description"])
 
-    def test_execution_model_only_sees_media_tools_authorized_by_plan(self) -> None:
+    def test_execution_model_keeps_tools_available_across_plan_types(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = True
         agent.current_file_authoring_task = False
         agent.current_task_plan = {"domain": "code", "operation": "code", "handler": None}
         agent.config = {
             "agent": {"prefer_local_code_tools": True},
-            "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": True},
+            "codex_cli": {"enabled": True}, "vision_mcp": {"enabled": True},
             "computer_control": {"enabled": False},
         }
         names = {item["function"]["name"] for item in agent._tools(scoped=True)}
-        self.assertNotIn("media_stop", names)
+        self.assertIn("media_stop", names)
         self.assertNotIn("bilibili_open_favorite_video", names)
+        self.assertIn("code_validate_project", names)
+        self.assertIn("codex_cli_task", names)
+
+    def test_code_tools_are_not_hidden_by_local_task_classification(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_code_task = False
+        agent.config = {
+            "agent": {"prefer_local_code_tools": True},
+            "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": False},
+            "computer_control": {"enabled": False},
+        }
+        names = {item["function"]["name"] for item in agent._tools(scoped=True)}
+        self.assertIn("code_read_file", names)
         self.assertIn("code_validate_project", names)
 
     def test_cloudmusic_plan_uses_generic_visual_action_tools(self) -> None:
@@ -520,7 +504,7 @@ class SelfProgrammingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.write_file(str(source), "VALUE = 9\n", self_edit=True)
 
-    def test_code_tool_surface_hides_codex_during_local_code_task(self) -> None:
+    def test_code_tool_surface_keeps_codex_available(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = True
         agent.config = {
@@ -530,7 +514,7 @@ class SelfProgrammingTests(unittest.TestCase):
         names = {item["function"]["name"] for item in agent._tools()}
         self.assertIn("code_write_file", names)
         self.assertIn("code_validate_project", names)
-        self.assertNotIn("codex_cli_task", names)
+        self.assertIn("codex_cli_task", names)
 
     def test_semantic_code_scope_marks_recovery_as_self_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -615,13 +599,21 @@ class SelfProgrammingTests(unittest.TestCase):
             self.assertFalse(manager.validate_current_changes(require_changes=True)["ok"])
             source.write_text("value = 2\n", encoding="utf-8")
             result = manager.validate_current_changes(require_changes=True)
-            self.assertFalse(result["ok"])
-            self.assertIn("AI Read", result["error"])
-            docs = root / "AI Read"; docs.mkdir(); (docs / "06_CURRENT_STATE.md").write_text("已同步 sample.py 逻辑\n", encoding="utf-8")
-            result = manager.validate_current_changes(require_changes=True)
             self.assertTrue(result["ok"])
             self.assertIn("HomeAgent/sample.py", result["changed"])
-            self.assertIn("AI Read/06_CURRENT_STATE.md", result["changed"])
+
+    def test_self_edit_can_modify_any_source_file_in_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            home = root / "HomeAgent"
+            home.mkdir()
+            script = root / "tools" / "release.py"
+            editor = CodeEditorModule(root, home)
+            editor.begin_tracking()
+            result = editor.write_file("tools/release.py", "print('ready')\n", self_edit=True)
+            self.assertTrue(result["ok"])
+            self.assertEqual(script.read_text(encoding="utf-8"), "print('ready')\n")
+            self.assertIn("tools/release.py", editor.changed_files())
 
     def test_self_programming_reads_engineering_documents(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -667,8 +659,7 @@ class SelfProgrammingTests(unittest.TestCase):
             changed = module.changed_files()
             self.assertIn("Projects/demo/calculator.py", changed)
             validation = module.validate_current_changes(require_changes=True)
-            self.assertFalse(validation["ok"])
-            self.assertIn("README", validation["error"])
+            self.assertTrue(validation["ok"])
             (project / "README.md").write_text("# Demo\n\nCalculator with tested add().\n", encoding="utf-8")
             changed = module.changed_files()
             validation = module.validate_current_changes(require_changes=True)

@@ -14,7 +14,7 @@
 
 ## 自动测试
 
-### Home Agent：103 项
+### Home Agent：105 项
 
 ```powershell
 Set-Location E:\Doc\AIAgent\HomeAgent
@@ -24,9 +24,9 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 | 文件 | 数量 | 主要覆盖 |
 |---|---:|---|
 | `test_command_executor.py` | 4 | PowerShell/CMD、工作目录、引号与退出码 |
-| `test_input_queue.py` | 11 | 多附件、异步预览、缩放、FIFO、QThread 与重启门禁 |
+| `test_input_queue.py` | 12 | 多附件、异步预览、发送线程非阻塞、缩放、FIFO、QThread 与重启门禁 |
 | `test_mimo_multimodal.py` | 19 | 图片/ASR 请求、完成检查、音乐视觉终态、原生窗口输入保护、最新证据压缩、证据时间、截图重试、媒体停止与关怀 |
-| `test_self_programming_and_delivery.py` | 58 | 模型计划约束、过期视觉证据淘汰、音乐完成门禁、代码范围及 Codex 计划传递、自升级恢复、文件/代码工具、角色图片路径、消息/TTS 顺序 |
+| `test_self_programming_and_delivery.py` | 59 | 模型计划约束、完整代码路径与 Codex 权限、过期视觉证据淘汰、音乐完成门禁、自升级恢复、文件/代码工具、角色图片路径、消息/TTS 顺序 |
 | `test_system_startup.py` | 4 | 开机启动、手动启动保护与重启计数 |
 | `test_task_progress_card.py` | 7 | 紧凑任务卡、窄窗口、关怀设置、消息与气泡同步 |
 

@@ -297,16 +297,8 @@ class LiveAssistant:
             self.workspace.remember({"type": "conversation", **base})
             self._record_message("memory", user, message, status="success", reason="mode:all")
             return
-        always = any(word and word in message for word in cfg.get("always_keywords", []))
-        ignored = any(word and word in message for word in cfg.get("ignore_keywords", []))
-        if ignored and not always:
-            self._record_message("memory", user, message, status="skipped", reason="ignored_keyword")
-            return
-        if len(message.strip()) < int(cfg.get("min_message_length", 4)) and not always:
-            self._record_message("memory", user, message, status="skipped", reason="too_short")
-            return
         threshold = int(cfg.get("importance_threshold", 70))
-        result = {"importance": 90 if always else 50, "should_remember": always, "category": "identity" if always else "event", "summary": f"{memory_user}说：{message}"}
+        result = {"importance": 0, "should_remember": False, "category": "event", "summary": ""}
         if cfg.get("analyze_with_llm", True):
             prompt = (
                 "你是直播间长期记忆筛选器。判断这段互动是否值得跨场次长期记住。"
@@ -328,7 +320,6 @@ class LiveAssistant:
                 self.log.exception("记忆重要度分析失败")
         score = max(0, min(100, int(result.get("importance", 0))))
         should = bool(result.get("should_remember")) and score >= threshold
-        if always: should, score = True, max(score, threshold)
         if not should:
             self._record_message("memory", user, message, status="skipped", reason=f"importance:{score}")
             return

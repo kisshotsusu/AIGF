@@ -171,28 +171,33 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LATEST-PLAYING-All by My Design", compact)
         self.assertLessEqual(len(compact), 5000)
 
-    async def test_media_stop_plan_blocks_toggle_hotkey_before_starting_vision(self):
+    async def test_hotkey_tool_does_not_apply_business_task_restrictions(self):
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"vision_mcp": {"enabled": True}}
         agent.current_task_plan = {"operation": "stop_media"}
-        agent.ensure_vision_service = Mock(side_effect=AssertionError("unsafe hotkey must be rejected first"))
+        agent.ensure_vision_service = Mock(return_value=True)
+        agent._vision_mcp_call = AsyncMock(return_value="{'pressed': ['space'], 'state_changed': True}")
         result = await agent._run_tool("ui_hotkey", {"keys": ["space"]})
-        self.assertFalse(result["executed"])
-        self.assertIn("media_stop", result["error"])
-        agent.ensure_vision_service.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["executed_tool"], "desktop_hotkey")
+        agent.ensure_vision_service.assert_called_once()
 
-    async def test_cloudmusic_blocks_unscoped_active_input_and_enter(self):
+    async def test_cloudmusic_allows_active_input_and_enter(self):
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"vision_mcp": {"enabled": True}}
         agent.current_task_plan = {"site": "cloudmusic", "operation": "play"}
-        agent.ensure_vision_service = Mock(side_effect=AssertionError("unsafe input must be rejected first"))
+        agent.ensure_vision_service = Mock(return_value=True)
+        agent._vision_mcp_call = AsyncMock(side_effect=[
+            "{'typed': True, 'state_changed': True}",
+            "{'pressed': ['enter'], 'state_changed': True}",
+        ])
         typed = await agent._run_tool("ui_type_active_text", {"text": "All by My Design"})
         submitted = await agent._run_tool("ui_hotkey", {"keys": ["enter"]})
-        self.assertFalse(typed["executed"])
-        self.assertIn("ui_type_window", typed["error"])
-        self.assertFalse(submitted["executed"])
-        self.assertIn("活动窗口", submitted["error"])
-        agent.ensure_vision_service.assert_not_called()
+        self.assertTrue(typed["ok"])
+        self.assertTrue(typed["observation"]["typed"])
+        self.assertTrue(submitted["ok"])
+        self.assertEqual(submitted["observation"]["pressed"], ["enter"])
+        self.assertEqual(agent._vision_mcp_call.await_count, 2)
 
     async def test_vision_tool_result_contains_submission_and_completion_times(self):
         agent = HomeAgent.__new__(HomeAgent)

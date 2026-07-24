@@ -15,7 +15,7 @@ if str(HOME_AGENT) not in sys.path:
 from PySide6.QtCore import QMimeData, QPoint, QRect, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QScrollArea, QWidget
-from qt_app import ClipboardImageSaveWorker, ClipboardImageTextEdit, HomeAgentWindow
+from qt_app import ChatWorker, ClipboardImageSaveWorker, ClipboardImageTextEdit, HomeAgentWindow
 
 
 class InputQueueTests(unittest.TestCase):
@@ -176,6 +176,12 @@ class InputQueueTests(unittest.TestCase):
         window.input.clear.assert_called_once()
         window._start_task.assert_not_called()
         window.set_status.assert_called_with("已排队 1 项，当前任务结束后执行")
+
+    def test_chat_worker_constructor_does_not_scan_workspace_on_ui_thread(self):
+        agent = Mock()
+        worker = ChatWorker(agent, "检查代码", Mock(), Mock())
+        agent.begin_task.assert_not_called()
+        worker.deleteLater()
 
     @patch("qt_app.QTimer.singleShot", side_effect=lambda _delay, callback: callback())
     def test_finished_task_starts_next_queued_item(self, _single_shot):

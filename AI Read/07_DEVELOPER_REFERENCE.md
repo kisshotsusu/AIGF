@@ -10,8 +10,8 @@
 
 ## 自主升级完成门禁
 
-- `CodeEditorModule.is_code_edit_request` 必须覆盖用户对 HomeAgent 自身修改的常见自然表达；新增表达时同步回归测试。
-- `SelfUpgradeManager.finalize` 对 `is_self_upgrade=true` 调用 `validate_current_changes(require_changes=True)`。空变更、实现未同步 `AI Read` 或语法/配置错误都必须写入 `validation_failed` 并阻止重启。
+- 自升级是否成立只读取语义规划器的 `domain=code` 与 `code_scope=self`，禁止恢复 `CodeEditorModule.is_code_edit_request`、关键词表、正则或常见表达枚举。
+- `SelfUpgradeManager.finalize` 对 `is_self_upgrade=true` 调用 `validate_current_changes(require_changes=True)`。空变更或语法/配置错误必须写入 `validation_failed` 并阻止重启；是否需要同步 `AI Read` 由模型按实际影响决定，不作为固定验证门槛。
 - 模型返回的普通 `content` 即使包含 `<tool_call>` 也不是工具调用。`HomeAgent._contains_unexecuted_tool_markup` 会拒绝此类回答，只有 API `tool_calls` 数组中的调用才能执行。
 - `_speak_home` 是 TTS 的统一安全门：伪工具标记、Markdown 代码块或超长源码不得播报。
 - 自身代码任务的 subject 不仅包括 HomeAgent，也包括本仓库的直播/B站/弹幕、CharacterManager、Vision、Sound 等组件；对应修复请求必须令 `current_code_self_edit=true`。
@@ -85,7 +85,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - 运行期读取 `HomeAgent/config.yaml`、`config.yaml`、`workspace`、`Task`、`LongTermMemory`；`__init__` 后台线程 `ensure_vision_service` / `ensure_sound_service` 自动拉起 MCP。
 - `begin_task` / `update_task_recovery` / `finalize_task_recovery` / `recover_interrupted_task` / `stop_current_task`：围绕 `SelfUpgradeManager` 做任务持久化与重启恢复；`stop_current_task` 会 `taskkill` 当前活跃子进程但保留常驻服务。
 - `SelfUpgradeManager.clear()` 是完成/取消状态的唯一清理入口。`resume_prompt()` 只能恢复 `running`；`restart_pending` 是已完成升级的进程接力标记，读取后必须清理并返回空字符串，禁止再次提交原任务。
-- `CodeEditorModule._resolve_read_path` 与 `_resolve_edit_path` 分别执行读写权限检查；`computer_control.full_access` 可授权绝对路径读写，`allowed_roots` 提供受限范围。外部结果返回规范绝对路径，写入后加入 `_external_changed` 并参与语法校验。
+- `CodeEditorModule._resolve_read_path` 与 `_resolve_edit_path` 负责路径规范化；自我修改可访问整个仓库源码，`computer_control.full_access` 授权外部绝对路径读写。外部结果返回规范绝对路径，写入后加入 `_external_changed` 并参与语法校验。
 - `log_event(event, **data)`：写 `HomeAgent/logs/agent-events.jsonl`，密钥按正则脱敏（`bearer ...` / `sk-...` 截断为 `***`），单字段 ≤4000 字符。
 - 工具循环收集最近工具返回作为 `completion_evidence`；执行类任务生成候选答案后调用 `MiMoMultimodalClient.verify_completion`。只读观察/查询在成功证据已包含所问信息时即通过，不额外要求被观察对象达到终态；变更/交互任务仍必须有可验证终态。失败时把 `reason/next_action` 作为新一轮指令，超过 `completion_max_retries` 后返回明确未通过而不是成功措辞。
 
@@ -94,10 +94,10 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `transcribe_audio(session, path, language)`：只接受 WAV/MP3，Base64 后不超过 10 MB，通过 `input_audio` 和 `asr_options.language` 调用 `mimo-v2.5-asr`。
 - `verify_completion(session, task, plan, answer, evidence)`：要求模型只返回 `{passed, reason, next_action}`；核验依据是工具证据，默认接口异常关闭成功路径。请求固定 `thinking.type=disabled`、`stream=false`，不设置 `response_format`；空响应错误必须包含 `finish_reason`。
 
-### `CodeEditorModule` 文档门禁
-- 跟踪范围包含实现目录、根配置、README 与 `AI Read`。
-- `validate_current_changes` 检测到实现/配置变化但没有 `AI Read/*.md` 变化时返回失败。
-- 执行合同要求按影响重写现有章节、删除过期事实并报告文档同步范围；不能用追加更新日志代替维护当前说明。
+### `CodeEditorModule` 变更与验证
+- 跟踪范围覆盖整个仓库中的源码、配置、README 与 `AI Read`，不再依赖固定模块目录清单。
+- `validate_current_changes` 检查真实变更以及 Python/YAML/JSON 等文件语法，不会因为缺少 `AI Read` 或项目 README 变更而人为失败。
+- 执行模型仍应按实际影响维护文档，但这是交付判断，不是代码工具内部的任务类型硬编码。
 
 ### 角色管理器 MiMo 多模态布局
 - `MiMoMultimodalPage(embedded=True)` 嵌入 `ModelPage.provider_tabs`，内部使用 `QScrollArea` 承载三组表单，避免较小窗口裁切输入项。
@@ -144,7 +144,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - **不要删/改 `src/ai_live_assistant/*`**：它们是 shim，改了也会被 `modules/live/...` 的真实实现覆盖。
 - **手改配置后 YAML 校验**：从项目根用 `.venv\Scripts\python.exe -m py_compile ...` 与 `yaml.safe_load`；改 `HomeAgent` 配置要同时考虑 `config.d`。
 - **TTS 重复启动**：`/api/options` 超时但 9879 端口存活时，客户端不会拉起第二个 GPT-SoVITS，请勿在此时手动再启动。
-- **Codex 隔离**：`codex_cli.isolated_home: true` 使用独立 `CODEX_HOME`；校验 JSONL 完成事件与必需 MCP 调用。网络任务不得把 Codex 当首选。
+- **Codex 权限**：`codex_cli.isolated_home: false` 复用用户现有 `CODEX_HOME`；`bypass_approvals_and_sandbox: true` 使用 CLI 的完全跳过审批与沙盒模式。JSONL 完成事件与必需 MCP 调用仍用于判断执行是否真正完成。
 - **私密边界**：直播模型上下文只注入 `include_private=False`；`LIVE_RULES.md`/`HOME_RULES.md` 分离场景行为；私密记忆/附件/照片只允许 `scene=home` 读取。
 ## 屏幕任务 API（2026-07-22）
 
@@ -157,11 +157,26 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 
 ## 总任务规划 API（2026-07-22）
 
-- `HomeAgent._plan_task(text, context)`：调用 MiMo 输出完整任务判定与执行合同。本地只做枚举、白名单、权限与一致性校验，不允许用原始文本关键词把模型的 `is_task/actionable/domain` 覆盖回去。
+- `HomeAgent._plan_task(text, context)`：调用 MiMo 输出完整任务判定与执行合同。本地只做字段类型、枚举和结构一致性校验，不允许用原始文本关键词把模型的 `is_task/actionable/domain/site/query/steps` 覆盖回去。
 - 代码计划必须包含 `code_scope`。执行器据此选择本工程、外部工程或新项目权限，不再调用关键词分类器。
 - `HomeAgent._planner_context(history, limit=8)`：序列化最近用户/助手消息并保留 `source`，供规划器识别主动关怀后的短回复。
 - `HomeAgent._should_route_to_web(task_plan)`：只在模型计划同时满足 `is_task=true`、`actionable=true`、`domain=web` 时路由网页能力。
 - `_analyze_task` 仅是规划接口不可用时的保守非执行合同，不负责语义识别或站点路由。
+
+## 模型驱动与 Tool 边界（强制）
+
+- 禁止在 `HomeAgent.chat`、`_plan_task`、`_run_tool`、`CodeEditorModule`、Vision 或 Skill 中新增普通任务的关键词分类、正则意图识别、固定动作拆分和站点专用业务流程。
+- 模型输出计划，执行模型选择工具；工具只接收明确参数、执行一个原子动作并返回事实。工具实现不能读取整段用户消息后自行判断任务类型。
+- `_tools()` 应向执行模型暴露所有已启用能力，不得因本地猜测的任务类型隐藏本可用工具。工具描述说明能力与副作用，不写“遇到某句话必须调用”的路由规则。
+- `_plan_task` 对模型计划只做 schema 和一致性校验；矛盾计划直接视为规划失败，不得通过站点 handler、关键词清洗或固定步骤在本地“修正”成另一种业务计划。
+- `_normalize_tool_result` 只统一 `status/tool/evidence` 等事实字段，不生成 `next_action`。快捷键、Shell 和界面工具不读取当前业务任务类型来阻止或替换模型指定的操作。
+- `HomeAgent._maybe_remember_home` 与直播助手 `_maybe_remember` 在模型不可用时默认不写长期记忆；不得用关键词、消息长度或固定类别词表替代模型的记忆价值判断。
+- `ChatWorker.__init__` 必须保持轻量，不能调用 `HomeAgent.begin_task(prompt)`；该调用会经 `CodeEditorModule.begin_tracking()` 扫描工程文件，必须在 `ChatWorker.run()` 的工作线程中执行，避免点击发送后冻结 Qt 事件循环。
+- 工具返回至少包含 `status/ok` 与真实结果；涉及状态的工具还要包含对象标识、提交/观察/完成时间和序号。任何分析文本都必须与其 `screenshot_captured_at/observed_at` 绑定。
+- 后续操作发生后，旧视觉证据由通用时间规则淘汰。禁止针对网易云、B站或某个按钮手写“标题变化才成功”“固定第一个候选”“固定坐标”等完成条件。
+- 模型负责消费工具结果并决定下一步；本地循环只能处理工具协议、取消、异常、证据时序与最大资源边界，不能替模型插入业务动作。
+- 独立完成检查由模型读取经过压缩且保留最新项的有效证据。工具不得返回业务 `next_action`；核验模型可以根据任务目标和证据生成下一步建议。
+- 新增工具时必须同时补充：清晰名称、单一职责、JSON 参数 schema、结构化返回、时间字段、失败语义、是否产生副作用及对应回归测试。
 
 ## MiMo 多轮工具调用约束（2026-07-22）
 
@@ -181,6 +196,6 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 
 - `_is_media_stop_plan(plan)` 与 `_allows_application_termination(plan)` 必须互斥：前者控制幂等播放停止，后者仅接受 `close_app/terminate_process` 或对应能力字段。修改规划枚举时必须同步两处安全检查和测试。
 - `_run_tool` 在调用 Vision 前拒绝 stop-media 计划中的 Space/Alt+F4，并在 shell/cmd 层阻止仅针对媒体停止的进程终止命令；显式进程终止计划不受此阻止。
-- `CodeEditorModule.read_file(path, start_line, max_lines, max_chars)` 用搜索返回的行号读取局部内容。代码循环的只读计数在成功写入/替换后清零，验证成功才设置 `current_code_verified`。该模块只执行文件权限与验证，不判断自然语言是否为代码任务。
+- `CodeEditorModule.read_file(path, start_line, max_lines, max_chars)` 用搜索返回的行号读取局部内容。代码循环的只读计数在成功写入/替换后清零，验证成功才设置 `current_code_verified`。该模块只执行文件操作与验证，不读取用户自然语言，也不判断是否为代码任务。
 - `_codex_exec_command` 的最后一个参数固定为 `-`，完整提示通过 asyncio 子进程 stdin 写入。自升级失败必须调用 `SelfUpgradeManager.fail`；`status=failed` 的恢复文件只保留诊断，不会由 `resume_prompt()` 重放。
 - `finalize_task_recovery` 对自升级实行 fail-closed：没有写入并通过代码验证的证据时不得清除为成功、触发重启或声称升级完成。

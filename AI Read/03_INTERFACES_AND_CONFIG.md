@@ -32,7 +32,7 @@
 - `microphone`：采样率、声道、设备 ID、识别后自动发送、本地 STT 运行时路径。
 - `desktop_pet`：置顶、坐标、桌宠图标。
 - `stt`：模式支持 `sound_mcp`、`mimo`、通用 `api` 与本地识别；MiMo 模式读取根 `mimo_multimodal` 配置。
-- `agent`：`max_tool_rounds` 表示失败轮次预算（当前 28），成功工具轮不计入；`max_tool_iterations` 是独立总迭代安全上限（当前 112）；另含本地工具优先、代码后备、角色图片 Skill 和 Skill 根目录。
+- `agent`：`max_tool_rounds` 表示失败轮次预算（当前 28），成功工具轮不计入；`max_tool_iterations` 是独立总迭代资源上限（当前 112）；另含模型工具循环、角色图片 Skill 和 Skill 根目录。
 - `semantic_planner`：控制 MiMo 总任务判定与语义计划：`enabled`、`timeout_seconds`（10）、`minimum_confidence`（0.55）、`context_messages`（8，包含用户和助手消息及来源）、`max_tokens`（900）。低于置信度时使用不执行外部动作的保守回退。
 - `progress_reporting`：**此前未记录的配置节**，控制长任务进度汇报：`enabled`、`long_task_seconds`（60）、`tts_cooldown_seconds`（90）、`max_reports_per_task`（3）。
 - `screen_care`：运行时主动屏幕关怀。默认 `enabled: true`、`interval_seconds: 300`；设置窗口的“屏幕关怀”页可实时启停，并以分钟为单位设置 1～1440 分钟的问候频率。`skip_while_busy` 防止打断用户任务，`all_screens: false` 只截主屏，`show_message` 控制是否写入对话区，`popup_enabled` 控制桌宠消息气泡，`popup_duration_seconds` 控制气泡显示时长（默认 12 秒），`speak` 与 `home.auto_speak` 共同控制播报，`max_chars` 限制关怀语长度。截图仅存于系统临时目录并在每轮结束后删除。
@@ -75,6 +75,19 @@
 - 健康接口超时（/_options 5xx/超时）但端口仍可 `open_connection` 时，**不**自动启动第二个服务，避免显存被第二个进程占用；合成暂态错误按指数退避重试，最终失败仍记日志、不静默丢弃。
 - 文本在传给外部 SVC 批处理前按 GBK 过滤，移除 emoji 等不可编码字符，避免中文路径/编码乱码。
 
+## HomeAgent Tool 通用契约
+
+所有 Tool 都是提供给执行模型自由组合的原子能力，不是任务类型、站点流程或业务意图的实现。新增或修改 Tool 时必须遵守：
+
+- Tool 名称和描述只陈述“能执行什么操作、需要什么参数、产生什么机械副作用”，不得包含“遇到某句话应调用”“某站点必须按固定顺序操作”等任务解析规则。
+- 用户意图、任务类型、参数提取、步骤规划、结果解释、是否完成和下一步操作全部由大模型决定；禁止 Tool 从原始用户文本用关键词、正则、枚举或条件分支猜测这些内容。
+- 一个 Tool 只完成一个可验证动作，例如观察、点击、输入、启动、停止、读取或写入。不得把“搜索并播放”“打开并登录”“检查后修复”封装成不可拆解的业务 Tool。
+- Tool 只返回真实操作结果和证据，不生成面向用户的任务结论或下一步建议。业务成功与否由执行模型结合目标和最新证据判断，最终完成状态由独立核验模型确认。
+- 通用返回至少包含 `ok`、`result` 或 `observation`、`error`、`tool_submitted_at`、`tool_completed_at`、`tool_elapsed_ms`、`tool_sequence`；有状态变化时补充动作前后证据和实际作用对象。
+- 视觉结果还必须包含截图采集时间和分析完成时间。模型只能采用同一对象的最新有效证据；旧序号、早于后续动作或与当前对象不一致的结果应废弃。
+- 失败必须返回可诊断的错误类型、阶段和已发生的副作用；不得吞错、伪造成功或以“安全限制”代替工具本来具备的正常能力。权限边界仅保留用户明确配置、系统真实能力和不可绕过的平台约束。
+- Tool schema 是唯一参数合同：必填项、类型、枚举、默认值和返回结构必须完整。执行层只校验 schema、权限、取消、超时和资源上限，不得借校验改写模型已经给出的业务计划。
+
 ## vision-gui MCP（127.0.0.1:8765/mcp）
 
 默认 `stdio` 传输；`VISION_MCP_TRANSPORT=http`（或 `streamable-http`）时以 HTTP（`streamable-http`）暴露。`VISION_PRELOAD_MODEL=1` 在启动时加载 GUI-Actor 模型，会覆盖 `preload_model: false` 的默认懒加载行为。`HomeAgent` 通过 `http://127.0.0.1:8765/mcp` 连接。
@@ -98,7 +111,7 @@
 - `type_active_text(text, clear=True)`：向已聚焦的输入框输入，避免重复视觉定位（适合 Ctrl+L 后输入网址）。
 - `ground_page(instruction, topk=3)`：只定位并返回坐标，不点击，用于观察与安全检查。
 - `scroll(direction="down", amount=400)`、`wait(ms=1000)`、`play_video(instruction=...)`、`screenshot()`（返回 MCP 图片）。
-- `inspect_active_target()`：先把活动窗口分类为 `browser_dom` / `browser_visual` / `desktop_visual`，再决定走 DOM、窗口视觉还是桌面工具。
+- `inspect_active_target()`：返回活动目标、可用观察通道及其机械能力事实；由大模型决定使用 DOM、窗口视觉还是桌面工具。
 
 ### 窗口工具（激活 + 窗口内视觉）
 
@@ -117,7 +130,7 @@
 
 - `vision_memory_status()`：返回 Vision 进程自身的 CUDA 已分配/缓存/峰值显存，便于评估与 GPT-SoVITS 共存的显存基线。
 
-GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露 `vision_gui_task`；`preload_model: false` 时 GUI-Actor 仅在被调用时按需加载。每次窗口/桌面动作后默认约 550 ms 重新截图，返回状态变化证据与下一步建议。
+GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露不可用的视觉能力；`preload_model: false` 时 GUI-Actor 仅在被调用时按需加载。每次窗口/桌面动作后默认约 550 ms 重新截图，只返回状态变化证据，不替模型决定下一步。
 
 ## sound-asr MCP（127.0.0.1:8766/mcp）
 

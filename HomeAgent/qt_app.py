@@ -304,7 +304,6 @@ class ChatWorker(QThread):
         self.file_paths = [item["path"] for item in self.attachments if item.get("kind") == "file"]
         self.cleanup_paths = [item["path"] for item in self.attachments if item.get("owned")]
         self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.activity_events = []; self.plan_steps = []; self.reasoning_summary = ""; self.success_criteria = ""; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False
-        self.agent.begin_task(prompt, resumed=prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"))
 
     def publish_answer(self, answer: str) -> None:
         """Show the final text as soon as it exists; TTS may continue afterwards."""
@@ -368,6 +367,13 @@ class ChatWorker(QThread):
         self.loop = asyncio.new_event_loop(); self.started_at = time.monotonic()
         try:
             asyncio.set_event_loop(self.loop)
+            # begin_task fingerprints the repository for self-upgrade tracking.
+            # It can take noticeable time on a large workspace, so it must run
+            # inside this worker rather than ChatWorker.__init__ on the Qt thread.
+            self.agent.begin_task(
+                self.prompt,
+                resumed=self.prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"),
+            )
             prompt = self.prompt
             if self.file_paths:
                 listing = "\n".join(f"- {path}" for path in self.file_paths)

@@ -49,6 +49,16 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/png;base64,"))
             self.assertEqual(content[1], {"type": "text", "text": "这道题怎么做？"})
 
+    def test_multiple_pasted_images_are_in_one_multimodal_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.png"; first.write_bytes(b"first")
+            second = Path(directory) / "second.jpg"; second.write_bytes(b"second")
+            content = HomeAgent._image_message_content("比较两张图", [first, second])
+            self.assertEqual([item["type"] for item in content], ["image_url", "image_url", "text"])
+            self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+            self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+            self.assertEqual(content[2]["text"], "比较两张图")
+
     async def test_image_uses_official_content_shape(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MIMO_API_KEY": "hidden"}):
             image = Path(directory) / "screen.png"; image.write_bytes(b"png")

@@ -16,8 +16,8 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import yaml
-from PySide6.QtCore import QObject, QPoint, QStandardPaths, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QFontDatabase, QIcon, QImage, QImageReader, QImageWriter, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLineEdit,
@@ -211,9 +211,98 @@ class ClipboardImageTextEdit(QTextEdit):
         super().insertFromMimeData(source)
 
 
+class ClipboardImageSaveWorker(QThread):
+    """Encode a clipboard image without blocking Qt's GUI event loop."""
+    saved = Signal(str, str, int, int)
+    failed = Signal(str, str)
+
+    def __init__(self, token: str, image: QImage, path: Path):
+        super().__init__()
+        self.token = token
+        self.image = image.copy()
+        self.path = Path(path)
+
+    def run(self):
+        try:
+            writer = QImageWriter(str(self.path), b"PNG")
+            writer.setCompression(3)
+            if not writer.write(self.image):
+                raise RuntimeError(writer.errorString() or "PNG 编码失败")
+            self.saved.emit(self.token, str(self.path), self.image.width(), self.image.height())
+        except Exception as exc:
+            try: self.path.unlink(missing_ok=True)
+            except OSError: pass
+            self.failed.emit(self.token, str(exc))
+
+
+class FramelessResizeHandle(QWidget):
+    """Transparent edge/corner handle for a frameless top-level window."""
+    def __init__(self, owner, edges, cursor):
+        super().__init__(owner)
+        self.owner = owner; self.edges = edges; self.setCursor(QCursor(cursor))
+        self.setAttribute(Qt.WA_StyledBackground, False)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton: return super().mousePressEvent(event)
+        self.owner.resize_edges = self.edges
+        self.owner.resize_start_global = event.globalPosition().toPoint()
+        self.owner.resize_start_geometry = self.owner.geometry()
+        self.owner.native_resizing = False
+        handle = self.owner.windowHandle()
+        if handle is not None:
+            try: self.owner.native_resizing = bool(handle.startSystemResize(self.edges))
+            except (AttributeError, RuntimeError): self.owner.native_resizing = False
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.owner.resize_edges and event.buttons() & Qt.LeftButton and not self.owner.native_resizing:
+            delta = event.globalPosition().toPoint() - self.owner.resize_start_global
+            self.owner.setGeometry(self.owner.resized_geometry(
+                self.owner.resize_start_geometry, delta, self.edges,
+                self.owner.minimumWidth(), self.owner.minimumHeight(),
+            ))
+            event.accept(); return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.owner._finish_resize()
+        event.accept()
+
+
+class ImagePreviewCard(QFrame):
+    """One independently removable image or file card."""
+    remove_requested = Signal(str)
+
+    def __init__(self, token: str, image: QImage | None = None, file_name: str = ""):
+        super().__init__(); self.token = token
+        self.setObjectName("attachmentCard"); self.setFixedSize(128, 82)
+        layout = QVBoxLayout(self); layout.setContentsMargins(4, 4, 4, 4)
+        self.preview = QLabel(); self.preview.setObjectName("attachmentPreview"); self.preview.setAlignment(Qt.AlignCenter); self.preview.setWordWrap(True)
+        if image is not None and not image.isNull():
+            thumbnail = image.scaled(120, 74, Qt.KeepAspectRatio, Qt.FastTransformation)
+            self.preview.setPixmap(QPixmap.fromImage(thumbnail))
+        else:
+            suffix = Path(file_name).suffix.upper().lstrip(".") or "FILE"
+            self.preview.setText(f"📄 {suffix}\n{Path(file_name).name[:18]}")
+        layout.addWidget(self.preview)
+        self.close_button = QPushButton("×", self); self.close_button.setObjectName("attachmentClose")
+        self.close_button.setToolTip("移除这个附件"); self.close_button.setFixedSize(22, 22)
+        self.close_button.clicked.connect(lambda: self.remove_requested.emit(self.token)); self.close_button.raise_()
+
+    def resizeEvent(self, event):
+        self.close_button.move(self.width() - self.close_button.width() - 3, 3)
+        super().resizeEvent(event)
+
+    def mark_ready(self, width: int, height: int):
+        self.setToolTip(f"已附加图片 · {width}×{height}")
+
+
 class ChatWorker(QThread):
-    def __init__(self, agent: HomeAgent, prompt: str, bridge: Bridge, confirm, image_path: str | None = None):
-        super().__init__(); self.agent = agent; self.prompt = prompt; self.bridge = bridge; self.confirm = confirm; self.image_path = image_path
+    def __init__(self, agent: HomeAgent, prompt: str, bridge: Bridge, confirm, attachments=None):
+        super().__init__(); self.agent = agent; self.prompt = prompt; self.bridge = bridge; self.confirm = confirm; self.attachments = list(attachments or [])
+        self.image_paths = [item["path"] for item in self.attachments if item.get("kind") == "image"]
+        self.file_paths = [item["path"] for item in self.attachments if item.get("kind") == "file"]
+        self.cleanup_paths = [item["path"] for item in self.attachments if item.get("owned")]
         self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False
         self.agent.begin_task(prompt, resumed=prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"))
 
@@ -258,7 +347,11 @@ class ChatWorker(QThread):
         self.loop = asyncio.new_event_loop(); self.started_at = time.monotonic()
         try:
             asyncio.set_event_loop(self.loop)
-            self.task = self.loop.create_task(self.agent.chat(self.prompt, self.report_status, self.confirm, self.publish_answer, image_path=self.image_path))
+            prompt = self.prompt
+            if self.file_paths:
+                listing = "\n".join(f"- {path}" for path in self.file_paths)
+                prompt += f"\n\n[用户本轮手动附加了以下本地文件。请按任务需要使用 read_text_file 或代码读取工具读取，不要忽略附件：\n{listing}\n]"
+            self.task = self.loop.create_task(self.agent.chat(prompt, self.report_status, self.confirm, self.publish_answer, image_path=self.image_paths))
             self.clock = self.loop.create_task(self.progress_clock())
             answer = self.loop.run_until_complete(self.task)
             self.agent.finalize_task_recovery(answer)
@@ -276,8 +369,8 @@ class ChatWorker(QThread):
                 for report in self.report_tasks: report.cancel()
                 self.loop.run_until_complete(self.drain_tasks(list(self.report_tasks))); self.report_tasks.clear()
             self.task = None; self.clock = None; self.loop.close()
-            if self.image_path:
-                try: Path(self.image_path).unlink(missing_ok=True)
+            for cleanup_path in self.cleanup_paths:
+                try: Path(cleanup_path).unlink(missing_ok=True)
                 except OSError: pass
             self.bridge.finished.emit()
 
@@ -558,9 +651,12 @@ class InspectorDialog(QDialog):
 
 class HomeAgentWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.input_queue = deque(); self.screen_care_worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False; self.pending_image_path = None
+        super().__init__(); self.agent = HomeAgent(); self.bridge = Bridge(); self.worker = None; self.input_queue = deque(); self.screen_care_worker = None; self.recording = False; self.stream = None; self.frames = []; self.drag_pos = None; self.force_quit = False; self.pet = None; self.progress_card = None; self.task_cancelled = False
+        self.pending_images = {}; self.pending_send_after_images = False; self.image_save_workers = {}; self.max_pending_images = 8
+        self.selected_attachment_queue = deque(); self.adding_selected_attachments = False
+        self.resize_margin = 9; self.resize_edges = Qt.Edges(); self.resize_start_global = None; self.resize_start_geometry = None; self.native_resizing = False
         self.setWindowTitle(f"{self.agent.character_name} · Home Agent"); self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window); self.setAttribute(Qt.WA_TranslucentBackground); self.resize(860, 380); self.setMinimumSize(640, 300)
-        self._build(); self._connect(); self.apply_always_on_top()
+        self._build(); self._create_resize_handles(); self._connect(); self.apply_always_on_top()
         self.bridge.finished.connect(self._restart_if_requested)
         self.scheduler = QTimer(self); self.scheduler.timeout.connect(self.poll_tasks); self.scheduler.start(10000)
         care_cfg = self.agent.config.get("screen_care", {})
@@ -587,21 +683,25 @@ class HomeAgentWindow(QMainWindow):
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame); self.messages = QWidget(); self.message_layout = QVBoxLayout(self.messages); self.message_layout.setContentsMargins(18, 10, 18, 8); self.message_layout.setSpacing(6); self.message_layout.addStretch(); self.scroll.setWidget(self.messages); root.addWidget(self.scroll, 1)
         composer = QFrame(); composer.setObjectName("composer"); c = QHBoxLayout(composer); c.setContentsMargins(14, 10, 14, 12); c.setSpacing(8)
         input_box = QVBoxLayout(); input_box.setSpacing(4)
-        self.input = ClipboardImageTextEdit(); self.input.setObjectName("input"); self.input.setPlaceholderText("输入任务或直接粘贴截图…  Ctrl + Enter 发送"); self.input.setMaximumHeight(76); self.input.setMinimumHeight(56); input_box.addWidget(self.input)
-        self.attachment_preview = QLabel()
-        self.attachment_preview.setObjectName("attachmentPreview")
-        self.attachment_preview.setAlignment(Qt.AlignCenter)
-        self.attachment_preview.setFixedSize(180, 96)
-        self.attachment_preview.setToolTip("待发送截图预览")
-        self.attachment_preview.hide()
-        input_box.addWidget(self.attachment_preview, 0, Qt.AlignLeft)
-        attachment_row = QHBoxLayout(); self.attachment_label = QLabel("已粘贴截图"); self.attachment_label.setObjectName("attachmentLabel"); self.remove_attachment_btn = QPushButton("移除"); self.remove_attachment_btn.setObjectName("attachmentRemove"); self.remove_attachment_btn.setFixedSize(58, 24); attachment_row.addWidget(self.attachment_label); attachment_row.addStretch(); attachment_row.addWidget(self.remove_attachment_btn); input_box.addLayout(attachment_row); self.attachment_label.hide(); self.remove_attachment_btn.hide(); c.addLayout(input_box, 1)
+        self.attachment_panel = QFrame(); self.attachment_panel.setObjectName("attachmentPanel"); self.attachment_panel.setFixedHeight(106)
+        panel_layout = QVBoxLayout(self.attachment_panel); panel_layout.setContentsMargins(4, 2, 4, 2)
+        self.attachment_scroll = QScrollArea(); self.attachment_scroll.setFrameShape(QFrame.NoFrame); self.attachment_scroll.setWidgetResizable(True)
+        self.attachment_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded); self.attachment_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.attachment_strip = QWidget(); self.attachment_strip.setMinimumHeight(82); self.attachment_layout = QHBoxLayout(self.attachment_strip)
+        self.attachment_layout.setContentsMargins(0, 0, 0, 0); self.attachment_layout.setSpacing(7); self.attachment_layout.addStretch()
+        self.attachment_scroll.setWidget(self.attachment_strip); panel_layout.addWidget(self.attachment_scroll)
+        self.attachment_panel.hide(); input_box.addWidget(self.attachment_panel)
+        input_row = QHBoxLayout(); input_row.setContentsMargins(0, 0, 0, 0); input_row.setSpacing(7)
+        self.add_attachment_btn = QPushButton("+"); self.add_attachment_btn.setObjectName("addAttachment"); self.add_attachment_btn.setToolTip("选择图片或文件"); self.add_attachment_btn.setFixedSize(42, 56)
+        self.input = ClipboardImageTextEdit(); self.input.setObjectName("input"); self.input.setPlaceholderText("输入任务、粘贴图片或点击左侧＋添加文件…  Ctrl + Enter 发送"); self.input.setMaximumHeight(76); self.input.setMinimumHeight(56)
+        input_row.addWidget(self.add_attachment_btn, 0, Qt.AlignBottom); input_row.addWidget(self.input, 1); input_box.addLayout(input_row)
+        c.addLayout(input_box, 1)
         actions = QVBoxLayout(); actions.setSpacing(8); top = QHBoxLayout(); self.voice_btn = QPushButton("语音"); self.voice_btn.setObjectName("softButton"); self.send_btn = QPushButton("发送"); self.send_btn.setObjectName("primaryButton"); top.addWidget(self.voice_btn); top.addWidget(self.send_btn); actions.addLayout(top)
         self.stop_btn = QPushButton("停止当前任务"); self.stop_btn.setObjectName("stopButton"); self.stop_btn.setEnabled(False); actions.addWidget(self.stop_btn); c.addLayout(actions); root.addWidget(composer)
 
     def _connect(self):
         self.send_btn.clicked.connect(self.send); self.stop_btn.clicked.connect(self.stop_task); self.voice_btn.clicked.connect(self.toggle_record); QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self.send)
-        self.input.image_pasted.connect(self.accept_pasted_image); self.remove_attachment_btn.clicked.connect(self.remove_pending_attachment)
+        self.input.image_pasted.connect(self.accept_pasted_image); self.add_attachment_btn.clicked.connect(self.choose_attachments)
         self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.progress.connect(self.update_task_progress); self.bridge.reminder.connect(self._show_reminder); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
 
     def append_message(self, role, name, text):
@@ -614,56 +714,143 @@ class HomeAgentWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
     def send(self):
         text = self.input.toPlainText().strip()
-        image_path = self._take_pending_attachment()
-        if not text and not image_path: return
-        if not text: text = "请分析这张截图。"
-        self.input.clear(); self.append_message("user", self.agent.config.get("home", {}).get("user_name", "你"), text + ("\n[已附加截图]" if image_path else ""))
+        if self.adding_selected_attachments or self.selected_attachment_queue or any(item["saving"] for item in self.pending_images.values()):
+            self.pending_send_after_images = True
+            self.set_status("附件正在后台处理，全部完成后自动发送…")
+            return
+        attachments = self._take_pending_attachments()
+        if not text and not attachments: return
+        if not text: text = "请分析这些附件。" if len(attachments) > 1 else "请分析这个附件。"
+        suffix = f"\n[已附加 {len(attachments)} 个图片/文件]" if attachments else ""
+        self.input.clear(); self.append_message("user", self.agent.config.get("home", {}).get("user_name", "你"), text + suffix)
         if self.worker and self.worker.isRunning():
-            self.input_queue.append((text, image_path) if image_path else text)
+            self.input_queue.append((text, attachments) if attachments else text)
             self.set_status(f"已排队 {len(self.input_queue)} 项，当前任务结束后执行")
             self.input.setFocus()
             return
-        self._start_task(text, image_path)
+        self._start_task(text, attachments)
 
-    def _start_task(self, text, image_path=None):
+    def _start_task(self, text, attachments=None):
         self.progress_card=TaskProgressCard(); self.message_layout.insertWidget(self.message_layout.count()-1,self.progress_card); self.task_cancelled=False; self.agent.begin_task(); self.send_btn.setEnabled(True); self.stop_btn.setEnabled(True); self.set_status("正在思考…")
-        self.worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action, image_path=image_path); self.worker.start()
+        self.worker = ChatWorker(self.agent, text, self.bridge, self.confirm_action, attachments=attachments); self.worker.start()
+
+    def choose_attachments(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择图片或文件", "", "所有文件 (*.*)")
+        capacity = max(0, self.max_pending_images - len(self.pending_images) - len(self.selected_attachment_queue))
+        accepted = paths[:capacity]
+        self.selected_attachment_queue.extend(accepted)
+        if len(accepted) < len(paths):
+            self.bridge.error.emit(f"一次最多附加 {self.max_pending_images} 个图片或文件")
+        if accepted and not self.adding_selected_attachments:
+            self.adding_selected_attachments = True
+            self.set_status(f"正在添加 {len(accepted)} 个附件…")
+            QTimer.singleShot(0, self._add_next_selected_attachment)
+
+    @staticmethod
+    def _read_thumbnail(path: Path) -> QImage:
+        """Decode only thumbnail-sized pixels instead of blocking on a full image."""
+        reader = QImageReader(str(path))
+        if not reader.canRead():
+            return QImage()
+        size = reader.size()
+        if size.isValid():
+            reader.setScaledSize(size.scaled(QSize(120, 74), Qt.KeepAspectRatio))
+        reader.setAutoTransform(True)
+        return reader.read()
+
+    def _add_next_selected_attachment(self):
+        if not self.selected_attachment_queue:
+            self.adding_selected_attachments = False
+            if self.pending_images:
+                self.set_status(f"已附加 {len(self.pending_images)} 个图片或文件")
+            if self.pending_send_after_images and not any(item["saving"] for item in self.pending_images.values()):
+                self.pending_send_after_images = False
+                QTimer.singleShot(0, self.send)
+            return
+        selected = self.selected_attachment_queue.popleft()
+        path = Path(selected).expanduser().resolve()
+        if path.is_file() and len(self.pending_images) < self.max_pending_images:
+            image = self._read_thumbnail(path)
+            token = uuid.uuid4().hex
+            kind = "image" if not image.isNull() else "file"
+            card = ImagePreviewCard(token, image if kind == "image" else None, path.name)
+            card.remove_requested.connect(self.remove_pending_image); card.setToolTip(str(path))
+            self.pending_images[token] = {"path": str(path), "saving": False, "card": card, "kind": kind, "owned": False}
+            self.attachment_layout.insertWidget(self.attachment_layout.count() - 1, card)
+            self.attachment_panel.show(); self._resize_attachment_strip()
+        QTimer.singleShot(0, self._add_next_selected_attachment)
 
     def accept_pasted_image(self, image):
         if not isinstance(image, QImage) or image.isNull():
             self.bridge.error.emit("剪贴板图片无效，无法预览")
             return
-        folder = Path(tempfile.gettempdir()) / "home-agent-clipboard"; folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"clipboard_{uuid.uuid4().hex}.png"
-        if not image.save(str(path), "PNG"):
-            self.bridge.error.emit("无法保存剪贴板截图")
+        if len(self.pending_images) >= self.max_pending_images:
+            self.bridge.error.emit(f"一次最多附加 {self.max_pending_images} 张图片，请先移除或发送已有图片")
             return
-        self.remove_pending_attachment()
-        preview = QPixmap.fromImage(image).scaled(
-            self.attachment_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
-        )
-        self.pending_image_path = str(path)
-        self.attachment_preview.setPixmap(preview)
-        self.attachment_preview.show()
-        self.attachment_label.setText(f"已粘贴截图 · {image.width()}×{image.height()}")
-        self.attachment_label.show()
-        self.remove_attachment_btn.show()
-        self.set_status("截图已附加，可预览内容并输入问题后发送")
+        folder = Path(tempfile.gettempdir()) / "home-agent-clipboard"; folder.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        path = folder / f"clipboard_{token}.png"
+        card = ImagePreviewCard(token, image); card.remove_requested.connect(self.remove_pending_image)
+        self.pending_images[token] = {"path": None, "saving": True, "card": card, "kind": "image", "owned": True}
+        self.attachment_layout.insertWidget(self.attachment_layout.count() - 1, card)
+        self.attachment_panel.show(); self._resize_attachment_strip()
+        worker = ClipboardImageSaveWorker(token, image, path)
+        worker.saved.connect(self._pasted_image_saved)
+        worker.failed.connect(self._pasted_image_failed)
+        worker.finished.connect(lambda token=token: self.image_save_workers.pop(token, None))
+        self.image_save_workers[token] = worker
+        worker.start()
+        self.set_status(f"已预览 {len(self.pending_images)} 张图片，正在后台准备原图…")
 
-    def _take_pending_attachment(self):
-        path = getattr(self, "pending_image_path", None); self.pending_image_path = None
-        if hasattr(self, "attachment_preview"):
-            self.attachment_preview.clear()
-            self.attachment_preview.hide()
-        if hasattr(self, "attachment_label"): self.attachment_label.hide()
-        if hasattr(self, "remove_attachment_btn"): self.remove_attachment_btn.hide()
-        return path
-
-    def remove_pending_attachment(self):
-        path = self._take_pending_attachment()
-        if path:
+    def _pasted_image_saved(self, token, path, width, height):
+        item = self.pending_images.get(token)
+        if item is None:
             try: Path(path).unlink(missing_ok=True)
             except OSError: pass
+            return
+        item["path"] = path; item["saving"] = False; item["card"].mark_ready(width, height)
+        self.set_status(f"已附加 {len(self.pending_images)} 张图片，可继续粘贴或发送")
+        if self.pending_send_after_images and not any(entry["saving"] for entry in self.pending_images.values()):
+            self.pending_send_after_images = False
+            QTimer.singleShot(0, self.send)
+
+    def _pasted_image_failed(self, token, error):
+        if token not in self.pending_images: return
+        self.remove_pending_image(token)
+        self.bridge.error.emit(f"无法保存剪贴板截图：{error}")
+        if self.pending_send_after_images and not any(entry["saving"] for entry in self.pending_images.values()):
+            self.pending_send_after_images = False
+            QTimer.singleShot(0, self.send)
+
+    def _resize_attachment_strip(self):
+        self.attachment_strip.setMinimumWidth(max(self.attachment_scroll.viewport().width(), len(self.pending_images) * 135))
+
+    def remove_pending_image(self, token):
+        item = self.pending_images.pop(token, None)
+        if item is None: return
+        card = item["card"]; self.attachment_layout.removeWidget(card); card.deleteLater()
+        if item.get("path") and item.get("owned"):
+            try: Path(item["path"]).unlink(missing_ok=True)
+            except OSError: pass
+        self._resize_attachment_strip()
+        if not self.pending_images:
+            self.pending_send_after_images = False
+            self.attachment_panel.hide()
+
+    def _take_pending_attachments(self):
+        attachments = [
+            {"path": item["path"], "kind": item.get("kind", "image"), "owned": bool(item.get("owned"))}
+            for item in self.pending_images.values() if item.get("path")
+        ]
+        for item in list(self.pending_images.values()):
+            card = item["card"]; self.attachment_layout.removeWidget(card); card.deleteLater()
+        self.pending_images.clear(); self.pending_send_after_images = False
+        self.attachment_panel.hide(); self._resize_attachment_strip()
+        return attachments
+
+    def remove_pending_attachment(self):
+        for token in list(self.pending_images):
+            self.remove_pending_image(token)
 
     def stop_task(self):
         if self.worker and self.worker.isRunning(): self.task_cancelled=True; self.worker.cancel_task(); self.set_status("正在停止…")
@@ -769,11 +956,105 @@ class HomeAgentWindow(QMainWindow):
         if self.pet is not None and self.agent.config.get("screen_care", {}).get("popup_enabled", True):
             self.pet.show_care_message(message)
         self.set_status("就绪")
+    @staticmethod
+    def resize_edges_for_position(x, y, width, height, margin=9):
+        edges = Qt.Edges()
+        if x <= margin: edges |= Qt.LeftEdge
+        elif x >= width - margin: edges |= Qt.RightEdge
+        if y <= margin: edges |= Qt.TopEdge
+        elif y >= height - margin: edges |= Qt.BottomEdge
+        return edges
+
+    @staticmethod
+    def resized_geometry(start: QRect, delta: QPoint, edges, minimum_width, minimum_height):
+        result = QRect(start)
+        if edges & Qt.LeftEdge:
+            left = min(start.right() - minimum_width + 1, start.left() + delta.x()); result.setLeft(left)
+        if edges & Qt.RightEdge:
+            result.setRight(max(start.left() + minimum_width - 1, start.right() + delta.x()))
+        if edges & Qt.TopEdge:
+            top = min(start.bottom() - minimum_height + 1, start.top() + delta.y()); result.setTop(top)
+        if edges & Qt.BottomEdge:
+            result.setBottom(max(start.top() + minimum_height - 1, start.bottom() + delta.y()))
+        return result
+
+    @staticmethod
+    def cursor_for_resize_edges(edges):
+        if edges in (Qt.LeftEdge | Qt.TopEdge, Qt.RightEdge | Qt.BottomEdge): return Qt.SizeFDiagCursor
+        if edges in (Qt.RightEdge | Qt.TopEdge, Qt.LeftEdge | Qt.BottomEdge): return Qt.SizeBDiagCursor
+        if edges & (Qt.LeftEdge | Qt.RightEdge): return Qt.SizeHorCursor
+        if edges & (Qt.TopEdge | Qt.BottomEdge): return Qt.SizeVerCursor
+        return Qt.ArrowCursor
+
+    def _create_resize_handles(self):
+        definitions = (
+            ("top", Qt.TopEdge), ("bottom", Qt.BottomEdge),
+            ("left", Qt.LeftEdge), ("right", Qt.RightEdge),
+            ("top_left", Qt.TopEdge | Qt.LeftEdge),
+            ("top_right", Qt.TopEdge | Qt.RightEdge),
+            ("bottom_left", Qt.BottomEdge | Qt.LeftEdge),
+            ("bottom_right", Qt.BottomEdge | Qt.RightEdge),
+        )
+        self.resize_handles = {
+            name: FramelessResizeHandle(self, edges, self.cursor_for_resize_edges(edges))
+            for name, edges in definitions
+        }
+        self._layout_resize_handles()
+
+    def _layout_resize_handles(self):
+        if not hasattr(self, "resize_handles"): return
+        width, height, margin = self.width(), self.height(), self.resize_margin
+        corner = margin * 2
+        geometries = {
+            "top": QRect(corner, 0, max(0, width - corner * 2), margin),
+            "bottom": QRect(corner, height - margin, max(0, width - corner * 2), margin),
+            "left": QRect(0, corner, margin, max(0, height - corner * 2)),
+            "right": QRect(width - margin, corner, margin, max(0, height - corner * 2)),
+            "top_left": QRect(0, 0, corner, corner),
+            "top_right": QRect(width - corner, 0, corner, corner),
+            "bottom_left": QRect(0, height - corner, corner, corner),
+            "bottom_right": QRect(width - corner, height - corner, corner, corner),
+        }
+        for name, handle in self.resize_handles.items():
+            handle.setGeometry(geometries[name]); handle.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_resize_handles()
+
+    def _finish_resize(self):
+        self.resize_edges = Qt.Edges(); self.resize_start_global = None; self.resize_start_geometry = None; self.native_resizing = False; self.unsetCursor()
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and event.position().y() <= 56: self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft(); event.accept()
+        if event.button() != Qt.LeftButton: return super().mousePressEvent(event)
+        point = event.position().toPoint()
+        edges = self.resize_edges_for_position(point.x(), point.y(), self.width(), self.height(), self.resize_margin)
+        if edges:
+            self.resize_edges = edges; self.resize_start_global = event.globalPosition().toPoint(); self.resize_start_geometry = self.geometry(); self.native_resizing = False
+            handle = self.windowHandle()
+            if handle is not None:
+                try: self.native_resizing = bool(handle.startSystemResize(edges))
+                except (AttributeError, RuntimeError): self.native_resizing = False
+            event.accept(); return
+        if point.y() <= 56:
+            self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft(); event.accept(); return
+        super().mousePressEvent(event)
     def mouseMoveEvent(self, event):
-        if self.drag_pos is not None and event.buttons() & Qt.LeftButton: self.move(event.globalPosition().toPoint() - self.drag_pos); event.accept()
-    def mouseReleaseEvent(self, event): self.drag_pos = None
+        if self.resize_edges and event.buttons() & Qt.LeftButton:
+            if not self.native_resizing and self.resize_start_global is not None and self.resize_start_geometry is not None:
+                delta = event.globalPosition().toPoint() - self.resize_start_global
+                self.setGeometry(self.resized_geometry(self.resize_start_geometry, delta, self.resize_edges, self.minimumWidth(), self.minimumHeight()))
+            event.accept(); return
+        if self.drag_pos is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self.drag_pos); event.accept(); return
+        point = event.position().toPoint(); edges = self.resize_edges_for_position(point.x(), point.y(), self.width(), self.height(), self.resize_margin)
+        self.setCursor(QCursor(self.cursor_for_resize_edges(edges)))
+        super().mouseMoveEvent(event)
+    def mouseReleaseEvent(self, event):
+        self.drag_pos = None; self._finish_resize(); super().mouseReleaseEvent(event)
+    def leaveEvent(self, event):
+        if not self.resize_edges: self.unsetCursor()
+        super().leaveEvent(event)
     def _start_wake_listener(self):
         """Start the wake word listener if enabled."""
         if self.agent.is_prompt_wake_enabled() and not self.wake_listener:
@@ -809,10 +1090,16 @@ class HomeAgentWindow(QMainWindow):
             try: self.stream.stop(); self.stream.close()
             except Exception: pass
         self.remove_pending_attachment()
+        for save_worker in list(getattr(self, "image_save_workers", {}).values()):
+            if save_worker.isRunning(): save_worker.wait(2000)
+            try: save_worker.path.unlink(missing_ok=True)
+            except OSError: pass
         for queued in self.input_queue:
             if isinstance(queued, tuple) and len(queued) > 1 and queued[1]:
-                try: Path(queued[1]).unlink(missing_ok=True)
-                except OSError: pass
+                for attachment in queued[1]:
+                    if not attachment.get("owned"): continue
+                    try: Path(attachment["path"]).unlink(missing_ok=True)
+                    except OSError: pass
         event.accept()
 
 
@@ -914,8 +1201,14 @@ QScrollArea {{ background: {COLORS['window']}; }} QScrollArea > QWidget > QWidge
 #progressCard {{ background: #F7F9F9; border: 1px solid #DFE7E7; border-radius: 12px; margin: 4px 10px; }} #progressCard[finished="true"] {{ background: #FAFBFB; border-color: #E4EAEA; }} #progressToggle {{ min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #526568; font-size: 19px; font-weight: 500; }} #progressToggle:hover {{ background: #E7EFEE; color: #16766F; }} #progressTitle {{ color: #263638; font-size: 13px; font-weight: 700; }} #progressSummary {{ color: #657578; font-size: 12px; }} #progressElapsed {{ color: #809093; font-size: 11px; }} #progressDetails {{ border-top: 1px solid #E4EAEA; }} #progressCurrent {{ color: #34484B; font-size: 12px; }} #progressDone {{ color: #657578; font-size: 12px; }}
 #composer {{ background: {COLORS['panel']}; border-top: 1px solid {COLORS['line']}; border-bottom-left-radius: 22px; border-bottom-right-radius: 22px; }}
 #input, QLineEdit, QComboBox, QTextBrowser {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 12px; padding: 10px; selection-background-color: {COLORS['accent']}; }} #input:focus, QLineEdit:focus {{ border: 1px solid {COLORS['accent']}; }}
-#attachmentPreview {{ background: #F7FBFA; border: 1px solid {COLORS['line']}; border-radius: 10px; padding: 3px; }}
-#attachmentLabel {{ color: {COLORS['accent']}; font-size: 12px; }} #attachmentRemove {{ min-height: 22px; padding: 0 9px; background: {COLORS['soft']}; color: {COLORS['accent']}; border: 0; font-size: 11px; }}
+#attachmentPanel {{ background: #F7FBFA; border: 1px solid {COLORS['line']}; border-radius: 10px; }}
+#attachmentCard {{ background: white; border: 1px solid {COLORS['line']}; border-radius: 8px; }}
+#attachmentPreview {{ background: white; border: 0; border-radius: 7px; }}
+#attachmentLabel {{ color: {COLORS['accent']}; font-size: 12px; }}
+#attachmentClose {{ background: rgba(30, 45, 45, 190); color: white; border: 0; border-radius: 11px; font-size: 16px; padding: 0; }}
+#attachmentClose:hover {{ background: {COLORS['danger']}; }}
+#addAttachment {{ background: {COLORS['soft']}; color: {COLORS['accent']}; border: 1px solid {COLORS['line']}; border-radius: 12px; font-size: 25px; padding: 0; }}
+#addAttachment:hover {{ background: #D7ECE8; }}
 QPushButton {{ min-height: 34px; padding: 0 15px; border-radius: 10px; font-weight: 600; }} #primaryButton {{ background: {COLORS['accent']}; color: white; border: 0; }} #primaryButton:hover {{ background: {COLORS['accent_hover']}; }} #softButton {{ background: {COLORS['soft']}; color: {COLORS['accent']}; border: 0; }} #stopButton {{ background: white; color: {COLORS['danger']}; border: 1px solid #EBC1BF; }} #stopButton:disabled {{ color: #AAB4B5; border-color: {COLORS['line']}; }}
 QDialog {{ background: {COLORS['window']}; }} #dialogTitle {{ font-size: 22px; font-weight: 700; }} QTabWidget::pane {{ border: 1px solid {COLORS['line']}; border-radius: 12px; background: white; }} QTabBar::tab {{ padding: 9px 18px; }} QTabBar::tab:selected {{ color: {COLORS['accent']}; font-weight: 700; }}
 """

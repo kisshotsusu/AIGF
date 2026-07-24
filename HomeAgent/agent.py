@@ -562,21 +562,30 @@ class HomeAgent:
         return json.dumps(rows, ensure_ascii=False)
 
     @staticmethod
-    def _image_message_content(text: str, image_path: str | Path) -> list[dict[str, Any]]:
-        """Build one ephemeral MiMo multimodal user message from a pasted screenshot."""
-        path = Path(image_path).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"粘贴的截图不存在：{path}")
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        if not mime.startswith("image/"):
-            raise ValueError("粘贴内容不是支持的图片")
-        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-        if len(encoded) > 10 * 1024 * 1024:
-            raise ValueError("粘贴截图编码后超过 10 MB，请先缩小图片")
-        return [
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-            {"type": "text", "text": str(text or "请分析这张截图。").strip() or "请分析这张截图。"},
-        ]
+    def _image_message_content(text: str, image_paths) -> list[dict[str, Any]]:
+        """Build one ephemeral MiMo message containing all pasted images."""
+        values = [image_paths] if isinstance(image_paths, (str, Path)) else list(image_paths or [])
+        if not values:
+            raise ValueError("没有可提交的图片")
+        content: list[dict[str, Any]] = []
+        total_encoded = 0
+        for value in values:
+            path = Path(value).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"粘贴的图片不存在：{path}")
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            if not mime.startswith("image/"):
+                raise ValueError(f"不支持的图片类型：{path.name}")
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            if len(encoded) > 10 * 1024 * 1024:
+                raise ValueError(f"图片 {path.name} 编码后超过 10 MB，请先缩小图片")
+            total_encoded += len(encoded)
+            if total_encoded > 30 * 1024 * 1024:
+                raise ValueError("全部图片编码后超过 30 MB，请减少图片数量或缩小图片")
+            content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+        prompt = str(text or "").strip() or ("请分析这些图片。" if len(values) > 1 else "请分析这张图片。")
+        content.append({"type": "text", "text": prompt})
+        return content
 
     @staticmethod
     def _is_file_authoring_request(text: str) -> bool:
@@ -2019,7 +2028,7 @@ class HomeAgent:
         imperative = value.startswith(("请", "麻烦", "现在", "立即", "马上", "帮我")) or value.endswith(("吧", "一下"))
         return has_target and imperative
 
-    async def chat(self, text: str, status=None, confirm=None, answer_ready=None, image_path: str | Path | None = None) -> str:
+    async def chat(self, text: str, status=None, confirm=None, answer_ready=None, image_path=None) -> str:
         self.current_task_submitted_at = _iso_now()
         if self.is_restart_request(text):
             answer = "好的主人，Home Agent 正在重启。"
@@ -2034,21 +2043,24 @@ class HomeAgent:
             self.log_event("prompt_wake_activated", original=text, command=wake_command)
             text = wake_command
         
-        text = str(text or "").strip() or ("请分析这张截图。" if image_path else "")
+        image_paths = [image_path] if isinstance(image_path, (str, Path)) else list(image_path or [])
+        text = str(text or "").strip() or (("请分析这些图片。" if len(image_paths) > 1 else "请分析这张图片。") if image_paths else "")
         self._acknowledge_common_response(text)
         max_context = int(self.config["home"].get("max_context_messages", 30))
         user_history = {"role": "user", "content": text}
-        if image_path: user_history.update({"source": "clipboard_image", "has_image": True})
+        if image_paths: user_history.update({"source": "clipboard_image", "has_image": True, "image_count": len(image_paths)})
         self.history.append(user_history); self.history = self.history[-max_context:]
-        self.log_event("user_message", message=text, history_messages=len(self.history), has_image=bool(image_path))
+        self.log_event("user_message", message=text, history_messages=len(self.history), has_image=bool(image_paths), image_count=len(image_paths))
         planner_context_limit = int(self.config.get("semantic_planner", {}).get("context_messages", 8))
         recent_task_context = self._planner_context(self.history[:-1], planner_context_limit)
         if status: status("正在理解任务并制定执行计划…")
         planning_text = text
-        if image_path:
-            planning_text += "\n[本消息已附带一张剪贴板截图；执行模型可直接读取附件，不要仅因图片内容未知而追问。]"
+        if image_paths:
+            planning_text += f"\n[本消息已附带 {len(image_paths)} 张图片；执行模型可直接读取全部附件，不要仅因图片内容未知而追问。]"
         task_plan = await self._plan_task(planning_text, recent_task_context)
-        if image_path: task_plan["has_image_attachment"] = True
+        if image_paths:
+            task_plan["has_image_attachment"] = True
+            task_plan["image_attachment_count"] = len(image_paths)
         self.current_task_plan = task_plan
         code_task = bool(task_plan.get("is_task") and task_plan.get("actionable") and task_plan.get("domain") == "code")
         self.current_code_task = code_task
@@ -2234,10 +2246,10 @@ class HomeAgent:
                 "不要主动调用 Codex，网络执行器仅由主程序在本地工具彻底失败后低优先级回退。"
             )
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt() + memory_context + operation_contract}, *self.history]
-        if image_path:
+        if image_paths:
             for message_index in range(len(messages) - 1, 0, -1):
                 if messages[message_index].get("role") == "user":
-                    messages[message_index] = {**messages[message_index], "content": self._image_message_content(text, image_path)}
+                    messages[message_index] = {**messages[message_index], "content": self._image_message_content(text, image_paths)}
                     break
         url = provider["base_url"].rstrip("/") + "/chat/completions"
         timeout = aiohttp.ClientTimeout(total=llm_cfg.get("timeout_seconds", 45))

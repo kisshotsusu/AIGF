@@ -126,6 +126,51 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("较新状态覆盖较早状态", prompt)
         self.assertIn("截图采集时刻", prompt)
 
+    async def test_music_completion_uses_fresh_visual_state_not_title_change(self):
+        client = MiMoMultimodalClient()
+        captured = {}
+
+        async def fake_post(session, payload):
+            captured.update(payload)
+            return '{"passed":true,"reason":"最新视觉证据确认目标歌曲正在播放","next_action":""}'
+
+        client._post = fake_post
+        result = await client.verify_completion(
+            Session(),
+            "打开网易云播放 All by My Design",
+            {"site": "cloudmusic", "operation": "play", "query": "All by My Design"},
+            "已经播放",
+            [{"tool": "ui_analyze_window", "result": {
+                "tool_sequence": 6,
+                "screenshot_captured_at": "2026-07-24T22:42:54+08:00",
+                "analysis": "暂停图标可见，All by My Design 正在播放",
+            }}],
+        )
+        prompt = captured["messages"][1]["content"]
+        self.assertTrue(result["passed"])
+        self.assertIn("窗口标题是否变化不是成功条件", prompt)
+        self.assertIn("目标在任务开始时已经播放也视为幂等完成", prompt)
+        self.assertIn("不得为了制造标题变化而停止、重播或重复双击", prompt)
+
+    def test_completion_evidence_compaction_always_preserves_newest_state(self):
+        old = [
+            {"tool": "ui_analyze_window", "result": {
+                "tool_sequence": index,
+                "analysis": f"OLD-{index}-" + ("旧画面" * 2500),
+            }}
+            for index in range(1, 20)
+        ]
+        newest = {"tool": "ui_analyze_window", "result": {
+            "tool_sequence": 20,
+            "analysis": "LATEST-PLAYING-All by My Design",
+            "screenshot_captured_at": "2026-07-24T22:55:35+08:00",
+        }}
+        compact = MiMoMultimodalClient._compact_completion_evidence(
+            [*old, newest], max_chars=5000,
+        )
+        self.assertIn("LATEST-PLAYING-All by My Design", compact)
+        self.assertLessEqual(len(compact), 5000)
+
     async def test_media_stop_plan_blocks_toggle_hotkey_before_starting_vision(self):
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {"vision_mcp": {"enabled": True}}
@@ -136,18 +181,18 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("media_stop", result["error"])
         agent.ensure_vision_service.assert_not_called()
 
-    async def test_code_task_cannot_invoke_cloudmusic_search(self):
+    async def test_cloudmusic_blocks_unscoped_active_input_and_enter(self):
         agent = HomeAgent.__new__(HomeAgent)
-        agent.current_task_plan = {
-            "is_task": True, "actionable": True, "domain": "code",
-            "site": "", "handler": None, "query": "",
-        }
-        agent.log_event = Mock()
-        agent._run_cloudmusic_search_and_play = AsyncMock(side_effect=AssertionError("media side effect must be blocked"))
-        result = await agent._run_tool("cloudmusic_search_and_play", {"query": "音乐"})
-        self.assertFalse(result["executed"])
-        self.assertEqual(result["blocked_by"], "task_plan_scope")
-        agent._run_cloudmusic_search_and_play.assert_not_awaited()
+        agent.config = {"vision_mcp": {"enabled": True}}
+        agent.current_task_plan = {"site": "cloudmusic", "operation": "play"}
+        agent.ensure_vision_service = Mock(side_effect=AssertionError("unsafe input must be rejected first"))
+        typed = await agent._run_tool("ui_type_active_text", {"text": "All by My Design"})
+        submitted = await agent._run_tool("ui_hotkey", {"keys": ["enter"]})
+        self.assertFalse(typed["executed"])
+        self.assertIn("ui_type_window", typed["error"])
+        self.assertFalse(submitted["executed"])
+        self.assertIn("活动窗口", submitted["error"])
+        agent.ensure_vision_service.assert_not_called()
 
     async def test_vision_tool_result_contains_submission_and_completion_times(self):
         agent = HomeAgent.__new__(HomeAgent)

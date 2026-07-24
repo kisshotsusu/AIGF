@@ -180,47 +180,6 @@ class CodeEditorModule:
             display = str(target); self._external_changed.add(display)
         return {"ok": True, "path": display, "replaced": requested, "remaining_matches": occurrences - requested}
 
-    @staticmethod
-    def is_code_edit_request(prompt: str) -> bool:
-        compact = str(prompt).replace(" ", "").lower()
-        # “写代码”也常出现在关怀、闲聊和辅助功能标签中，并不等于要求执行代码任务。
-        # 只有同一句还包含明确的修改动作时，才允许这些非指令语境继续参与分类。
-        non_action_context = (
-            "写代码累了", "代码写累了", "写代码辛苦", "辛苦了", "喝口水",
-            "休息一下", "眼睛也休息", "回复模糊语义号", "模糊语义号",
-        )
-        decisive_actions = (
-            "修复", "修改", "升级", "更新", "优化", "重构", "实现", "新增",
-            "增加功能", "添加功能", "编辑", "改代码", "fix", "implement", "refactor",
-        )
-        if any(marker in compact for marker in non_action_context) and not any(action in compact for action in decisive_actions):
-            return False
-        subjects = (
-            "homeagent", "你自己", "自己", "自己的代码", "你自己的代码", "自身", "自我", "本体",
-            "你的代码", "自身代码", "自我升级", "自动升级", "程序", "系统",
-            "直播", "直播间", "直播助手", "欢迎观众", "弹幕", "b站", "bilibili", "liveassistant",
-            "角色管理器", "charactermanager", "视觉服务", "vision", "语音服务", "sound",
-        )
-        actions = ("升级", "更新", "修改", "优化", "修复", "编辑", "增加功能", "添加功能", "写代码", "改代码", "重构", "实现")
-        explicit_path = "aiagent/homeagent" in compact.replace("\\", "/")
-        delivery_change = "播放语音" in compact and "显示消息" in compact and any(word in compact for word in ("不要等", "立刻", "立即", "同时", "的时候"))
-        return ((any(word in compact for word in subjects) or explicit_path) and any(word in compact for word in actions)) or delivery_change
-
-    @classmethod
-    def is_independent_project_request(cls, prompt: str) -> bool:
-        if cls.is_code_edit_request(prompt):
-            return False
-        compact = str(prompt).replace(" ", "").lower()
-        # “检查开发文档” describes documentation, not a request to develop a new project.
-        action_text = compact.replace("开发文档", "文档").replace("开发说明", "说明")
-        subjects = ("项目", "应用", "网站", "网页应用", "桌面应用", "脚本", "工具", "软件", "程序", "代码库", "api", "服务")
-        actions = ("创建", "新建", "开发", "编写", "搭建", "实现", "生成", "从零", "build", "create", "develop", "scaffold")
-        return any(word in compact for word in subjects) and any(word in action_text for word in actions)
-
-    @classmethod
-    def is_code_task(cls, prompt: str) -> bool:
-        return cls.is_code_edit_request(prompt) or cls.is_independent_project_request(prompt)
-
     def _fingerprint(self) -> dict[str, str]:
         result: dict[str, str] = {}
         for relative in self.ROOT_TRACKED_FILES:

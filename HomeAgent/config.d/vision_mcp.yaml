@@ -11,14 +11,4 @@ existing_browser_cdp_endpoints:
 - http://127.0.0.1:9223
 - http://127.0.0.1:9333
 startup_timeout_seconds: 120
-direct_operation_timeout_seconds: 60
 task_timeout_seconds: 180
-trigger_keywords:
-- 操作电脑
-- 点击屏幕
-- 看一下屏幕
-- 看屏幕
-- 主屏幕
-- 桌面上
-- 找到按钮
-- 视觉操作

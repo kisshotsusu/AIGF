@@ -501,8 +501,6 @@ class DesktopPet:
             ("executable", "Codex 可执行文件"),
             ("working_directory", "Codex 工作目录"),
             ("sandbox", "CLI 权限模式"),
-            ("trigger_mode", "触发模式"),
-            ("trigger_keywords", "自动触发关键词（分号分隔）"),
             ("timeout_seconds", "任务超时秒数"),
         ]
         for row, (key, label) in enumerate(codex_rows, start=20):
@@ -510,13 +508,9 @@ class DesktopPet:
             if key == "sandbox":
                 widget = ttk.Combobox(frame, values=["read-only", "workspace-write", "danger-full-access"], state="readonly", width=45)
                 widget.set(str(codex.get(key, "danger-full-access")))
-            elif key == "trigger_mode":
-                widget = ttk.Combobox(frame, values=["manual", "auto", "always"], state="readonly", width=45)
-                widget.set(str(codex.get(key, "auto")))
             else:
                 widget = ttk.Entry(frame, width=48)
-                value = "；".join(str(x) for x in codex.get(key, [])) if key == "trigger_keywords" else str(codex.get(key, ""))
-                widget.insert(0, value)
+                widget.insert(0, str(codex.get(key, "")))
             widget.grid(row=row, column=1, sticky="ew", pady=4); codex_fields[key] = widget
 
         def test_codex():
@@ -529,7 +523,7 @@ class DesktopPet:
                     self.root.after(0, lambda e=str(exc): messagebox.showerror("连接失败", e, parent=win))
             threading.Thread(target=worker, daemon=True).start()
 
-        ttk.Button(frame, text="测试 CLI 与 MCP", command=test_codex).grid(row=26, column=1, sticky="w", pady=(7, 2))
+        ttk.Button(frame, text="测试 CLI 与 MCP", command=test_codex).grid(row=24, column=1, sticky="w", pady=(7, 2))
 
         save_timer = None
         save_status = tk.StringVar(value="修改后自动保存")
@@ -561,8 +555,6 @@ class DesktopPet:
             cfg["codex_cli"]["executable"] = codex_fields["executable"].get().strip() or "codex"
             cfg["codex_cli"]["working_directory"] = codex_fields["working_directory"].get().strip() or str(ROOT)
             cfg["codex_cli"]["sandbox"] = codex_fields["sandbox"].get().strip() or "danger-full-access"
-            cfg["codex_cli"]["trigger_mode"] = codex_fields["trigger_mode"].get().strip() or "auto"
-            cfg["codex_cli"]["trigger_keywords"] = [x.strip() for x in codex_fields["trigger_keywords"].get().replace("；", ";").split(";") if x.strip()]
             try:
                 cfg["codex_cli"]["timeout_seconds"] = max(10, int(codex_fields["timeout_seconds"].get().strip() or "600"))
             except ValueError:

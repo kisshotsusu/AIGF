@@ -75,7 +75,6 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `resolve_user(value)`：把家庭称呼（`aliases`）与直播用户名（`live_usernames`）都解析为规范 `id`（`owner` 或 `viewer:<name>`），避免同一人被存成两个人。`IDENTITY.yaml` 是唯一真值。
 - `remember(event)` / `recent_memories(limit, include_private)`：每日 JSONL 读写；直播回复 `include_private=False` 不注入私密记忆。
 - `cleanup_home_chatter()`：只删 `source` 以 `home-` 开头且为普通对话/回复且 `importance<70` 的条目，保留重要/手动/隐私。
-- `recent_live_conversations(limit)`：从 `logs/messages.jsonl` 读成功回复，供家庭模式共享近期对话。
 
 ### 管理后台（`modules/live/manager.py`）
 - `create_app()`：aiohttp 路由表见 `03_INTERFACES_AND_CONFIG.md`。`put_config` 会丢弃传入的 `llm/tts/image_generation/memory_write/workspace`，用磁盘当前值回填；`put_secrets` 只接受 `BILIBILI_COOKIE`。
@@ -159,6 +158,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 ## 总任务规划 API（2026-07-22）
 
 - `HomeAgent._plan_task(text, context)`：调用 MiMo 输出完整任务判定与执行合同。本地只做枚举、白名单、权限与一致性校验，不允许用原始文本关键词把模型的 `is_task/actionable/domain` 覆盖回去。
+- 代码计划必须包含 `code_scope`。执行器据此选择本工程、外部工程或新项目权限，不再调用关键词分类器。
 - `HomeAgent._planner_context(history, limit=8)`：序列化最近用户/助手消息并保留 `source`，供规划器识别主动关怀后的短回复。
 - `HomeAgent._should_route_to_web(task_plan)`：只在模型计划同时满足 `is_task=true`、`actionable=true`、`domain=web` 时路由网页能力。
 - `_analyze_task` 仅是规划接口不可用时的保守非执行合同，不负责语义识别或站点路由。
@@ -181,6 +181,6 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 
 - `_is_media_stop_plan(plan)` 与 `_allows_application_termination(plan)` 必须互斥：前者控制幂等播放停止，后者仅接受 `close_app/terminate_process` 或对应能力字段。修改规划枚举时必须同步两处安全检查和测试。
 - `_run_tool` 在调用 Vision 前拒绝 stop-media 计划中的 Space/Alt+F4，并在 shell/cmd 层阻止仅针对媒体停止的进程终止命令；显式进程终止计划不受此阻止。
-- `CodeEditorModule.read_file(path, start_line, max_lines, max_chars)` 用搜索返回的行号读取局部内容。代码循环的只读计数在成功写入/替换后清零，验证成功才设置 `current_code_verified`。
+- `CodeEditorModule.read_file(path, start_line, max_lines, max_chars)` 用搜索返回的行号读取局部内容。代码循环的只读计数在成功写入/替换后清零，验证成功才设置 `current_code_verified`。该模块只执行文件权限与验证，不判断自然语言是否为代码任务。
 - `_codex_exec_command` 的最后一个参数固定为 `-`，完整提示通过 asyncio 子进程 stdin 写入。自升级失败必须调用 `SelfUpgradeManager.fail`；`status=failed` 的恢复文件只保留诊断，不会由 `resume_prompt()` 重放。
 - `finalize_task_recovery` 对自升级实行 fail-closed：没有写入并通过代码验证的证据时不得清除为成功、触发重启或声称升级完成。

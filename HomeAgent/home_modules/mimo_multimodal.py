@@ -98,7 +98,7 @@ class MiMoMultimodalClient:
     async def verify_completion(self, session: aiohttp.ClientSession, task: str, plan: dict[str, Any], answer: str, evidence: list[dict[str, Any]]) -> dict[str, Any]:
         if not self.config.get("enabled") or not self.config.get("completion_check_enabled"):
             return {"passed": True, "reason": "完成检查已关闭", "next_action": ""}
-        compact_evidence = json.dumps(evidence[-20:], ensure_ascii=False, default=str)[:18000]
+        compact_evidence = self._compact_completion_evidence(evidence)
         prompt = (
             "你是独立任务完成核验器。只根据工具证据判断任务是否真正完成，不能依据助手的口头声明。"
             "先按任务计划区分类型：observe、查询、读取、分析等只读任务，只要成功的工具证据已取得用户所问信息，"
@@ -107,7 +107,10 @@ class MiMoMultimodalClient:
             "tool_completed_at 和 tool_sequence；必须按 tool_sequence/完成时间判断新旧，同一对象的较新状态覆盖较早状态，"
             "不得用操作前或分析耗时期间已经过期的窗口/进程状态否定较新的终态证据。视觉分析只代表其截图采集时刻，"
             "返回较晚不等于画面仍然新鲜。媒体停止命令若明确为 idempotent、requested_state=stopped 且已成功送达，"
-            "不得要求用可反转的播放切换键再次确认。只输出 JSON："
+            "不得要求用可反转的播放切换键再次确认。核验音乐播放时，窗口标题是否变化不是成功条件；应以任务提交后"
+            "最新的窗口视觉分析为准。视觉分析若同时确认目标歌曲名称和正在播放状态（例如暂停按钮、播放进度或播放详情），"
+            "即可作为终态证据；目标在任务开始时已经播放也视为幂等完成，不得为了制造标题变化而停止、重播或重复双击。"
+            "若较新的停止、暂停或其他歌曲证据覆盖了该状态，则必须判定失败。只输出 JSON："
             '{"passed":true或false,"reason":"简短依据","next_action":"失败时给出下一步工具动作"}。\n'
             f"用户任务：{task}\n任务计划：{json.dumps(plan, ensure_ascii=False)}\n候选回复：{answer}\n工具证据：{compact_evidence}"
         )
@@ -127,3 +130,44 @@ class MiMoMultimodalClient:
         if not isinstance(result, dict) or not isinstance(result.get("passed"), bool):
             raise RuntimeError("MiMo 完成检查的 passed 必须是 JSON boolean")
         return {"passed": result["passed"], "reason": str(result.get("reason") or "未提供原因"), "next_action": str(result.get("next_action") or "")}
+
+    @staticmethod
+    def _compact_completion_evidence(
+        evidence: list[dict[str, Any]],
+        *,
+        max_chars: int = 18000,
+    ) -> str:
+        """Compact newest-first so long old observations cannot hide the final state."""
+        def compact(value: Any, depth: int = 0) -> Any:
+            if depth >= 6:
+                return str(value)[:300]
+            if isinstance(value, str):
+                return value if len(value) <= 1600 else value[:1599] + "…"
+            if isinstance(value, dict):
+                return {str(key): compact(item, depth + 1) for key, item in value.items()}
+            if isinstance(value, list):
+                return [compact(item, depth + 1) for item in value[-12:]]
+            return value
+
+        selected_newest: list[dict[str, Any]] = []
+        used = 2
+        for item in reversed(evidence[-30:]):
+            candidate = compact(item)
+            encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+            if selected_newest and used + len(encoded) + 1 > max_chars:
+                continue
+            if not selected_newest and len(encoded) + 2 > max_chars:
+                result = item.get("result") if isinstance(item, dict) else {}
+                result = result if isinstance(result, dict) else {}
+                candidate = {
+                    "tool": str(item.get("tool") or "") if isinstance(item, dict) else "",
+                    "result": {
+                        "status": str(result.get("status") or ""),
+                        "tool_sequence": result.get("tool_sequence"),
+                        "summary": encoded[: max(200, max_chars - 300)],
+                    },
+                }
+                encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+            selected_newest.append(candidate)
+            used += len(encoded) + 1
+        return json.dumps(list(reversed(selected_newest)), ensure_ascii=False, default=str)

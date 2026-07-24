@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,10 +32,13 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("近期直播对话", prompt)
         self.assertNotIn("live-chat", prompt)
 
-    def test_clear_live_messages_phrase_bypasses_model_routing(self) -> None:
-        for phrase in ("清理直播消息", "清空直播上下文", "删除近期直播对话", "清理直播聊天记录"):
-            self.assertTrue(HomeAgent._is_live_context_clear_request(phrase))
-        self.assertFalse(HomeAgent._is_live_context_clear_request("总结直播消息"))
+    async def test_clear_live_context_is_a_model_selected_tool(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent._request_live_context_clear = Mock(return_value={"removed_messages": 3})
+        result = await agent._run_tool("clear_live_context", {})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["removed_messages"], 3)
+        agent._request_live_context_clear.assert_called_once_with()
 
     def test_registered_character_images_expose_canonical_paths(self) -> None:
         catalog = HomeAgent._character_image_catalog()
@@ -147,7 +152,10 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         agent.config = {"home": {"max_context_messages": 4, "auto_speak": True}}
         agent.history = []
         root = Path(__file__).resolve().parents[2]
-        agent.self_upgrade = SimpleNamespace(code_editor=CodeEditorModule(root, root / "HomeAgent"), is_upgrade_request=lambda text: False)
+        agent.self_upgrade = SimpleNamespace(
+            code_editor=CodeEditorModule(root, root / "HomeAgent"),
+            set_self_upgrade=lambda enabled: None,
+        )
         agent.log_event = lambda *args, **kwargs: None
         agent._acknowledge_common_response = lambda text: None
 
@@ -181,6 +189,15 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
             read = await agent._run_tool("code_read_file", {"path": "Projects/demo/main.py"})
             self.assertTrue(written["ok"])
             self.assertEqual("VALUE = 1\n", read["content"])
+
+    async def test_codex_tool_receives_semantic_task_plan(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.current_task_plan = {
+            "domain": "code", "implementation_change": True, "code_scope": "self",
+        }
+        agent._run_codex_task = AsyncMock(return_value={"ok": True})
+        await agent._run_tool("codex_cli_task", {"task": "继续完成实现"})
+        self.assertIs(agent._run_codex_task.await_args.kwargs["task_plan"], agent.current_task_plan)
 
     async def test_tts_failure_uses_windows_fallback_without_failing_chat(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
@@ -343,7 +360,7 @@ class SelfProgrammingTests(unittest.TestCase):
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = False
         agent.config = {
-            "agent": {"model_driven_computer_actions": True, "prefer_local_code_tools": True},
+            "agent": {"prefer_local_code_tools": True},
             "vision_mcp": {"enabled": True}, "codex_cli": {"enabled": False},
             "computer_control": {"enabled": False},
         }
@@ -357,14 +374,12 @@ class SelfProgrammingTests(unittest.TestCase):
         for prompt in ("不要重启自己", "如何重启自己？", "让他能自己重启自己", "完善重启自己的消息处理功能"):
             self.assertFalse(HomeAgent.is_restart_request(prompt), prompt)
 
-    def test_external_bat_request_uses_file_tools_not_ui_or_codex(self) -> None:
-        prompt = r"检查 D:\Program\hermes-agent 给hermes 写个一键启动的bat"
-        self.assertTrue(HomeAgent._is_file_authoring_request(prompt))
+    def test_file_plan_uses_file_tools_not_ui_or_codex(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = False
         agent.current_file_authoring_task = True
         agent.config = {
-            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "agent": {"prefer_local_code_tools": True},
             "codex_cli": {"enabled": True}, "vision_mcp": {"enabled": True},
             "computer_control": {"enabled": True},
         }
@@ -379,7 +394,7 @@ class SelfProgrammingTests(unittest.TestCase):
         agent.current_code_task = False
         agent.current_file_authoring_task = False
         agent.config = {
-            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "agent": {"prefer_local_code_tools": True},
             "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": False},
             "computer_control": {"enabled": True},
             "shell_execution": {"shell_enabled": True, "cmd_enabled": True},
@@ -395,12 +410,11 @@ class SelfProgrammingTests(unittest.TestCase):
         agent.current_file_authoring_task = False
         agent.current_task_plan = {"domain": "code", "operation": "code", "handler": None}
         agent.config = {
-            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "agent": {"prefer_local_code_tools": True},
             "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": True},
             "computer_control": {"enabled": False},
         }
         names = {item["function"]["name"] for item in agent._tools(scoped=True)}
-        self.assertNotIn("cloudmusic_search_and_play", names)
         self.assertNotIn("media_stop", names)
         self.assertNotIn("bilibili_open_favorite_video", names)
         self.assertIn("code_validate_project", names)
@@ -414,33 +428,72 @@ class SelfProgrammingTests(unittest.TestCase):
             "operation": "play", "handler": "model_ui", "query": "稻香", "query_is_explicit": True,
         }
         agent.config = {
-            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "agent": {"prefer_local_code_tools": True},
             "codex_cli": {"enabled": False}, "vision_mcp": {"enabled": True},
             "computer_control": {"enabled": True}, "shell_execution": {"shell_enabled": False, "cmd_enabled": False},
         }
         names = {item["function"]["name"] for item in agent._tools(scoped=True)}
-        self.assertNotIn("cloudmusic_search_and_play", names)
-        for name in ("ui_list_windows", "ui_analyze_window", "ui_click_window", "ui_type_active_text", "launch_app"):
+        for name in ("ui_list_windows", "ui_analyze_window", "ui_click_window", "ui_type_window", "launch_app"):
             self.assertIn(name, names)
 
-    def test_independent_project_request_prefers_local_tools(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        agent = HomeAgent.__new__(HomeAgent)
-        agent.config = {"agent": {"prefer_local_code_tools": True}, "codex_cli": {"enabled": True, "trigger_mode": "auto", "trigger_keywords": ["写程序"]}}
-        agent.self_upgrade = SimpleNamespace(code_editor=CodeEditorModule(root, root / "HomeAgent"))
-        self.assertFalse(agent._should_route_to_codex("创建一个独立的 Python 记账项目并测试"))
-        self.assertTrue(agent._should_route_to_codex("明确调用 Codex 创建一个独立 Python 项目"))
+    def test_cloudmusic_completion_is_not_hard_gated_by_window_title_change(self) -> None:
+        source = inspect.getsource(HomeAgent.chat)
+        self.assertNotIn("unproven_media_success_rejected", source)
+        self.assertNotIn("automated_media_target_verified", source)
+        self.assertNotIn("只有 ui_double_click_window 自身返回的 after_title", source)
+        self.assertIn("verify_completion", source)
 
-    def test_development_document_inspection_is_not_misclassified_as_new_project(self) -> None:
-        prompt = r"你自己的项目路径在 E:\Doc\AIAgent，检查开发文档"
-        self.assertFalse(CodeEditorModule.is_independent_project_request(prompt))
-        self.assertFalse(CodeEditorModule.is_code_task(prompt))
+    def test_completion_discards_visual_state_superseded_by_later_action(self) -> None:
+        evidence = [
+            {"tool": "ui_analyze_window", "result": {
+                "status": "success",
+                "screenshot_captured_at": "2026-07-24T22:55:10+08:00",
+                "analysis": "旧歌曲正在播放",
+            }},
+            {"tool": "ui_click_window", "result": {
+                "status": "success",
+                "tool_submitted_at": "2026-07-24T22:55:20+08:00",
+            }},
+            {"tool": "ui_analyze_window", "result": {
+                "status": "success",
+                "screenshot_captured_at": "2026-07-24T22:55:30+08:00",
+                "analysis": "目标歌曲正在播放",
+            }},
+        ]
+        fresh, discarded = HomeAgent._fresh_completion_evidence(
+            evidence,
+            now=datetime.fromisoformat("2026-07-24T22:55:40+08:00"),
+            max_visual_age_seconds=45,
+        )
+        self.assertEqual([item["tool"] for item in fresh], ["ui_click_window", "ui_analyze_window"])
+        self.assertEqual(len(discarded), 1)
+        self.assertIn("状态变更", discarded[0]["reason"])
+        self.assertEqual(fresh[-1]["result"]["analysis"], "目标歌曲正在播放")
 
-    def test_screen_care_reply_is_not_misclassified_as_code_task(self) -> None:
-        care = "主人，写代码累了吧？记得喝口水，让眼睛也休息一下哦。回复 模糊语义 号"
-        self.assertFalse(CodeEditorModule.is_code_edit_request(care))
-        self.assertFalse(CodeEditorModule.is_code_task(care))
-        self.assertTrue(CodeEditorModule.is_code_task(care + " 请修复 HomeAgent 的路由错误"))
+    def test_completion_discards_visual_state_that_is_too_old(self) -> None:
+        evidence = [{"tool": "ui_analyze_window", "result": {
+            "status": "success",
+            "screenshot_captured_at": "2026-07-24T22:54:00+08:00",
+            "analysis": "曾经正在播放",
+        }}]
+        fresh, discarded = HomeAgent._fresh_completion_evidence(
+            evidence,
+            now=datetime.fromisoformat("2026-07-24T22:55:00+08:00"),
+            max_visual_age_seconds=45,
+        )
+        self.assertFalse(fresh)
+        self.assertIn("超过 45 秒", discarded[0]["reason"])
+
+    def test_stale_vision_result_drops_analysis_before_model_context(self) -> None:
+        normalized = HomeAgent._normalize_tool_result("ui_analyze_window", {
+            "ok": True,
+            "stale": True,
+            "stale_reason": "标题已变化",
+            "analysis": "这段旧识别不能再用",
+        })
+        self.assertEqual(normalized["status"], "stale")
+        self.assertTrue(normalized["discarded_analysis"])
+        self.assertNotIn("analysis", normalized)
 
     def test_code_read_tools_allow_absolute_paths_when_full_access_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as root_folder, tempfile.TemporaryDirectory() as external_folder:
@@ -471,7 +524,7 @@ class SelfProgrammingTests(unittest.TestCase):
         agent = HomeAgent.__new__(HomeAgent)
         agent.current_code_task = True
         agent.config = {
-            "agent": {"prefer_local_code_tools": True, "model_driven_computer_actions": True},
+            "agent": {"prefer_local_code_tools": True},
             "codex_cli": {"enabled": True}, "vision_mcp": {"enabled": False}, "computer_control": {"enabled": False},
         }
         names = {item["function"]["name"] for item in agent._tools()}
@@ -479,24 +532,21 @@ class SelfProgrammingTests(unittest.TestCase):
         self.assertIn("code_validate_project", names)
         self.assertNotIn("codex_cli_task", names)
 
-    def test_home_agent_code_request_is_detected(self) -> None:
-        prompts = (
-            r"你的本体在 E:\Doc\AIAgent\HomeAgent，修改你自身的代码",
-            "给 HomeAgent 添加自己写代码的功能",
-            "修复你的代码并完成测试",
-            "在播放语音的时候就显示消息，不要等语音播完再显示消息",
-            "升级自己的代码，在运行时增加屏幕关怀功能",
-            "完善自动升级功能",
-            "你的直播间欢迎观众功能失效了，检查一下并修复",
-        )
-        for prompt in prompts:
-            self.assertTrue(SelfUpgradeManager.is_upgrade_request(prompt), prompt)
+    def test_semantic_code_scope_marks_recovery_as_self_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {"require_validation": True}})
+            manager.begin("由规划器稍后确定范围")
+            self.assertFalse(manager.read()["is_self_upgrade"])
+            manager.set_self_upgrade(True)
+            self.assertTrue(manager.read()["is_self_upgrade"])
 
     def test_self_upgrade_finalize_rejects_empty_changes(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); home = root / "HomeAgent"; home.mkdir()
             manager = SelfUpgradeManager(root, home, {"self_upgrade": {"require_validation": True}})
             manager.begin("升级自己的代码")
+            manager.set_self_upgrade(True)
             with self.assertRaisesRegex(RuntimeError, "没有产生任何代码或配置变更"):
                 manager.finalize("已经完成")
             self.assertEqual(manager.read()["status"], "validation_failed")
@@ -518,6 +568,7 @@ class SelfProgrammingTests(unittest.TestCase):
             docs = root / "AI Read"; docs.mkdir(); doc = docs / "06_CURRENT_STATE.md"; doc.write_text("before\n", encoding="utf-8")
             manager = SelfUpgradeManager(root, home, {"self_upgrade": {"require_validation": True, "enabled": True, "auto_restart": True}})
             manager.begin("升级自己的代码")
+            manager.set_self_upgrade(True)
             source.write_text("value = 2\n", encoding="utf-8"); doc.write_text("after\n", encoding="utf-8")
             self.assertTrue(manager.finalize("升级完成"))
             self.assertEqual(manager.read()["status"], "restart_pending")
@@ -589,10 +640,7 @@ class SelfProgrammingTests(unittest.TestCase):
         self.assertIn("必须在本机实际完成代码写入", contract)
         self.assertIn("没有写入文件", contract)
 
-    def test_independent_project_request_and_contract(self) -> None:
-        prompt = "创建一个独立的 Python 待办事项项目并编写测试"
-        self.assertTrue(CodeEditorModule.is_independent_project_request(prompt))
-        self.assertTrue(CodeEditorModule.is_code_task(prompt))
+    def test_independent_project_contract(self) -> None:
         root = Path(__file__).resolve().parents[2]
         contract, loaded = CodeEditorModule(root, root / "HomeAgent").build_execution_contract(self_edit=False)
         self.assertFalse(loaded)

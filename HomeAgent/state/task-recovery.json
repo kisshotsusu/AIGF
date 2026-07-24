@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "status": "running",
+  "prompt": "打开网易云播放all by my design",
+  "is_self_upgrade": false,
+  "started_at": "2026-07-24T23:14:13",
+  "updated_at": "2026-07-24T23:17:16",
+  "current_step": "正在播放语音 3/3…",
+  "completed_steps": [
+    "双击界面目标",
+    "双击界面目标 · 完成",
+    "完成验证 · 通过",
+    "正在生成语音 1/3…",
+    "正在生成语音 2/3…",
+    "正在播放语音 1/3…",
+    "正在生成语音 3/3…",
+    "正在播放语音 2/3…"
+  ],
+  "changed_files": [],
+  "restart_count": 0
+}

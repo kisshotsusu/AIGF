@@ -1,6 +1,6 @@
 # AI 直播工程：新会话入口
 
-最后核对：2026-07-22。路径均以工程根目录为基准，代码和当前 YAML 始终高于文档。
+最后核对：2026-07-24。路径均以工程根目录为基准，代码和当前 YAML 始终高于文档。
 
 ## 阅读顺序
 
@@ -45,10 +45,8 @@
 
 `当前代码与 YAML` > `AI Read` > 根 `README.md` > 各模块历史说明。此优先级用于排查旧信息，不代表允许文档长期落后：完成代码任务前必须更新对应 `01~08` 章节；影响当前能力的结果写入 `06_CURRENT_STATE.md`，测试数量、方法或验收流程变化同步 `08_TESTING.md`，入口或用户使用方式变化再同步 README。
 
-## 本轮（2026-07-20）细化要点
+## 维护约定
 
-- 直播核心代码只有一份：`modules/live/ai_live_assistant/`。`src/ai_live_assistant/` 是**再导出 shim**，改代码只改前者。
-- Vision MCP 工具集比旧文档更完整（见 `03`，新增 `click`/`ground_page`/`type_active_text`/`vision_memory_status`/`window_double_click`/`desktop_read_clipboard` 等）。
-- HomeAgent 配置新增 `semantic_planner` 与 `progress_reporting` 两节（见 `03`）。
-- 直播控制台 `PUT /api/config`、`PUT /api/secrets` 已服务端保护 `llm/tts/...` 与大部分密钥，这些项归属角色工作台。
-- `CharacterService` 按修改时间双向同步 `config.yaml` ↔ `config.d`（见 `05` 与 `07`）。当前 `computer_control` 在两处不一致，待人工核对。
+- 直播核心代码位于 `modules/live/ai_live_assistant/`；`src/ai_live_assistant/` 仅为兼容再导出。
+- 当前能力写入 `06_CURRENT_STATE.md`，测试方法写入 `08_TESTING.md`，不要在 AI Read 中追加逐次故障和修复流水。
+- 角色工作台管理共享模型和密钥配置；直播控制台只维护直播运行参数与 `BILIBILI_COOKIE`。

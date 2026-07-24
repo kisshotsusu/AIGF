@@ -54,10 +54,6 @@ class SelfUpgradeManager:
             return {}
 
     @staticmethod
-    def is_upgrade_request(prompt: str) -> bool:
-        return CodeEditorModule.is_code_edit_request(prompt)
-
-    @staticmethod
     def _is_restart_only_prompt(prompt: str) -> bool:
         value = re.sub(r"[\s，。！？、,.!?;；:：]+", "", str(prompt or "")).lower()
         return value in {
@@ -77,13 +73,21 @@ class SelfUpgradeManager:
         previous = self.read() if resumed else {}
         self._write({
             "version": 1, "status": "running", "prompt": previous.get("prompt") or prompt,
-            "is_self_upgrade": self.is_upgrade_request(prompt) or bool(previous.get("is_self_upgrade")),
+            "is_self_upgrade": bool(previous.get("is_self_upgrade")) if resumed else False,
             "started_at": previous.get("started_at") or now, "updated_at": now,
             "current_step": previous.get("current_step", "正在恢复任务" if resumed else "正在分析任务"),
             "completed_steps": previous.get("completed_steps", []),
             "changed_files": previous.get("changed_files", []),
             "restart_count": int(previous.get("restart_count", 0)),
         })
+
+    def set_self_upgrade(self, enabled: bool) -> None:
+        """Persist the semantic planner's code-scope decision for recovery."""
+        state = self.read()
+        if state.get("status") != "running":
+            return
+        state.update({"is_self_upgrade": bool(enabled), "updated_at": datetime.now().isoformat(timespec="seconds")})
+        self._write(state)
 
     def progress(self, current: str, completed: list[str]) -> None:
         state = self.read()

@@ -123,23 +123,3 @@ class Workspace:
                 temporary.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
                 temporary.replace(path)
         return {"scanned": scanned, "removed": removed}
-
-    def recent_live_conversations(self, limit: int) -> list[dict[str, Any]]:
-        """读取直播成功回复流水，供直播和家庭模式共享近期对话上下文。"""
-        path = self.project_root / "logs" / "messages.jsonl"
-        if not path.exists():
-            return []
-        rows: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if item.get("event") == "reply" and item.get("status") == "success":
-                identity = self.resolve_user(str(item.get("user", "")))
-                rows.append({
-                    "time": item.get("time"), "source": "live-chat",
-                    "user": identity["name"], "user_id": identity["id"], "source_username": item.get("user", ""), "message": item.get("message", ""),
-                    "reply": item.get("reply", ""),
-                })
-        return rows[-limit:]

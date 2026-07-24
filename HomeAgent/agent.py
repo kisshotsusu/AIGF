@@ -326,8 +326,6 @@ class HomeAgent:
         scene = ROOT / home.get("scene_file", "workspace/HOME.md")
         scene_text = scene.read_text(encoding="utf-8") if scene.exists() else "当前在家中进行私人对话。"
         memories = [item for item in self.workspace.recent_memories(200) if item.get("type") != "reply"][-20:]
-        # 直播流水与长期记忆分层读取：保留跨场景连续性，但不把直播话术当作永久事实。
-        live_conversations = self.workspace.recent_live_conversations(20)
         skills = self.list_skills()
         active_tasks = self.task_store.list()
         awaiting_tasks = self.task_store.awaiting_acknowledgements()
@@ -338,8 +336,6 @@ class HomeAgent:
             "\n\n家庭长期上下文摘要：\n" + context_summary +
             f"\n\n当前本地时间：{datetime.now():%Y-%m-%d %H:%M:%S}。当前用户称呼：{home.get('user_name', '用户')}。当前不是直播场景。" +
             "\n\n可用长期记忆：\n" + "\n".join(json.dumps(x, ensure_ascii=False) for x in memories) +
-            "\n\n近期直播对话（仅用于识别共同经历和用户身份，当前回答仍须使用家庭场景话术）：\n" +
-            "\n".join(json.dumps(x, ensure_ascii=False) for x in live_conversations) +
             "\n\n可用Skills：\n" + "\n".join(f"- {x['name']}: {x['description']}" for x in skills) +
             "\n\n当前任务文件快照（这是任务数量和状态的唯一可信来源，不得用历史对话推算）：\n" + json.dumps({"active_count": len(active_tasks), "tasks": active_tasks}, ensure_ascii=False) +
             "\n\n正在等待用户确认的提醒：\n" + "\n".join(json.dumps(x, ensure_ascii=False) for x in awaiting_tasks) +
@@ -1583,6 +1579,16 @@ class HomeAgent:
         self.log_event("live_context_clear_requested", token=token)
         return payload
 
+    @staticmethod
+    def _is_live_context_clear_request(text: str) -> bool:
+        """Recognize requests to clear raw livestream messages without model routing."""
+        value = re.sub(r"\s+", "", str(text or ""))
+        return (
+            any(word in value for word in ("清理", "清空", "删除"))
+            and "直播" in value
+            and any(word in value for word in ("上下文", "聊天记录", "对话记录", "近期对话", "对话", "消息"))
+        )
+
     async def _run_codex_task(self, task: str, require_mcp: bool = False, status=None, preferred_mcp: str = "", task_plan: dict[str, Any] | None = None, previous_failure: str = "", code_retry_round: int = 0) -> dict[str, Any]:
         if self.cancel_event.is_set():
             raise asyncio.CancelledError
@@ -2232,9 +2238,7 @@ class HomeAgent:
             query_tags = self._memory_query_tags(text)
             recalled_memories = self.long_term_memory.retrieve(query_tags, limit=8, user_id="owner")
             self.log_event("long_term_memory_retrieved", query_tags=query_tags, matches=len(recalled_memories), route="deterministic")
-        normalized_clear = str(text).replace(" ", "")
-        if (any(word in normalized_clear for word in ("清理", "清空", "删除")) and "直播" in normalized_clear
-                and any(word in normalized_clear for word in ("上下文", "聊天记录", "对话记录", "近期对话"))):
+        if self._is_live_context_clear_request(text):
             request = self._request_live_context_clear()
             removed = request.get("removed_messages", 0)
             answer = f"好，直播场景的短期聊天上下文已经独立清空了，共移除{removed}条，长期记忆不会受影响。"
@@ -2941,7 +2945,9 @@ class HomeAgent:
             return await self.codex_status()
         if name == "search_memories":
             q = str(args.get("query", "")).lower()
-            shared = self.workspace.recent_memories(500) + self.workspace.recent_live_conversations(200)
+            # Raw livestream chat is an audit stream, not family memory. Only
+            # explicitly retained long-term memories may cross scene boundaries.
+            shared = self.workspace.recent_memories(500)
             return [x for x in shared if q in json.dumps(x, ensure_ascii=False).lower()][-20:]
         if name == "list_skills": return self.list_skills()
         if name == "list_character_images":

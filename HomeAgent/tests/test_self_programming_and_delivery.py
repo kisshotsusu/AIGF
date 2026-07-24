@@ -14,6 +14,27 @@ from self_upgrade import SelfUpgradeManager
 
 
 class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_family_system_prompt_does_not_embed_raw_live_chat(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {
+            "home": {"scene_file": "workspace/DOES_NOT_EXIST.md", "user_name": "主人"},
+            "context_maintenance": {"summary_file": "workspace/DOES_NOT_EXIST.md"},
+        }
+        agent.workspace = SimpleNamespace(
+            recent_memories=lambda _limit: [],
+            prompt_documents=lambda _scene: "家庭提示",
+        )
+        agent.task_store = SimpleNamespace(list=lambda: [], awaiting_acknowledgements=lambda: [])
+        agent.list_skills = lambda: []
+        prompt = agent._system_prompt()
+        self.assertNotIn("近期直播对话", prompt)
+        self.assertNotIn("live-chat", prompt)
+
+    def test_clear_live_messages_phrase_bypasses_model_routing(self) -> None:
+        for phrase in ("清理直播消息", "清空直播上下文", "删除近期直播对话", "清理直播聊天记录"):
+            self.assertTrue(HomeAgent._is_live_context_clear_request(phrase))
+        self.assertFalse(HomeAgent._is_live_context_clear_request("总结直播消息"))
+
     def test_registered_character_images_expose_canonical_paths(self) -> None:
         catalog = HomeAgent._character_image_catalog()
         three_view = next(item for item in catalog["images"] if item["filename"] == "角色三视图.png")

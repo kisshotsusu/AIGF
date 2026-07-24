@@ -67,8 +67,9 @@ class SelfUpgradeManager:
         """Validate edits before an execution agent is allowed to claim success."""
         return self.code_editor.validate_current_changes(require_changes)
 
-    def begin(self, prompt: str, resumed: bool = False) -> None:
-        self.code_editor.begin_tracking()
+    def begin(self, prompt: str, resumed: bool = False, track_changes: bool = True) -> None:
+        if track_changes:
+            self.code_editor.begin_tracking()
         now = datetime.now().isoformat(timespec="seconds")
         previous = self.read() if resumed else {}
         self._write({
@@ -80,6 +81,10 @@ class SelfUpgradeManager:
             "changed_files": previous.get("changed_files", []),
             "restart_count": int(previous.get("restart_count", 0)),
         })
+
+    def begin_tracking(self) -> None:
+        """Start code-change tracking without creating a recovery task."""
+        self.code_editor.begin_tracking()
 
     def set_self_upgrade(self, enabled: bool) -> None:
         """Persist the semantic planner's code-scope decision for recovery."""
@@ -160,6 +165,11 @@ class SelfUpgradeManager:
         if status != "running" or not str(state.get("prompt", "")).strip():
             if status in {"completed", "cancelled"}:
                 self.clear()
+            return ""
+        if state.get("is_self_upgrade") is not True:
+            # Legacy versions persisted every conversation as a recoverable
+            # current task. Only an unfinished self-upgrade belongs here.
+            self.clear()
             return ""
         original = str(state["prompt"]).strip()
         completed = "；".join(state.get("completed_steps") or []) or "暂无可靠完成记录"

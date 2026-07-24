@@ -30,7 +30,7 @@
 - Vision 当前 `gui_enabled: true`、`preload_model: false`：视觉能力允许使用，但 GUI-Actor 只在需要时懒加载。
 - 所有点击、输入、快捷键和滚动操作默认约 550 ms 后重新截图，返回 `state_changed`、`post_action_verified`、采集时间与实际作用对象；后续动作由模型决定。
 - Sound MCP 为 `http://127.0.0.1:8766/mcp`；Vision MCP 为 `http://127.0.0.1:8765/mcp`；直播管理页为 `http://127.0.0.1:9888`。
-- 直播短期上下文位于 `state/live-context.json`；HomeAgent 未完成任务位于 `HomeAgent/state/task-recovery.json`。
+- 直播短期上下文位于 `state/live-context.json`；提醒/闹钟只存入 `Task/*.json`；`HomeAgent/state/task-recovery.json` 只保存尚未完成的自身代码升级。
 
 ## 安全与修改边界
 

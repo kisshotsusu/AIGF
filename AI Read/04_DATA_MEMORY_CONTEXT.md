@@ -18,7 +18,8 @@
 1. **直播短期模型上下文**：`state/live-context.json`，含角色、内容、创建时间；运行时同步到 deque。默认清理超过 120 分钟内容。
 2. **旧式每日共享记忆**：`workspace/memory/YYYY-MM-DD.jsonl`，由 Workspace 读写，角色管理器可编辑标签、隐私和附件。
 3. **结构化长期记忆**：`LongTermMemory/memory.db`，只存身体、情绪、重大事件、偏好、习惯、关系和约定等高价值内容。
-4. **未完成任务恢复状态**：`HomeAgent/state/task-recovery.json`，记录任务原文、当前步骤、已完成内容、是否属于自升级和重启次数。普通任务完成或取消后立即删除；只有 `running` 会恢复。自升级的 `restart_pending` 表示任务已经完成、仅等待新进程加载代码，新进程看到后只删除状态而不重复执行原任务。
+4. **自升级恢复状态**：`HomeAgent/state/task-recovery.json` 只记录尚未完成的自身代码升级，包括原任务、当前步骤、已完成内容、变更文件和重启次数。普通任务与定时任务不写该文件；只有 `is_self_upgrade=true` 且 `status=running` 才允许恢复。旧版本遗留的非升级 `running` 状态会在启动时清除。`restart_pending` 表示升级已完成、仅等待新进程加载代码，新进程看到后只删除状态而不重复执行原任务。
+5. **定时任务状态**：`Task/<task-id>.json` 是提醒、闹钟和周期任务的唯一持久化位置。创建、列出、确认、推进周期和成功后删除一次性任务均由 `TaskStore` 完成，与当前聊天进度和自升级恢复完全独立。
 
 ## 长期记忆记录
 

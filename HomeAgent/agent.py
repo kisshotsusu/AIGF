@@ -144,6 +144,7 @@ class HomeAgent:
         self.command_executor = CommandExecutor(ROOT)
         self.mimo_multimodal = MiMoMultimodalClient(self.project.get("mimo_multimodal", {}))
         self.restart_requested = False
+        self.current_task_resumed = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
         threading.Thread(target=self.ensure_sound_service, daemon=True, name="sound-mcp-autostart").start()
         self.character_name = "小助手"
@@ -187,11 +188,14 @@ class HomeAgent:
 
     def begin_task(self, prompt: str = "", resumed: bool = False) -> None:
         self.cancel_event.clear()
+        self.current_task_resumed = bool(resumed)
         if prompt:
             if self.is_restart_request(prompt):
                 self.self_upgrade.clear()
                 return
-            self.self_upgrade.begin(prompt, resumed=resumed)
+            # Every task may need code-change evidence later, but only a model-
+            # confirmed self-upgrade may create task-recovery.json.
+            self.self_upgrade.begin_tracking()
 
     def update_task_recovery(self, current: str, completed: list[str]) -> None:
         self.self_upgrade.progress(current, completed)
@@ -204,6 +208,11 @@ class HomeAgent:
             upgrade_restart = False
         else:
             state = self.self_upgrade.read()
+            if state.get("is_self_upgrade") is not True:
+                if state.get("status") == "running":
+                    self.self_upgrade.clear()
+                self.log_event("task_recovery_skipped", reason="not_self_upgrade")
+                return False
             if state.get("is_self_upgrade") and not bool(getattr(self, "current_code_verified", False)):
                 self.self_upgrade.fail("自升级执行未取得写入并通过测试的证据")
                 self.log_event("task_recovery_failed", reason="self_upgrade_not_verified")
@@ -1981,7 +1990,13 @@ class HomeAgent:
         self.current_code_task = code_task
         self.current_file_authoring_task = bool(task_plan.get("is_task") and task_plan.get("actionable") and task_plan.get("domain") == "file")
         self.current_code_self_edit = bool(code_task and task_plan.get("code_scope") == "self")
-        self.self_upgrade.set_self_upgrade(self.current_code_self_edit)
+        if self.current_code_self_edit:
+            self.self_upgrade.begin(
+                text,
+                resumed=bool(getattr(self, "current_task_resumed", False)),
+                track_changes=False,
+            )
+            self.self_upgrade.set_self_upgrade(True)
         self.current_code_verified = not self.current_code_self_edit
         self.log_event("task_plan_created", task_plan=task_plan)
         self._emit_activity(status, {

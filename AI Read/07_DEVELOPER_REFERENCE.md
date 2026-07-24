@@ -83,7 +83,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 ### HomeAgent（`HomeAgent/agent.py`）
 - `HomeAgentWindow.send()` 在 worker 忙碌时必须清空编辑框、显示用户消息并把文本追加到 `input_queue`，不得静默丢弃；`finish_task()` 仅在当前 worker（包含最终 TTS）结束后通过零延迟 Qt 回调启动队首任务。队列为进程内 FIFO，重启时不在旧进程继续消费。
 - 运行期读取 `HomeAgent/config.yaml`、`config.yaml`、`workspace`、`Task`、`LongTermMemory`；`__init__` 后台线程 `ensure_vision_service` / `ensure_sound_service` 自动拉起 MCP。
-- `begin_task` / `update_task_recovery` / `finalize_task_recovery` / `recover_interrupted_task` / `stop_current_task`：围绕 `SelfUpgradeManager` 做任务持久化与重启恢复；`stop_current_task` 会 `taskkill` 当前活跃子进程但保留常驻服务。
+- `begin_task` 只清除取消标志并调用 `SelfUpgradeManager.begin_tracking()` 建立代码变更基线，不创建恢复文件。`HomeAgent.chat` 只有在模型计划为 `domain=code`、`code_scope=self` 时才调用 `SelfUpgradeManager.begin(..., track_changes=False)` 创建自升级恢复状态。`update_task_recovery`、`finalize_task_recovery` 和 `recover_interrupted_task` 只处理该自升级状态；`stop_current_task` 会终止当前活跃子进程但保留常驻服务。
 - `SelfUpgradeManager.clear()` 是完成/取消状态的唯一清理入口。`resume_prompt()` 只能恢复 `running`；`restart_pending` 是已完成升级的进程接力标记，读取后必须清理并返回空字符串，禁止再次提交原任务。
 - `CodeEditorModule._resolve_read_path` 与 `_resolve_edit_path` 负责路径规范化；自我修改可访问整个仓库源码，`computer_control.full_access` 授权外部绝对路径读写。外部结果返回规范绝对路径，写入后加入 `_external_changed` 并参与语法校验。
 - `log_event(event, **data)`：写 `HomeAgent/logs/agent-events.jsonl`，密钥按正则脱敏（`bearer ...` / `sk-...` 截断为 `***`），单字段 ≤4000 字符。
@@ -199,3 +199,4 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `CodeEditorModule.read_file(path, start_line, max_lines, max_chars)` 用搜索返回的行号读取局部内容。代码循环的只读计数在成功写入/替换后清零，验证成功才设置 `current_code_verified`。该模块只执行文件操作与验证，不读取用户自然语言，也不判断是否为代码任务。
 - `_codex_exec_command` 的最后一个参数固定为 `-`，完整提示通过 asyncio 子进程 stdin 写入。自升级失败必须调用 `SelfUpgradeManager.fail`；`status=failed` 的恢复文件只保留诊断，不会由 `resume_prompt()` 重放。
 - `finalize_task_recovery` 对自升级实行 fail-closed：没有写入并通过代码验证的证据时不得清除为成功、触发重启或声称升级完成。
+- `SelfUpgradeManager.resume_prompt()` 只恢复 `is_self_upgrade=true` 的 `running` 状态；旧版本遗留的普通/定时任务状态直接清除。`create_scheduled_task` 始终通过 `TaskStore(ROOT / "Task")` 写入独立 JSON，不能写入或依赖 `task-recovery.json`。

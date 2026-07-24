@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from agent import HomeAgent
 from home_modules.code_editor import CodeEditorModule
 from self_upgrade import SelfUpgradeManager
+from task_manager import TaskStore
 
 
 class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -109,6 +110,24 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         agent._speak_home = speak
         await agent.run_due_tasks(lambda _message: order.append("message"))
         self.assertEqual(["message", "tts"], order)
+
+    async def test_scheduled_task_is_stored_only_in_task_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            agent = HomeAgent.__new__(HomeAgent)
+            agent.cancel_event = __import__("threading").Event()
+            agent.current_task_resumed = False
+            agent.self_upgrade = SelfUpgradeManager(root, home, {"self_upgrade": {}})
+            agent.task_store = TaskStore(root / "Task")
+            agent.log_event = Mock()
+            agent.begin_task("明天提醒我喝水")
+            result = await agent._run_tool("create_scheduled_task", {
+                "title": "喝水", "message": "该喝水了", "recurrence": "once",
+                "scheduled_at": "2099-01-01T09:00", "action": "tts",
+            })
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(list((root / "Task").glob("*.json"))), 1)
+            self.assertFalse(agent.self_upgrade.path.exists())
 
     async def test_direct_restart_bypasses_model_planning(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
@@ -560,13 +579,23 @@ class SelfProgrammingTests(unittest.TestCase):
             self.assertEqual(manager.resume_prompt(), "")
             self.assertFalse(manager.path.exists())
 
-    def test_only_running_task_is_resumed(self) -> None:
+    def test_legacy_non_upgrade_running_task_is_not_resumed(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); home = root / "HomeAgent"; home.mkdir()
             manager = SelfUpgradeManager(root, home, {"self_upgrade": {}})
             manager.begin("检查尚未完成的任务")
             prompt = manager.resume_prompt()
-            self.assertIn("原任务：检查尚未完成的任务", prompt)
+            self.assertEqual(prompt, "")
+            self.assertFalse(manager.path.exists())
+
+    def test_only_running_self_upgrade_is_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); home = root / "HomeAgent"; home.mkdir()
+            manager = SelfUpgradeManager(root, home, {"self_upgrade": {}})
+            manager.begin("检查尚未完成的升级")
+            manager.set_self_upgrade(True)
+            prompt = manager.resume_prompt()
+            self.assertIn("原任务：检查尚未完成的升级", prompt)
             self.assertEqual(manager.read()["status"], "running")
 
     def test_legacy_running_restart_command_is_cleared_not_resumed(self) -> None:

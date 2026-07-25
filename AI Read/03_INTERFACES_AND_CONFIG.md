@@ -29,7 +29,7 @@
 ### `HomeAgent/config.yaml`
 
 - `home`：助理名、主人称呼、场景文件、上下文上限、是否自动播报。
-- `microphone`：采样率、声道、设备 ID、识别后自动发送、本地 STT 运行时路径。
+- `microphone`：期望采样率、声道、设备 ID、识别后自动发送、本地 STT 运行时路径。`sample_rate` 是首选值，不再强制要求设备原生支持；录音前通过 PortAudio 校验，失败时采用设备 `default_samplerate`，再由 ASR 输入链路重采样到 16 kHz。
 - `desktop_pet`：置顶、坐标、桌宠图标。
 - `stt`：模式支持 `sound_mcp`、`mimo`、通用 `api` 与本地识别；MiMo 模式读取根 `mimo_multimodal` 配置。
 - `agent`：`max_tool_rounds` 表示失败轮次预算（当前 28），成功工具轮不计入；`max_tool_iterations` 是独立总迭代资源上限（当前 112）；另含模型工具循环、角色图片 Skill 和 Skill 根目录。
@@ -135,7 +135,7 @@ GUI 关闭时 HomeAgent 不应在 LLM 工具列表暴露不可用的视觉能力
 ## sound-asr MCP（127.0.0.1:8766/mcp）
 
 - `transcribe_file(path, language="auto")`：`auto/zh/en/ja/ko/yue`，只返回清洗后的纯文本。
-- `record_and_transcribe(duration=5.0, language="auto")`：麦克风录音并转写。
+- `record_and_transcribe(duration=5.0, language="auto")`：协商输入设备支持的采样率后录音，WAV 按真实采样率封装，再重采样并转写。
 
 ## 跨进程服务发现小结
 

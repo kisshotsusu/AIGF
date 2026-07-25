@@ -172,6 +172,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `_normalize_tool_result` 只统一 `status/tool/evidence` 等事实字段，不生成 `next_action`。快捷键、Shell 和界面工具不读取当前业务任务类型来阻止或替换模型指定的操作。
 - `HomeAgent._maybe_remember_home` 与直播助手 `_maybe_remember` 在模型不可用时默认不写长期记忆；不得用关键词、消息长度或固定类别词表替代模型的记忆价值判断。
 - `ChatWorker.__init__` 必须保持轻量，不能调用 `HomeAgent.begin_task(prompt)`；该调用会经 `CodeEditorModule.begin_tracking()` 扫描工程文件，必须在 `ChatWorker.run()` 的工作线程中执行，避免点击发送后冻结 Qt 事件循环。
+- `resolve_input_settings(sd, device, requested_rate, requested_channels, dtype)`：依次验证首选采样率、设备默认采样率和常见采样率；配置设备不可用时再验证系统默认输入。Qt、Tk 和 Sound MCP 必须用返回的真实 `sample_rate/channels` 创建流并写 WAV，禁止仍用配置中的 16 kHz 伪造 WAV 头。
 - 工具返回至少包含 `status/ok` 与真实结果；涉及状态的工具还要包含对象标识、提交/观察/完成时间和序号。任何分析文本都必须与其 `screenshot_captured_at/observed_at` 绑定。
 - 后续操作发生后，旧视觉证据由通用时间规则淘汰。禁止针对网易云、B站或某个按钮手写“标题变化才成功”“固定第一个候选”“固定坐标”等完成条件。
 - 模型负责消费工具结果并决定下一步；本地循环只能处理工具协议、取消、异常、证据时序与最大资源边界，不能替模型插入业务动作。

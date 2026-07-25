@@ -16,6 +16,7 @@ from PySide6.QtCore import QMimeData, QPoint, QRect, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QScrollArea, QWidget
 from qt_app import ChatWorker, ClipboardImageSaveWorker, ClipboardImageTextEdit, HomeAgentWindow
+from home_modules.audio_capture import resolve_input_settings
 
 
 class InputQueueTests(unittest.TestCase):
@@ -182,6 +183,39 @@ class InputQueueTests(unittest.TestCase):
         worker = ChatWorker(agent, "检查代码", Mock(), Mock())
         agent.begin_task.assert_not_called()
         worker.deleteLater()
+
+    def test_microphone_uses_native_rate_when_device_rejects_16khz(self):
+        sound = Mock()
+        sound.query_devices.return_value = {
+            "name": "WASAPI microphone", "max_input_channels": 2,
+            "default_samplerate": 48000.0,
+        }
+        sound.check_input_settings.side_effect = lambda **kwargs: (
+            None if kwargs["samplerate"] == 48000
+            else (_ for _ in ()).throw(RuntimeError("Invalid sample rate"))
+        )
+        capture = resolve_input_settings(
+            sound, device=21, requested_rate=16000, requested_channels=1,
+        )
+        self.assertEqual(capture["device"], 21)
+        self.assertEqual(capture["sample_rate"], 48000)
+        self.assertTrue(capture["used_native_rate"])
+
+    def test_microphone_falls_back_to_default_input_if_configured_device_is_stale(self):
+        sound = Mock()
+        sound.query_devices.side_effect = [
+            RuntimeError("invalid device"),
+            {"name": "Default microphone", "max_input_channels": 1, "default_samplerate": 44100.0},
+        ]
+        sound.check_input_settings.side_effect = lambda **kwargs: (
+            None if kwargs["samplerate"] == 44100
+            else (_ for _ in ()).throw(RuntimeError("Invalid sample rate"))
+        )
+        capture = resolve_input_settings(
+            sound, device=99, requested_rate=16000, requested_channels=1,
+        )
+        self.assertIsNone(capture["device"])
+        self.assertEqual(capture["sample_rate"], 44100)
 
     @patch("qt_app.QTimer.singleShot", side_effect=lambda _delay, callback: callback())
     def test_finished_task_starts_next_queued_item(self, _single_shot):

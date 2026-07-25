@@ -41,6 +41,7 @@
 - `HomeAgent/home_modules/code_editor.py` 与 `self_upgrade.py` 共同保证自升级意图识别、真实变更要求、文档同步、语法校验和重启门禁；空变更不能完成自升级。
 - `HomeAgent/home_modules/code_editor.py`：隔离的代码工程模块，负责自身/独立项目识别、工程合同、文件追踪、Python/YAML/JSON/Node/TypeScript/静态网页校验和自主测试。
 - `HomeAgent/home_modules/mimo_multimodal.py`：MiMo 图片理解、WAV/MP3 语音识别和基于工具证据的任务完成独立核验。
+- `HomeAgent/home_modules/audio_capture.py`：校验麦克风设备与采样率；配置采样率不可用时选择设备原生采样率，设备 ID 失效时回退系统默认输入。
 - `HomeAgent/agent.py::proactive_screen_care`：临时截取主屏幕、用 MiMo 生成隐私安全的简短关怀语、按配置播报并保证截图清理。
 - `HomeAgent/home_modules/command_executor.py`：执行模型规划后的 PowerShell/CMD 命令，统一工作目录、超时、输出和失败状态。
 - `CharacterManager/service.py`：UI 无关的数据接口、原子保存、配置文档拆分和未知字段保留。

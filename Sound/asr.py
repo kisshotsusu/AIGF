@@ -136,11 +136,17 @@ def transcribe_file(path_or_bytes, language: str = "auto"):
 def record_and_transcribe(duration: float = 5.0, language: str = "auto", sr: int = SR):
     """录音 duration 秒并转写。返回 {raw, text, language}。"""
     import sounddevice as sd
+    from HomeAgent.home_modules.audio_capture import resolve_input_settings
 
     print(f"[asr] recording {duration}s ...", flush=True)
-    sd.default.samplerate = sr
-    sd.default.channels = 1
-    audio = sd.rec(int(duration * sr), samplerate=sr, channels=1, dtype="float32")
+    capture = resolve_input_settings(
+        sd, device=None, requested_rate=sr, requested_channels=1, dtype="float32",
+    )
+    capture_rate = int(capture["sample_rate"])
+    audio = sd.rec(
+        int(duration * capture_rate), device=capture["device"],
+        samplerate=capture_rate, channels=capture["channels"], dtype="float32",
+    )
     sd.wait()
     # float32 -> int16 wav 字节
     pcm = (audio.flatten() * 32767).clip(-32768, 32767).astype("<i2").tobytes()
@@ -148,7 +154,7 @@ def record_and_transcribe(duration: float = 5.0, language: str = "auto", sr: int
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(sr)
+        wf.setframerate(capture_rate)
         wf.writeframes(pcm)
     return transcribe_file(buf.getvalue(), language=language)
 

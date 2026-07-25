@@ -29,6 +29,7 @@ from agent import HOME_AGENT, ROOT, HomeAgent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from modules.live.ai_live_assistant.instance_lock import InstanceLock
+from home_modules.audio_capture import resolve_input_settings
 from home_modules.system_startup import AUTOSTART_ARGUMENT, run_network_guard, set_windows_autostart
 
 
@@ -66,9 +67,14 @@ class WakeWordListener(QThread):
         """Main listener loop."""
         self.running = True
         cfg = self.agent.config.get("microphone", {})
-        device_id = cfg.get("device_id")
-        self.sample_rate = cfg.get("sample_rate", 16000)
-        self.channels = cfg.get("channels", 1)
+        capture = resolve_input_settings(
+            sd, device=cfg.get("device_id"),
+            requested_rate=cfg.get("sample_rate", 16000),
+            requested_channels=cfg.get("channels", 1),
+        )
+        device_id = capture["device"]
+        self.sample_rate = capture["sample_rate"]
+        self.channels = capture["channels"]
         
         # Buffer to hold recent audio
         max_frames = int(self.buffer_duration * self.sample_rate / 1024)
@@ -92,7 +98,7 @@ class WakeWordListener(QThread):
                 blocksize=1024
             )
             self.stream.start()
-            self.agent.log_event("wake_listener_started", device=device_id)
+            self.agent.log_event("wake_listener_started", device=device_id, sample_rate=self.sample_rate, device_name=capture["device_name"])
             
             while self.running:
                 time.sleep(0.1)  # Check every 100ms
@@ -989,15 +995,30 @@ class HomeAgentWindow(QMainWindow):
     def toggle_record(self): self.stop_record() if self.recording else self.start_record()
     def start_record(self):
         try:
-            cfg = self.agent.config.get("microphone", {}); self.frames = []; self.stream = sd.InputStream(device=cfg.get("device_id"), samplerate=cfg.get("sample_rate", 16000), channels=cfg.get("channels", 1), dtype="int16", callback=lambda data, *_: self.frames.append(data.copy())); self.stream.start(); self.recording = True; self.voice_btn.setText("停止并识别"); self.set_status("正在录音…")
+            cfg = self.agent.config.get("microphone", {})
+            capture = resolve_input_settings(
+                sd, device=cfg.get("device_id"),
+                requested_rate=cfg.get("sample_rate", 16000),
+                requested_channels=cfg.get("channels", 1),
+            )
+            self.frames = []
+            self.recording_sample_rate = capture["sample_rate"]
+            self.recording_channels = capture["channels"]
+            self.stream = sd.InputStream(
+                device=capture["device"], samplerate=self.recording_sample_rate,
+                channels=self.recording_channels, dtype="int16",
+                callback=lambda data, *_: self.frames.append(data.copy()),
+            )
+            self.stream.start(); self.recording = True; self.voice_btn.setText("停止并识别"); self.set_status("正在录音…")
+            self.agent.log_event("microphone_recording_started", device=capture["device"], device_name=capture["device_name"], requested_sample_rate=capture["requested_sample_rate"], sample_rate=self.recording_sample_rate)
         except Exception as exc: QMessageBox.critical(self, "录音启动失败", str(exc))
 
     def stop_record(self):
         if self.stream: self.stream.stop(); self.stream.close(); self.stream = None
         self.recording = False; self.voice_btn.setText("语音")
         if not self.frames: self.set_status("没有录到声音"); return
-        data = np.concatenate(self.frames, axis=0); cfg = self.agent.config.get("microphone", {}); folder = HOME_AGENT / "recordings"; folder.mkdir(parents=True, exist_ok=True); path = folder / f"voice_{datetime.now():%Y%m%d_%H%M%S}.wav"
-        with wave.open(str(path), "wb") as handle: handle.setnchannels(cfg.get("channels", 1)); handle.setsampwidth(2); handle.setframerate(cfg.get("sample_rate", 16000)); handle.writeframes(data.tobytes())
+        data = np.concatenate(self.frames, axis=0); folder = HOME_AGENT / "recordings"; folder.mkdir(parents=True, exist_ok=True); path = folder / f"voice_{datetime.now():%Y%m%d_%H%M%S}.wav"
+        with wave.open(str(path), "wb") as handle: handle.setnchannels(getattr(self, "recording_channels", 1)); handle.setsampwidth(2); handle.setframerate(getattr(self, "recording_sample_rate", 16000)); handle.writeframes(data.tobytes())
         self.set_status("正在识别语音…")
         def work():
             try: self.bridge.transcription.emit(asyncio.run(self.agent.transcribe(path)))

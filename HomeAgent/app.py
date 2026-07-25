@@ -17,6 +17,7 @@ import sounddevice as sd
 import yaml
 
 from agent import HomeAgent, ROOT, HOME_AGENT
+from home_modules.audio_capture import resolve_input_settings
 
 
 class DesktopPet:
@@ -332,8 +333,15 @@ class DesktopPet:
             return messagebox.showerror("没有麦克风", "未检测到可用的语音输入设备。")
         cfg = self.agent.config["microphone"]
         try:
+            capture = resolve_input_settings(
+                sd, device=device_id,
+                requested_rate=cfg.get("sample_rate", 16000),
+                requested_channels=cfg.get("channels", 1),
+            )
             self.frames = []
-            self.stream = sd.InputStream(device=device_id, samplerate=cfg.get("sample_rate", 16000), channels=cfg.get("channels", 1), dtype="int16", callback=lambda data, *_: self.frames.append(data.copy()))
+            self.recording_sample_rate = capture["sample_rate"]
+            self.recording_channels = capture["channels"]
+            self.stream = sd.InputStream(device=capture["device"], samplerate=self.recording_sample_rate, channels=self.recording_channels, dtype="int16", callback=lambda data, *_: self.frames.append(data.copy()))
             self.stream.start(); self.recording = True
             self.record_btn.configure(text="■ 停止并识别"); self.set_status("正在录音…")
         except Exception as exc:
@@ -347,9 +355,8 @@ class DesktopPet:
             return self.set_status("没有录到声音")
         data = np.concatenate(self.frames, axis=0)
         path = HOME_AGENT / "recordings" / f"voice_{datetime.now():%Y%m%d_%H%M%S}.wav"
-        cfg = self.agent.config["microphone"]
         with wave.open(str(path), "wb") as f:
-            f.setnchannels(cfg.get("channels", 1)); f.setsampwidth(2); f.setframerate(cfg.get("sample_rate", 16000)); f.writeframes(data.tobytes())
+            f.setnchannels(getattr(self, "recording_channels", 1)); f.setsampwidth(2); f.setframerate(getattr(self, "recording_sample_rate", 16000)); f.writeframes(data.tobytes())
         self.set_status("正在识别语音…")
         threading.Thread(target=self._stt_worker, args=(path,), daemon=True).start()
 

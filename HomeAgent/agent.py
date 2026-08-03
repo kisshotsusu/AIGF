@@ -539,11 +539,26 @@ class HomeAgent:
         return json.dumps(rows, ensure_ascii=False)
 
     @staticmethod
-    def _image_message_content(text: str, image_paths) -> list[dict[str, Any]]:
-        """Build one ephemeral MiMo message containing all pasted images."""
+    @staticmethod
+    def _image_message_content(text: str, image_paths, support_multimodal: bool = True) -> list[dict[str, Any]]:
+        """Build one ephemeral message containing all pasted images.
+        
+        If support_multimodal is False, returns text-only content with image filenames.
+        """
         values = [image_paths] if isinstance(image_paths, (str, Path)) else list(image_paths or [])
         if not values:
             raise ValueError("没有可提交的图片")
+        
+        # 如果不支持多模态，只返回文本描述
+        if not support_multimodal:
+            image_names = [Path(v).name for v in values]
+            prompt = str(text or "").strip()
+            if not prompt:
+                prompt = f"[用户发送了 {len(values)} 张图片：{', '.join(image_names)}，但当前模型不支持图片识别，请用文字描述图片内容。]"
+            else:
+                prompt = f"[用户发送了 {len(values)} 张图片：{', '.join(image_names)}] {prompt}"
+            return [{"type": "text", "text": prompt}]
+        
         content: list[dict[str, Any]] = []
         total_encoded = 0
         for value in values:
@@ -563,6 +578,31 @@ class HomeAgent:
         prompt = str(text or "").strip() or ("请分析这些图片。" if len(values) > 1 else "请分析这张图片。")
         content.append({"type": "text", "text": prompt})
         return content
+
+    @staticmethod
+    def _provider_supports_images(provider: dict[str, Any]) -> bool:
+        """当前 LLM 供应商能否直接接收图片消息。
+
+        MiMo 或显式声明 supports_images 的供应商可直接发送 image_url；
+        DeepSeek 官方 API（deepseek-chat）是纯文本模型，图片必须先经视觉代理
+        转成文字描述（见 MiMoMultimodalClient.describe_images_for_chat）。
+        """
+        if provider.get("supports_images") is True:
+            return True
+        return "xiaomimimo" in str(provider.get("base_url", "")).lower() or str(provider.get("model", "")).lower().startswith("mimo-")
+
+    async def _text_only_image_message(self, text: str, image_paths) -> list[dict[str, Any]]:
+        """为 DeepSeek 等纯文本模型把图片转成文字描述消息。
+
+        视觉代理失败时退化为只列出文件名的文本消息，避免整轮对话失败。
+        """
+        try:
+            timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                return await self.mimo_multimodal.describe_images_for_chat(session, image_paths, text)
+        except Exception as exc:
+            self.log_event("image_vision_proxy_failed", error=str(exc)[:300])
+            return self._image_message_content(text, image_paths, support_multimodal=False)
 
     @staticmethod
     def _favorite_folder_key(value: str) -> str:
@@ -1632,7 +1672,7 @@ class HomeAgent:
             {"type": "function", "function": {"name": "clear_live_context", "description": "清空直播短期模型上下文；不删除审计日志和长期记忆，返回清理数量。", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "list_character_images", "description": "列出角色形象库、主形象以及每张图片的规范绝对路径和元数据。", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "generate_character_image", "description": "调用 ai-live-character-image 技能生成或编辑角色形象", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "operation": {"type": "string", "enum": ["generate", "edit"]}, "reference": {"type": "string", "description": "编辑时使用 primary 或图片路径"}, "label": {"type": "string"}, "tags": {"type": "string"}, "set_primary": {"type": "boolean"}}, "required": ["prompt"]}}},
-            {"type": "function", "function": {"name": "analyze_image", "description": "使用 MiMo 多模态 API 理解图片内容、识别画面细节或文字；不用于生成图片。已登记角色图可传 primary、图片ID、文件名、标签或 list_character_images 返回的绝对路径。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片绝对路径；已登记角色图也可用 primary、ID、文件名或标签"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
+            {"type": "function", "function": {"name": "analyze_image", "description": "理解图片内容、识别画面细节或文字（按配置优先 DeepSeek 视觉代理，失败自动回退 MiMo）；不用于生成图片。已登记角色图可传 primary、图片ID、文件名、标签或 list_character_images 返回的绝对路径。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片绝对路径；已登记角色图也可用 primary、ID、文件名或标签"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
             {"type": "function", "function": {"name": "mimo_transcribe_audio", "description": "使用 MiMo API 识别项目内 WAV 或 MP3 语音文件", "parameters": {"type": "object", "properties": {"audio": {"type": "string", "description": "项目内音频路径"}, "language": {"type": "string", "enum": ["auto", "zh", "en"]}}, "required": ["audio"]}}},
             {"type": "function", "function": {"name": "sing_song", "description": "使用角色当前本地 TTS/SVC 音色朗读最多十行给定歌词，并返回生成和播放结果。", "parameters": {"type": "object", "properties": {"song": {"type": "string", "description": "歌曲名称或演唱主题"}, "lyrics": {"type": "string", "description": "最多十行需要朗读的歌词或测试文本"}, "style": {"type": "string", "description": "演唱或朗读情绪"}, "voice": {"type": "string", "description": "仅备用 MiMo 分支使用"}}, "required": ["song", "lyrics"]}}},
             {"type": "function", "function": {"name": "create_scheduled_task", "description": "创建TTS语音提醒或闹钟。一次性任务成功执行后自动删除；重复任务会保留并等待下一次。必须根据当前本地时间解析用户的自然语言时间。", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "message": {"type": "string", "description": "触发时由TTS播放的文本"}, "recurrence": {"type": "string", "enum": ["once", "daily", "weekdays", "weekly"]}, "scheduled_at": {"type": "string", "description": "仅once使用，本地ISO时间，如2026-07-17T15:00"}, "time": {"type": "string", "description": "重复任务使用的24小时HH:MM"}, "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 7}, "description": "仅weekly使用，周一为1、周日为7"}, "action": {"type": "string", "enum": ["tts"]}}, "required": ["title", "message", "recurrence"]}}},
@@ -1909,7 +1949,7 @@ class HomeAgent:
             
             timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                result = await self.mimo_multimodal.analyze_image(session, screenshot, prompt)
+                result = await self.mimo_multimodal.analyze_image_auto(session, screenshot, prompt)
                 answer = re.sub(r"\s+", " ", str(result.get("text") or "")).strip().strip('\'"\'"')
                 
                 if not answer:
@@ -2044,7 +2084,10 @@ class HomeAgent:
         if image_paths:
             for message_index in range(len(messages) - 1, 0, -1):
                 if messages[message_index].get("role") == "user":
-                    messages[message_index] = {**messages[message_index], "content": self._image_message_content(text, image_paths)}
+                    if self._provider_supports_images(provider):
+                        messages[message_index] = {**messages[message_index], "content": self._image_message_content(text, image_paths, support_multimodal=True)}
+                    else:
+                        messages[message_index] = {**messages[message_index], "content": await self._text_only_image_message(text, image_paths)}
                     break
         url = provider["base_url"].rstrip("/") + "/chat/completions"
         timeout = aiohttp.ClientTimeout(total=llm_cfg.get("timeout_seconds", 45))
@@ -2535,7 +2578,7 @@ class HomeAgent:
             try:
                 timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    return await self.mimo_multimodal.analyze_image(session, path, str(args.get("prompt") or "请描述图片内容"))
+                    return await self.mimo_multimodal.analyze_image_auto(session, path, str(args.get("prompt") or "请描述图片内容"))
             except Exception as exc:
                 return {"status": "failed", "error": str(exc)}
         if name == "mimo_transcribe_audio":

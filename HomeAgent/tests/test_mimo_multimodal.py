@@ -281,5 +281,86 @@ class MiMoMultimodalTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         agent.analyze_current_screen.assert_awaited_once_with("读取题干和四个选项，计算后给出答案及依据")
 
+    def test_auth_value_adds_bearer_for_authorization(self):
+        self.assertEqual(MiMoMultimodalClient._auth_value("Authorization", "sk-abc"), "Bearer sk-abc")
+        self.assertEqual(MiMoMultimodalClient._auth_value("Authorization", "Bearer sk-abc"), "Bearer sk-abc")
+        self.assertEqual(MiMoMultimodalClient._auth_value("api-key", "secret"), "secret")
+
+    def test_provider_supports_images_detection(self):
+        self.assertFalse(HomeAgent._provider_supports_images({"base_url": "https://api.deepseek.com", "model": "deepseek-chat"}))
+        self.assertTrue(HomeAgent._provider_supports_images({"base_url": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.5"}))
+        self.assertTrue(HomeAgent._provider_supports_images({"base_url": "https://api.example.com/v1", "model": "gpt-4o", "supports_images": True}))
+        self.assertFalse(HomeAgent._provider_supports_images({"base_url": "https://api.example.com/v1", "model": "gpt-4o"}))
+
+    async def test_deepseek_image_uses_vision_proxy_then_deepseek_reasoning(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MIMO_API_KEY": "hidden", "DEEPSEEK_API_KEY": "hidden-deepseek"}):
+            image = Path(directory) / "scene.png"; image.write_bytes(b"png")
+            client = MiMoMultimodalClient({"deepseek_image_enabled": True})
+            captured = {}
+
+            async def fake_post(session, payload, base_url=None, api_key_env=None, auth_header="api-key"):
+                captured.update({"payload": payload, "auth_header": auth_header, "base_url": base_url})
+                if auth_header == "Authorization":
+                    return "画面里有台灯和显示器，正在播放演示文稿。"
+                return "描述：室内有一盏台灯、一台显示器，屏幕显示幻灯片。"
+
+            client._post = fake_post
+            result = await client.analyze_image_with_deepseek(Session(), image, "图中有什么？")
+            self.assertEqual(result["provider"], "deepseek")
+            self.assertEqual(result["vision_model"], "mimo-v2.5")
+            self.assertEqual(result["model"], "deepseek-chat")
+            self.assertIn("正在播放演示文稿", result["text"])
+            self.assertIn("幻灯片", result["description"])
+            payload = captured["payload"]
+            self.assertEqual(payload["model"], "deepseek-chat")
+            self.assertIsInstance(payload["messages"][0]["content"], str)
+            self.assertIn("幻灯片", payload["messages"][0]["content"])
+            self.assertIn("图中有什么？", payload["messages"][0]["content"])
+            self.assertEqual(captured["auth_header"], "Authorization")
+
+    async def test_deepseek_image_auto_falls_back_to_mimo_when_deepseek_fails(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MIMO_API_KEY": "hidden", "DEEPSEEK_API_KEY": "hidden-deepseek"}):
+            image = Path(directory) / "screen.png"; image.write_bytes(b"png")
+            client = MiMoMultimodalClient({"deepseek_image_enabled": True, "image_enabled": True})
+
+            async def broken_proxy(session, path, prompt, proxy):
+                raise RuntimeError("视觉代理不可用")
+
+            client._describe_image_with_proxy = broken_proxy
+            session = Session()
+            result = await client.analyze_image_auto(session, image, "看什么")
+            self.assertEqual(result["provider"], "mimo")
+            self.assertEqual(result["text"], "识别结果")
+            self.assertEqual(session.payload["model"], "mimo-v2.5")
+
+    async def test_describe_images_for_chat_returns_text_only_content(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MIMO_API_KEY": "hidden"}):
+            first = Path(directory) / "a.png"; first.write_bytes(b"a")
+            second = Path(directory) / "b.jpg"; second.write_bytes(b"b")
+            client = MiMoMultimodalClient()
+
+            async def fake_describe(session, path, prompt, proxy):
+                return f"描述{path.name}"
+
+            client._describe_image_with_proxy = fake_describe
+            content = await client.describe_images_for_chat(Session(), [first, second], "比较两张图")
+            self.assertEqual(len(content), 1)
+            self.assertEqual(content[0]["type"], "text")
+            self.assertIn("a.png", content[0]["text"])
+            self.assertIn("b.jpg", content[0]["text"])
+            self.assertIn("比较两张图", content[0]["text"])
+            self.assertNotIn("image_url", content[0]["text"])
+
+    async def test_text_only_image_message_falls_back_when_proxy_fails(self):
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.mimo_multimodal = MiMoMultimodalClient({"deepseek_image_proxy_enabled": False})
+        agent.log_event = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "clipboard.png"; image.write_bytes(b"png-data")
+            content = await agent._text_only_image_message("看看", image)
+            self.assertEqual(content[0]["type"], "text")
+            self.assertIn("clipboard.png", content[0]["text"])
+            agent.log_event.assert_called_once()
+
 
 if __name__ == "__main__": unittest.main()

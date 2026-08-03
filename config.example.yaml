@@ -45,6 +45,7 @@ llm:
       model: mimo-v2.5
       auth_header: api-key
       max_tokens_field: max_completion_tokens
+      supports_images: true
       extra_body:
         thinking:
           type: disabled
@@ -127,6 +128,21 @@ mimo_multimodal:
   timeout_seconds: 60
   max_completion_tokens: 1024
   fail_closed: true
+  # DeepSeek 图像识别：DeepSeek 官方 API 为纯文本模型，采用“视觉代理”方案。
+  # 未显式配置代理时复用上方 MiMo 图片模型；也可换成任意支持 image_url 的模型。
+  deepseek_image_enabled: true
+  deepseek_image_model: deepseek-chat
+  deepseek_image_base_url: https://api.deepseek.com
+  deepseek_image_api_key_env: DEEPSEEK_API_KEY
+  deepseek_image_proxy_enabled: true
+  deepseek_image_proxy_base_url: https://api.xiaomimimo.com/v1
+  deepseek_image_proxy_api_key_env: MIMO_API_KEY
+  deepseek_image_proxy_model: mimo-v2.5
+  deepseek_image_proxy_auth_header: api-key
+  deepseek_image_proxy_max_tokens_field: max_completion_tokens
+  deepseek_image_proxy_extra_body:
+    thinking:
+      type: disabled
 
 workspace:
   path: workspace

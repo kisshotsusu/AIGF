@@ -91,8 +91,17 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 
 ### `MiMoMultimodalClient`（`HomeAgent/home_modules/mimo_multimodal.py`）
 - `analyze_image(session, path, prompt)`：图片编码为 data URL，通过 `chat/completions` 的 `image_url` + `text` 内容调用 `mimo-v2.5`。
+- `analyze_image_auto(session, path, prompt)`：优先走 DeepSeek 视觉代理（`deepseek_image_enabled` 时），失败自动回退 MiMo；结果带 `provider`，全部失败抛出带各服务原因的 `RuntimeError`。
+- `analyze_image_with_deepseek(session, path, prompt)`：DeepSeek 官方 API 为纯文本模型，先经 `_describe_image_with_proxy` 用视觉代理（默认 MiMo，可配 `deepseek_image_proxy_*`）把图片转成文字描述，再把描述与问题交给 `deepseek-chat` 推理；返回 `{ok, text, model, vision_model, description, path, provider:"deepseek"}`。
+- `describe_images_for_chat(session, image_paths, user_text)`：把每张图片经视觉代理转成文字描述，返回 text-only 内容数组，供 DeepSeek 等纯文本聊天模型“看图”使用。
+- `_post` 对 `Authorization` 头自动加 `Bearer` 前缀；MiMo 的 `api-key` 头保持原样。
 - `transcribe_audio(session, path, language)`：只接受 WAV/MP3，Base64 后不超过 10 MB，通过 `input_audio` 和 `asr_options.language` 调用 `mimo-v2.5-asr`。
 - `verify_completion(session, task, plan, answer, evidence)`：要求模型只返回 `{passed, reason, next_action}`；核验依据是工具证据，默认接口异常关闭成功路径。请求固定 `thinking.type=disabled`、`stream=false`，不设置 `response_format`；空响应错误必须包含 `finish_reason`。
+
+### HomeAgent 图片消息与供应商能力
+- `HomeAgent._provider_supports_images(provider)`：判断供应商能否直接接收图片（MiMo 或显式 `supports_images: true`）；DeepSeek 官方 API 为纯文本模型，返回 `false`。
+- `chat` 带附件时：供应商支持图片则构造 `image_url + text` 消息；纯文本供应商（DeepSeek）调用 `_text_only_image_message`，经 `describe_images_for_chat` 把图片转成文字描述后提交，代理失败退化为只列文件名的文本消息（`image_vision_proxy_failed` 事件）。
+- `analyze_image` 工具与 `analyze_current_screen`（`ui_analyze_screen`）改用 `analyze_image_auto`，按配置优先 DeepSeek 并自动回退 MiMo；`proactive_screen_care` 仍固定使用 MiMo `analyze_image`。
 
 ### `CodeEditorModule` 变更与验证
 - 跟踪范围覆盖整个仓库中的源码、配置、README 与 `AI Read`，不再依赖固定模块目录清单。

@@ -59,11 +59,11 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         agent.config = {"computer_control": {"full_access": False, "allowed_roots": []}}
         agent.mimo_multimodal = SimpleNamespace(
             config={"timeout_seconds": 5},
-            analyze_image=AsyncMock(return_value={"status": "success", "text": "三视图"}),
+            analyze_image_auto=AsyncMock(return_value={"status": "success", "text": "三视图"}),
         )
         result = await agent._run_tool("analyze_image", {"image": "角色三视图.png", "prompt": "分析固定外观"})
         self.assertEqual(result["status"], "success")
-        used_path = agent.mimo_multimodal.analyze_image.await_args.args[1]
+        used_path = agent.mimo_multimodal.analyze_image_auto.await_args.args[1]
         self.assertTrue(used_path.is_absolute())
         self.assertEqual(used_path.name, "角色三视图.png")
 

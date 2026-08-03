@@ -12,7 +12,7 @@
 - `bilibili`：Cookie 环境变量名、欢迎、频率和长度。
 - `reply`：触发模式、名称/前缀、冷却、上下文和回复长度。
 - `gift_reply`：礼物回复开关、冷却、最低币值与模板。
-- `llm`：供应商、超时，以及 `live`/`home`/`memory` 场景各自的温度与 token；`providers` 中 `deepseek`/`mimo`/`custom` 的 URL、模型与密钥环境变量。MiMo 额外使用 `auth_header: api-key`、`max_tokens_field: max_completion_tokens` 与 `extra_body.thinking.type: disabled`。
+- `llm`：供应商、超时，以及 `live`/`home`/`memory` 场景各自的温度与 token；`providers` 中 `deepseek`/`mimo`/`custom` 的 URL、模型与密钥环境变量。MiMo 额外使用 `auth_header: api-key`、`max_tokens_field: max_completion_tokens`、`supports_images: true` 与 `extra_body.thinking.type: disabled`；`supports_images` 表示该供应商可直接接收图片，DeepSeek 官方 API 为纯文本模型，不声明该字段。
 - `tts`：9879 URL、健康接口、启动批处理、请求模板、音频响应、播放、健康超时和重试策略（重试 4 次、指数退避、上限 15 秒）。
 - `singing`：唱歌模式（`local_tts` 朗读歌词，MiMo `mimo-v2.5-tts` 为关闭的备用分支）、男女声预设。
 - `memory_write`：重要度判断、每日上限、强制/忽略关键词。
@@ -21,7 +21,7 @@
   - 千问预设使用 `dashscope_multimodal`、`qwen-image-2.0-pro`、`DASHSCOPE_API_KEY` 和 `2048*2048`；Base URL 必须把 `{WorkspaceId}` 换成所属地域的百炼工作空间 ID。
   - Grok 预设使用 `xai_images`、`https://api.x.ai/v1`、`grok-imagine-image-quality` 与 `XAI_API_KEY`，调用 `/images/generations` 或 `/images/edits`，不会发送通用 `size` 字段。
   - 自定义模式继续支持 `images` 与 `chat_multimodal`，并保留配置中 UI 未识别的 `extra_body` 等供应商参数。
-- `mimo_multimodal`：统一 MiMo 多模态配置，包括总开关、Base URL、密钥环境变量、图片模型、ASR 模型/语言、完成检查模型、失败重试、超时和 `fail_closed`。当前图片模型 `mimo-v2.5`，语音模型 `mimo-v2.5-asr`，完成检查默认启用并重试 2 次。
+- `mimo_multimodal`：统一 MiMo 多模态配置，包括总开关、Base URL、密钥环境变量、图片模型、ASR 模型/语言、完成检查模型、失败重试、超时和 `fail_closed`。当前图片模型 `mimo-v2.5`，语音模型 `mimo-v2.5-asr`，完成检查默认启用并重试 2 次。另含 DeepSeek 图像识别（`deepseek_image_*`）：DeepSeek 官方 API 为纯文本模型，采用官方推荐的“视觉代理”方案——先用 `deepseek_image_proxy_*` 指定的视觉模型（默认 MiMo `mimo-v2.5`）把图片转成文字描述，再交给 `deepseek-chat` 推理；`analyze_image` 工具与屏幕分析按 `deepseek_image_enabled` 优先走 DeepSeek，失败自动回退 MiMo。
 - `workspace`：人格、身份、记忆和图片相对路径。
 
 > 注意：直播管理后台的 `PUT /api/config` 与 `PUT /api/secrets` 已在服务端保护 `llm`/`tts`/`image_generation`/`memory_write`/`workspace` 以及除 `BILIBILI_COOKIE` 外的所有密钥——这些项已迁移到角色工作台（见下）。直播网页即使长时间未刷新，也不能用旧值覆盖它们。

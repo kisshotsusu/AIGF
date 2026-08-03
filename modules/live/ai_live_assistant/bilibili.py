@@ -98,7 +98,14 @@ class BilibiliLive:
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     try:
                         async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.BINARY:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    payload = json.loads(msg.data)
+                                    if isinstance(payload, dict) and payload.get("cmd"):
+                                        yield payload
+                                except json.JSONDecodeError:
+                                    pass
+                            elif msg.type == aiohttp.WSMsgType.BINARY:
                                 for event in unpack_packets(msg.data): yield event
                             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED): break
                     finally: heartbeat.cancel()

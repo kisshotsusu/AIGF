@@ -125,6 +125,7 @@ class LiveAssistant:
             user = str(data.get("uname") or data.get("username") or base.get("name") or data.get("copy_writing") or "新朋友")
             user = re.sub(r"<[^>]+>", "", user).strip()
             uid = str(data.get("uid") or uinfo.get("uid") or user)
+            self.log.info("收到进场事件: user=%s uid=%s cmd=%s", user, uid, cmd)
             if self.cfg["bilibili"].get("welcome_enabled", True):
                 self._record_message("welcome", user, "", status="received", uid=uid, command=cmd)
                 self._start_background_task(self._welcome(uid, user))

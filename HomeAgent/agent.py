@@ -117,6 +117,8 @@ from task_manager import TaskStore
 from self_upgrade import SelfUpgradeManager
 from home_modules.command_executor import CommandExecutor
 from home_modules.mimo_multimodal import MiMoMultimodalClient
+from home_modules.comfyui_client import ComfyUIClient
+from home_modules.cosyvoice_tts import CosyVoiceTTS
 
 
 class HomeAgent:
@@ -143,6 +145,12 @@ class HomeAgent:
         self.self_upgrade = SelfUpgradeManager(ROOT, HOME_AGENT, self.config)
         self.command_executor = CommandExecutor(ROOT)
         self.mimo_multimodal = MiMoMultimodalClient(self.project.get("mimo_multimodal", {}))
+        comfy_cfg = dict(self.project.get("comfyui", {}) or {})
+        comfy_cfg.setdefault("project_root", str(ROOT))
+        self.comfyui = ComfyUIClient(comfy_cfg)
+        cosy_cfg = dict(self.project.get("cosyvoice", {}) or {})
+        cosy_cfg.setdefault("project_root", str(ROOT))
+        self.cosyvoice = CosyVoiceTTS(cosy_cfg)
         self.restart_requested = False
         self.current_task_resumed = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
@@ -690,6 +698,8 @@ class HomeAgent:
                 "必须判定implementation_change=false、domain=file、execution_strategy=tool_loop；持久写入文件本身不等于修改程序实现。"
                 "例如“读取你自己的角色三视图，并完善固定外观文档”应先列出已登记角色图片，使用清单返回的绝对路径分析三视图，"
                 "再读取、写入并重新读取CHARACTER.md；不得进入code_loop或调用code_validate_project。"
+                "涉及已有角色形象/设定图（primary、角色三视图、正面照片等）的绘图任务：优先 comfy_edit_image 以设定图为底修改姿势，"
+                "再用改好姿势的结果修改背景；禁止用 comfy_generate_image 凭空重新生成导致角色细节丢失，只有没有现成角色图时才允许文生图。"
                 "调用现有维护能力清理数据不等于修改程序实现。例如“清理直播消息/直播上下文”必须为"
                 "implementation_change=false、domain=memory、execution_strategy=tool_loop，并调用clear_live_context；"
                 "若用户否定清理或只询问功能原理，则actionable=false且不得调用该工具。"
@@ -730,7 +740,8 @@ class HomeAgent:
                 "needs_clarification, clarification_question, final_action_requires_verification(是否要求播放/提交等终态), "
                 "success_criteria, confidence(0到1), reasoning_short。工具可从ui_analyze_screen/ui_inspect_target/web_read/web_fill/web_click_text/"
                 "ui_list_windows/ui_activate_window/ui_analyze_window/ui_click_window/ui_double_click_window/ui_type_window/ui_hotkey/ui_type_active_text/"
-                "launch_app/media_stop/clear_live_context/list_character_images/analyze_image/read_text_file/write_text_file/code_tools中选择，不要发明工具。\n"
+                "launch_app/media_stop/clear_live_context/list_character_images/analyze_image/comfy_status/comfy_list_models/"
+                "comfy_generate_image/comfy_edit_image/comfy_generate_video/read_text_file/write_text_file/code_tools中选择，不要发明工具。\n"
                 f"最近上下文：{context[-1200:]}\n当前请求：{text}"
             )
             timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
@@ -864,6 +875,18 @@ class HomeAgent:
             return "发送所需快捷键"
         if name == "launch_app":
             return f"应用：{cls._activity_text(args.get('app') or args.get('name'), 54)}"
+        if name == "comfy_generate_image":
+            return f"生成图像：{cls._activity_text(args.get('prompt'), 64)}"
+        if name == "comfy_edit_image":
+            return f"编辑图像：{cls._activity_text(args.get('prompt'), 64)}"
+        if name == "comfy_generate_video":
+            return f"生成视频：{cls._activity_text(args.get('prompt'), 64)}"
+        if name in {"comfy_status", "comfy_list_models"}:
+            return "检查 ComfyUI 服务与模型"
+        if name == "cosyvoice_speak":
+            return f"情绪语音：{cls._activity_text(args.get('text'), 64)}"
+        if name == "cosyvoice_references":
+            return "列出 CosyVoice2 参考音色"
         if name in {"read_text_file", "write_text_file", "code_read_file", "code_write_file", "code_replace_text"}:
             path = args.get("path") or args.get("file_path")
             return f"文件：{cls._activity_text(path, 76)}" if path else "处理目标文件"
@@ -902,6 +925,16 @@ class HomeAgent:
             return f"定位到 {count} 项相关内容" if count is not None else "已定位相关内容"
         if name == "code_validate_project":
             return "项目检查和相关测试已通过" if result.get("ok", True) else "验证完成"
+        if name.startswith("comfy_") and isinstance(result, dict):
+            media = result.get("media")
+            if isinstance(media, list) and media:
+                kinds = "、".join(sorted({str(item.get("kind")) for item in media if isinstance(item, dict)}))
+                return f"已生成 {len(media)} 个媒体文件（{kinds}）"
+            return str(result.get("message") or "ComfyUI 生成完成")
+        if name == "cosyvoice_speak" and isinstance(result, dict):
+            return str(result.get("message") or "语音合成完成")
+        if name == "cosyvoice_references" and isinstance(result, dict):
+            return f"可用音色 {int(result.get('count') or 0)} 个"
         if name.startswith("code_") or name in {"read_text_file", "write_text_file"}:
             return "文件处理完成"
         return cls._activity_text(result.get("next_action") or result.get("message") or "执行完成", 96)
@@ -914,6 +947,9 @@ class HomeAgent:
             "ui_click_window": "点击界面目标", "ui_double_click_window": "双击界面目标",
             "ui_type_active_text": "输入文字", "ui_hotkey": "执行快捷键",
             "launch_app": "启动应用", "read_text_file": "读取文件", "write_text_file": "写入文件",
+            "comfy_status": "检查生成服务", "comfy_list_models": "查看生成模型",
+            "comfy_generate_image": "生成图像", "comfy_edit_image": "编辑图像", "comfy_generate_video": "生成视频",
+            "cosyvoice_references": "查看情绪语音音色", "cosyvoice_speak": "情绪语音合成",
             "code_read_file": "读取代码", "code_search_text": "搜索代码",
             "code_replace_text": "修改代码", "code_write_file": "写入代码",
             "code_validate_project": "验证代码和测试", "media_stop": "停止媒体",
@@ -1629,6 +1665,7 @@ class HomeAgent:
             return {"error": f"Codex 调用了 MCP，但没有调用指定的 {preferred_mcp}。", "answer": answer, "mcp_calls": mcp_calls, "event_count": len(events)}
         code_validation = None
         autonomous_tests = None
+        repo_check = None
         if code_task:
             code_validation = self.self_upgrade.validate_current_changes(require_changes=True)
             self.log_event("code_validation", self_edit=self_code_task, result=code_validation)
@@ -1640,6 +1677,16 @@ class HomeAgent:
                     self.log_event("code_repair_retry", stage="validation", round=code_retry_round + 1, failure=failure)
                     return await self._run_codex_task(task, require_mcp, status, preferred_mcp, plan, failure, code_retry_round + 1)
                 return {"error": f"代码任务未通过本地校验：{code_validation.get('error', 'unknown error')}", "answer": answer, "validation": code_validation, "event_count": len(events)}
+            repo_check = await asyncio.to_thread(self.self_upgrade.code_editor.git_diff_check)
+            self.log_event("code_repo_check", result=repo_check)
+            if not repo_check.get("ok"):
+                max_repairs = max(0, min(4, int(self.config.get("agent", {}).get("code_test_retry_rounds", 2))))
+                if code_retry_round < max_repairs:
+                    failure = f"git diff --check 未通过：{str(repo_check.get('output') or repo_check.get('error') or 'unknown')[-800:]}"
+                    if status: status(f"代码静态检查失败，正在自主修复（第 {code_retry_round + 1}/{max_repairs} 轮）…")
+                    self.log_event("code_repair_retry", stage="repo_check", round=code_retry_round + 1, failure=failure)
+                    return await self._run_codex_task(task, require_mcp, status, preferred_mcp, plan, failure, code_retry_round + 1)
+                return {"error": "代码任务未通过 git diff --check 静态检查", "answer": answer, "validation": code_validation, "repo_check": repo_check, "event_count": len(events)}
             if status: status("代码已写入，正在由本地模块独立运行测试…")
             autonomous_tests = await asyncio.to_thread(self.self_upgrade.code_editor.run_autonomous_tests, code_validation.get("changed", []))
             self.log_event("code_autonomous_tests", result=autonomous_tests)
@@ -1652,7 +1699,7 @@ class HomeAgent:
                     self.log_event("code_repair_retry", stage="tests", round=code_retry_round + 1, failure=failure)
                     return await self._run_codex_task(task, require_mcp, status, preferred_mcp, plan, failure, code_retry_round + 1)
                 return {"error": f"代码已生成，但自主测试未通过：{autonomous_tests.get('error', 'unknown error')}", "answer": answer, "validation": code_validation, "tests": autonomous_tests, "event_count": len(events)}
-        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:], "validation": code_validation, "tests": autonomous_tests}
+        result = {"ok": True, "answer": answer, "thread_id": self.codex_thread_id, "mcp_calls": mcp_calls, "event_count": len(events), "degraded_network": bool(codex_errors), "network_events": codex_errors[-5:], "validation": code_validation, "repo_check": repo_check, "tests": autonomous_tests}
         self.log_event("codex_task_completed", result=result)
         return result
 
@@ -1681,6 +1728,19 @@ class HomeAgent:
             {"type": "function", "function": {"name": "acknowledge_scheduled_task", "description": "确认指定或最近一个待回应定时任务，并返回确认结果和剩余任务数量。", "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "description": "可选；不填时确认最近的待回应任务"}, "response": {"type": "string", "description": "用户的原始确认回复"}}}}},
             {"type": "function", "function": {"name": "long_term_memory", "description": "存储或按标签检索结构化长期记忆，并返回数据库操作结果。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["store", "retrieve"]}, "tags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 5}, "summary": {"type": "string", "maxLength": 20}, "detail": {"type": "string"}, "category": {"type": "string", "enum": ["health", "emotion", "major_event", "preference", "habit", "relationship", "agreement"]}, "importance": {"type": "integer", "minimum": 70, "maximum": 100}, "query_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8}}, "required": ["action"]}}},
         ]
+        if getattr(self, "comfyui", None) is not None and self.comfyui.config.get("enabled", True):
+            tools += [
+                {"type": "function", "function": {"name": "comfy_status", "description": "检查本地 ComfyUI 服务是否运行、版本与当前队列状态；未运行时按配置自动拉起。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "comfy_list_models", "description": "列出 ComfyUI 已安装的生成模型预设（图像/编辑/视频）与可用模型文件名。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "comfy_generate_image", "description": "调用本地 ComfyUI 从文字生成全新图像（Qwen-Image-2512 写实 / Anima 动漫）。注意：已有角色设定图（primary、角色三视图、正面照片等）时禁止用它凭空重画角色，应改用 comfy_edit_image 基于设定图修改。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "英文或中文正向提示词，描述主体、风格、构图、光影"}, "negative_prompt": {"type": "string", "description": "负向提示词"}, "model": {"type": "string", "enum": ["qwen-image-2512", "anima"], "description": "写实默认 qwen-image-2512；动漫风格用 anima"}, "width": {"type": "integer", "description": "宽度，默认 1024（会自动吸附到模型支持尺寸）"}, "height": {"type": "integer", "description": "高度，默认 1024"}, "steps": {"type": "integer", "description": "采样步数；使用 Lightning LoRA 时 4 步即可，默认 40"}, "cfg": {"type": "number"}, "seed": {"type": "integer"}, "use_lora": {"type": "boolean", "description": "是否加载加速 LoRA，默认 true"}}, "required": ["prompt"]}}},
+                {"type": "function", "function": {"name": "comfy_edit_image", "description": "调用本地 ComfyUI（Qwen-Image-Edit-2511）基于一张现有图片修改内容，角色一致性最好。image 支持绝对路径或已登记角色图（primary、角色三视图、正面照片、文件名）。推荐流程：先用角色设定图改姿势，再用改好姿势的结果改背景。denoise 越低越贴近原图（0.6～0.8 适合微调，1.0 完全重绘）。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "待编辑图片路径或已登记角色图（primary/角色三视图/正面照片/文件名）"}, "prompt": {"type": "string", "description": "编辑指令，例如“改成水彩画风格”“改成坐姿，侧身回眸”"}, "negative_prompt": {"type": "string"}, "model": {"type": "string", "enum": ["qwen-image-edit-2511"]}, "steps": {"type": "integer"}, "cfg": {"type": "number"}, "seed": {"type": "integer"}, "denoise": {"type": "number", "minimum": 0.3, "maximum": 1.0, "description": "重绘强度，默认 1.0；想保留更多原图细节用 0.6～0.8"}}, "required": ["image", "prompt"]}}},
+                {"type": "function", "function": {"name": "comfy_generate_video", "description": "调用本地 ComfyUI（MiniMax-H3）生成带音频的视频，支持文字生视频或首帧图生视频。生成耗时很长（数分钟），完成后返回视频文件路径。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "视频描述：画面主体、动作、镜头运动、氛围，可带时间线分段"}, "model": {"type": "string", "enum": ["minimax-h3"]}, "width": {"type": "integer", "description": "默认 1344"}, "height": {"type": "integer", "description": "默认 768"}, "frames": {"type": "integer", "description": "帧数，默认 49（约 2 秒 @24fps），最多 1024"}, "steps": {"type": "integer", "description": "采样步数，默认 20"}, "fps": {"type": "integer", "description": "帧率，默认 24"}, "seed": {"type": "integer"}, "first_frame": {"type": "string", "description": "可选：首帧图片路径，用于图生视频"}, "use_int8": {"type": "boolean", "description": "使用 INT8 量化版模型节省显存，默认 false"}}, "required": ["prompt"]}}},
+            ]
+        if getattr(self, "cosyvoice", None) is not None and self.cosyvoice.config.get("enabled", True):
+            tools += [
+                {"type": "function", "function": {"name": "cosyvoice_references", "description": "列出 CosyVoice2 可用的参考音色文件（3～10 秒干净人声）。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "cosyvoice_speak", "description": "用 CosyVoice2 指令式情绪 TTS 朗读文本：自动把（括号）里的语气描写转为情绪指令（如温柔、喘息、黏腻、急促），生成并返回音频文件路径。", "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "要朗读的台词，可带（语气描写）括号，程序会自动剥离并转成情绪指令"}, "reference": {"type": "string", "description": "参考音色文件名或路径；不填用默认音色"}, "instruct_text": {"type": "string", "description": "可选：直接指定情绪指令，覆盖括号自动解析"}}, "required": ["text"]}}},
+            ]
         if self.config.get("agent", {}).get("prefer_local_code_tools", True):
             tools += [
                 {"type": "function", "function": {"name": "code_list_files", "description": "列出当前代码任务允许目录中的文件。独立项目只能访问 Projects；自修改任务可访问工程源码区。", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "工程根目录相对路径"}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}}}},
@@ -1688,7 +1748,7 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "code_search_text", "description": "在允许的代码目录中搜索文本并返回文件、行号和内容，用于先定位再修改。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "path": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": ["query"]}}},
                 {"type": "function", "function": {"name": "code_write_file", "description": "原子创建或完整写入一个代码/测试/README 文件。独立项目写到 Projects/<name>/。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
                 {"type": "function", "function": {"name": "code_replace_text", "description": "在已读取文件中精确替换原文，适合小范围修改，找不到原文会失败。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["path", "old", "new"]}}},
-                {"type": "function", "function": {"name": "code_validate_project", "description": "扫描当前代码变更并执行适用的语法检查和自动测试，返回变更、验证和测试结果。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "code_validate_project", "description": "扫描当前代码变更并执行文件语法检查、git diff --check 静态检查和项目自动测试，返回变更、验证和测试结果。", "parameters": {"type": "object", "properties": {}}}},
             ]
         if self.config.get("vision_mcp", {}).get("enabled", False):
             tools += [
@@ -1926,6 +1986,15 @@ class HomeAgent:
         if answer_ready and str(answer or "").strip():
             answer_ready(str(answer).strip())
 
+    @staticmethod
+    def _publish_media(media: list[dict[str, Any]], media_ready=None) -> None:
+        valid = [
+            item for item in (media or [])
+            if isinstance(item, dict) and item.get("path") and item.get("kind") in {"image", "video", "audio"}
+        ]
+        if media_ready and valid:
+            media_ready(valid)
+
     async def analyze_current_screen(self, question: str, status=None) -> dict[str, Any]:
         """Capture the desktop and answer a visual question chosen by the task model."""
         screenshot = None
@@ -1960,7 +2029,11 @@ class HomeAgent:
                     "screenshot_captured_at": screenshot_captured_at,
                     "analysis_completed_at": _iso_now(),
                 }
-                self.log_event("screen_analysis_completed", question=prompt[:200], answer=answer[:300])
+                self.log_event(
+                    "screen_analysis_completed",
+                    question=prompt[:200], answer=answer[:300],
+                    model=result.get("model"), provider=result.get("provider"), vision_model=result.get("vision_model"),
+                )
                 return response
                 
         except Exception as exc:
@@ -1993,7 +2066,7 @@ class HomeAgent:
         imperative = value.startswith(("请", "麻烦", "现在", "立即", "马上", "帮我")) or value.endswith(("吧", "一下"))
         return has_target and imperative
 
-    async def chat(self, text: str, status=None, confirm=None, answer_ready=None, image_path=None) -> str:
+    async def chat(self, text: str, status=None, confirm=None, answer_ready=None, image_path=None, media_ready=None) -> str:
         self.current_task_submitted_at = _iso_now()
         if self.is_restart_request(text):
             answer = "好的主人，Home Agent 正在重启。"
@@ -2097,6 +2170,7 @@ class HomeAgent:
             long_term_stored = False
             tool_failures: list[dict[str, str]] = []
             completion_evidence: list[dict[str, Any]] = []
+            generated_media: list[dict[str, Any]] = []
             tool_sequence = 0
             code_inspection_iterations = 0
             completion_check_failures = 0
@@ -2108,6 +2182,7 @@ class HomeAgent:
                 if failed_rounds >= max_failed_rounds:
                     break
                 round_failed = False
+                round_post_tool_instructions: list[str] = []
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
                 payload = {"model": provider["model"], "messages": messages, "tools": self._tools(scoped=True), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
@@ -2211,6 +2286,7 @@ class HomeAgent:
                             answer = f"任务执行后的独立检查仍未通过：{reason[:220]}。我没有把未验证的结果报告为完成。"
                     self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
                     self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+                    self._publish_media(generated_media, media_ready)
                     self._publish_answer(answer, answer_ready)
                     if not long_term_stored:
                         await self._maybe_remember_home(text, answer, session, provider, key)
@@ -2241,13 +2317,25 @@ class HomeAgent:
                     tool_submitted_at = _iso_now()
                     tool_started = time.monotonic()
                     self.log_event("tool_started", tool=name, arguments=args, sequence=tool_sequence, task_submitted_at=self.current_task_submitted_at, tool_submitted_at=tool_submitted_at)
-                    result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
+                    try:
+                        result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
+                    except Exception as exc:
+                        result = {
+                            "status": "failed", "tool": name,
+                            "error": f"工具执行异常：{str(exc)[:500]}", "executed": False,
+                        }
                     if isinstance(result, dict):
                         result.setdefault("task_submitted_at", self.current_task_submitted_at)
                         result.setdefault("tool_submitted_at", tool_submitted_at)
                         result.setdefault("tool_completed_at", _iso_now())
                         result.setdefault("tool_elapsed_ms", int((time.monotonic() - tool_started) * 1000))
                         result.setdefault("tool_sequence", tool_sequence)
+                        if isinstance(result.get("media"), list):
+                            for item in result["media"]:
+                                if isinstance(item, dict) and item.get("path") and item.get("kind") in {"image", "video", "audio"}:
+                                    entry = {"path": str(item["path"]), "kind": str(item["kind"]), "caption": str(item.get("caption") or "")}
+                                    if entry not in generated_media:
+                                        generated_media.append(entry)
                     completion_evidence.append({"tool": name, "result": result})
                     if isinstance(result, dict) and result.get("status") == "failed":
                         round_failed = True
@@ -2304,7 +2392,9 @@ class HomeAgent:
                     }, f"已完成：{display_name}")
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
                     if post_tool_instruction:
-                        messages.append({"role": "system", "content": post_tool_instruction})
+                        round_post_tool_instructions.append(post_tool_instruction)
+                for instruction in round_post_tool_instructions:
+                    messages.append({"role": "system", "content": instruction})
                 if round_failed:
                     failed_rounds += 1
         failure_summary = "；".join(f"{row['tool']}：{row['reason']}" for row in tool_failures[-6:])
@@ -2322,6 +2412,7 @@ class HomeAgent:
                     self.current_code_verified = True
                 answer = str(result.get("answer", "代码任务已通过后备执行器完成。"))
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+            self._publish_media(generated_media, media_ready)
             self._publish_answer(answer, answer_ready)
             if self.config["home"].get("auto_speak", True):
                 await self._speak_with_fresh_session(answer, status, ignore_cancel=True)
@@ -2331,6 +2422,7 @@ class HomeAgent:
         self.log_event("tool_round_limit_reached", failed_rounds=rounds, iterations=round_index + 1, max_failed_rounds=max_failed_rounds, max_tool_iterations=max_tool_iterations, failures=tool_failures, failure_summary=failure_summary, answer=answer)
         if status: status(f"任务失败：{last_reason[:120]}")
         self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+        self._publish_media(generated_media, media_ready)
         self._publish_answer(answer, answer_ready)
         if self.config["home"].get("auto_speak", True):
             await self._speak_with_fresh_session(answer, status, ignore_cancel=True)
@@ -2361,10 +2453,13 @@ class HomeAgent:
                     validation = await asyncio.to_thread(editor.validate_current_changes, True)
                     if not validation.get("ok"):
                         return {"error": validation.get("error", "代码文件校验失败"), "validation": validation}
+                    repo_check = await asyncio.to_thread(editor.git_diff_check)
+                    if not repo_check.get("ok"):
+                        return {"error": f"git diff --check 未通过：{str(repo_check.get('output') or repo_check.get('error') or '')[:500]}", "validation": validation, "repo_check": repo_check}
                     tests = await asyncio.to_thread(editor.run_autonomous_tests, validation.get("changed", []))
                     if not tests.get("ok"):
                         return {"error": tests.get("error", "自动测试失败"), "validation": validation, "tests": tests}
-                    return {"ok": True, "validation": validation, "tests": tests, "changed": validation.get("changed", [])}
+                    return {"ok": True, "validation": validation, "repo_check": repo_check, "tests": tests, "changed": validation.get("changed", [])}
             except (OSError, ValueError, UnicodeError) as exc:
                 return {"error": str(exc)}
         if name == "process_status":
@@ -2581,6 +2676,87 @@ class HomeAgent:
                     return await self.mimo_multimodal.analyze_image_auto(session, path, str(args.get("prompt") or "请描述图片内容"))
             except Exception as exc:
                 return {"status": "failed", "error": str(exc)}
+        if name == "comfy_status":
+            try:
+                return await self.comfyui.status()
+            except Exception as exc:
+                return {"status": "failed", "error": f"ComfyUI 未运行：{exc}"}
+        if name == "comfy_list_models":
+            try:
+                return await self.comfyui.list_models()
+            except Exception as exc:
+                return {"status": "failed", "error": f"读取 ComfyUI 模型失败：{exc}"}
+        if name == "comfy_generate_image":
+            try:
+                return await self.comfyui.generate_image(
+                    str(args.get("prompt") or ""),
+                    str(args.get("negative_prompt") or ""),
+                    str(args.get("model") or "qwen-image-2512"),
+                    width=int(args.get("width") or 1024),
+                    height=int(args.get("height") or 1024),
+                    steps=int(args["steps"]) if args.get("steps") else None,
+                    cfg=float(args["cfg"]) if args.get("cfg") is not None else None,
+                    seed=int(args["seed"]) if args.get("seed") is not None else None,
+                    use_lora=bool(args.get("use_lora", True)),
+                    status=status,
+                )
+            except Exception as exc:
+                return {"status": "failed", "error": f"图像生成失败：{str(exc)[:400]}"}
+        if name == "comfy_edit_image":
+            try:
+                image_value = str(args.get("image") or "").strip()
+                registered_path = self._resolve_character_image(image_value)
+                image_path = registered_path if registered_path is not None else self._allowed_path(image_value)
+                if not image_path.is_file():
+                    return {"status": "failed", "error": f"待编辑图片不存在：{image_path}"}
+                return await self.comfyui.edit_image(
+                    str(image_path),
+                    str(args.get("prompt") or ""),
+                    str(args.get("negative_prompt") or ""),
+                    str(args.get("model") or "qwen-image-edit-2511"),
+                    steps=int(args["steps"]) if args.get("steps") else None,
+                    cfg=float(args["cfg"]) if args.get("cfg") is not None else None,
+                    seed=int(args["seed"]) if args.get("seed") is not None else None,
+                    denoise=float(args["denoise"]) if args.get("denoise") is not None else 1.0,
+                    status=status,
+                )
+            except Exception as exc:
+                return {"status": "failed", "error": f"图像编辑失败：{str(exc)[:400]}"}
+        if name == "comfy_generate_video":
+            try:
+                first_frame = None
+                if str(args.get("first_frame") or "").strip():
+                    first_frame = str(self._allowed_path(str(args.get("first_frame") or "")).resolve())
+                return await self.comfyui.generate_video(
+                    str(args.get("prompt") or ""),
+                    str(args.get("model") or "minimax-h3"),
+                    width=int(args.get("width") or 1344),
+                    height=int(args.get("height") or 768),
+                    frames=int(args.get("frames") or 49),
+                    steps=int(args["steps"]) if args.get("steps") else None,
+                    seed=int(args["seed"]) if args.get("seed") is not None else None,
+                    fps=int(args.get("fps") or 24),
+                    first_frame=first_frame,
+                    use_int8=bool(args.get("use_int8", False)),
+                    status=status,
+                )
+            except Exception as exc:
+                return {"status": "failed", "error": f"视频生成失败：{str(exc)[:400]}"}
+        if name == "cosyvoice_references":
+            try:
+                return self.cosyvoice.list_reference_audios()
+            except Exception as exc:
+                return {"status": "failed", "error": f"读取参考音色失败：{str(exc)[:300]}"}
+        if name == "cosyvoice_speak":
+            try:
+                return await self.cosyvoice.synthesize(
+                    str(args.get("text") or ""),
+                    str(args.get("instruct_text") or ""),
+                    str(args.get("reference") or ""),
+                    status=status,
+                )
+            except Exception as exc:
+                return {"status": "failed", "error": f"语音合成失败：{str(exc)[:400]}"}
         if name == "mimo_transcribe_audio":
             path = self._allowed_path(str(args.get("audio") or ""))
             try:

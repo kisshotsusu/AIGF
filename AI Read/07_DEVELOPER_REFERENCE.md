@@ -98,15 +98,61 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `transcribe_audio(session, path, language)`：只接受 WAV/MP3，Base64 后不超过 10 MB，通过 `input_audio` 和 `asr_options.language` 调用 `mimo-v2.5-asr`。
 - `verify_completion(session, task, plan, answer, evidence)`：要求模型只返回 `{passed, reason, next_action}`；核验依据是工具证据，默认接口异常关闭成功路径。请求固定 `thinking.type=disabled`、`stream=false`，不设置 `response_format`；空响应错误必须包含 `finish_reason`。
 
+### 工具循环消息顺序约束（2026-08-07）
+- OpenAI 兼容接口要求：assistant 消息带 `tool_calls` 时，其后的 tool 消息必须连续紧跟（DeepSeek 会以 “insufficient tool messages following tool_calls message” 拒绝）。
+- `chat()` 工具循环把轮内 `post_tool_instruction`（如“连续8次只读检查”）先收集到 `round_post_tool_instructions`，等该轮全部 tool 消息追加完后再统一插入 system 消息，避免插在 tool 消息之间。
+- 单次 `_run_tool` 出现未预期异常时，转为 `{"status":"failed","error":"工具执行异常…"}` 的 tool 消息继续循环，而不是中断会话。
+
 ### HomeAgent 图片消息与供应商能力
 - `HomeAgent._provider_supports_images(provider)`：判断供应商能否直接接收图片（MiMo 或显式 `supports_images: true`）；DeepSeek 官方 API 为纯文本模型，返回 `false`。
 - `chat` 带附件时：供应商支持图片则构造 `image_url + text` 消息；纯文本供应商（DeepSeek）调用 `_text_only_image_message`，经 `describe_images_for_chat` 把图片转成文字描述后提交，代理失败退化为只列文件名的文本消息（`image_vision_proxy_failed` 事件）。
 - `analyze_image` 工具与 `analyze_current_screen`（`ui_analyze_screen`）改用 `analyze_image_auto`，按配置优先 DeepSeek 并自动回退 MiMo；`proactive_screen_care` 仍固定使用 MiMo `analyze_image`。
+- `comfy_edit_image` 工具支持已登记角色图别名（`primary`、`角色三视图`、`正面照片`、文件名/标签），与 `analyze_image` 一样先经 `_resolve_character_image` 解析，再交给 ComfyUI 编辑。
+- 规划器与工具描述引导“有设定图的角色绘图”：先用 `comfy_edit_image` 以设定图为底改姿势，再用结果改背景；禁止用 `comfy_generate_image` 凭空重画导致角色细节丢失。
 
 ### `CodeEditorModule` 变更与验证
 - 跟踪范围覆盖整个仓库中的源码、配置、README 与 `AI Read`，不再依赖固定模块目录清单。
 - `validate_current_changes` 检查真实变更以及 Python/YAML/JSON 等文件语法，不会因为缺少 `AI Read` 或项目 README 变更而人为失败。
 - 执行模型仍应按实际影响维护文档，但这是交付判断，不是代码工具内部的任务类型硬编码。
+
+### `CodeValidator`（`HomeAgent/home_modules/code_validator.py`）
+- 独立验证模块，不包含编辑、变更追踪或任务恢复；`CodeEditorModule` 在 `__init__` 创建 `self.validator` 并委托 `validate_files` / `run_autonomous_tests` / `git_diff_check`。
+- `validate_files(changed)`：按扩展名执行语法/结构检查——Python `py_compile`、JSON `json.loads`、YAML `safe_load`、TOML `tomllib`、INI `configparser`、JS `node --check`（无 node 时跳过）、HTML 根标签、CSS 大括号平衡；未知扩展名跳过。任一失败返回 `{ok:false, checked, error}`。
+- `validate_repo()`：运行 `git diff --check`；非 git 仓库返回 `{ok:true, skipped:true}`。
+- `run_autonomous_tests(changed, timeout)`：按变更检测工程——非 Projects 的 Python 先 `py_compile`；`Projects/<项目>` 内运行 `compileall`、pytest/unittest、node `--check`、静态 HTML/CSS 检查、`npm test`、`tsc --noEmit`；HomeAgent 变更跑 `HomeAgent/tests` 全套，`modules/live/` 变更跑直播测试。返回 `{ok, commands, failed, changed, error}`。
+- `code_validate_project` 工具与 Codex 代码任务完成门禁现在同时要求：`validate_current_changes` 通过、`git_diff_check` 通过、`run_autonomous_tests` 通过。
+
+### `ComfyUIClient`（`HomeAgent/home_modules/comfyui_client.py`）
+- 独立 ComfyUI 生成模块，主程序不包含任何 ComfyUI 调用细节；`HomeAgent.__init__` 用根 `config.yaml` 的 `comfyui` 节创建 `self.comfyui`。
+- `ensure_running()`：探测 `/system_stats`；未运行且 `auto_start=true` 时按桌面版参数拉起（`.venv` Python + `--extra-model-paths-config` + 共享 input/output 目录），最多等待 `startup_timeout_seconds`。
+- `generate_image(prompt, negative_prompt, model, width, height, steps, cfg, seed, use_lora)`：`qwen-image-2512`（写实）或 `anima`（动漫）API 工作流；尺寸自动吸附到模型支持分辨率。
+- `_enrich_prompts(preset, prompt, negative_prompt)`：自动在正向提示词后追加预设质量/风格后缀（`positive_suffix`，如 masterpiece/clean lineart），并始终应用默认负面提示词（`negative_default`）；用户传入的负面提示词会与默认合并。模块配置可用 `positive_suffix` / `negative_prompt` 全局覆盖。
+- `edit_image(image_path, prompt, ...)`：上传图片到 `/upload/image`，用 `TextEncodeQwenImageEditPlus` + VAEEncode 构造编辑工作流。
+- 编辑步数策略（`_edit_steps`）：启用 Lightning LoRA 时用其原生 4 步，避免高步数过度处理；关闭 LoRA 时用 20 步并强制下限 `min_steps=8`。`edit_image` 新增 `denoise` 参数（0.3～1.0，默认 1.0），越低越贴近原图。
+- `generate_video(prompt, model, width, height, frames, steps, fps, first_frame, use_int8)`：MiniMax-H3 `MiniMaxH3ImageToVideo` 管线（SigmaShift + SamplerCustomAdvanced + VAEDecode/VAEDecodeAudio + CreateVideo + SaveVideo）；`first_frame` 非空时自动图生视频，默认视频超时 1800 秒。
+- 输出通过 `/history/{id}` 轮询、`/view` 下载到 `outputs/comfyui/`，返回 `{ok, status, prompt_id, media:[{path, kind, caption}], message}`；`media` 由工具循环收集并经 `media_ready` 回调交给 Qt 界面。
+- `chat(..., media_ready=None)`：`_run_tool` 返回的 `media` 列表被去重收集，在最终答案发布前调用 `_publish_media` 推送；`qt_app.Bridge.media` 信号驱动 `MediaBubble` 渲染（图片缩略图可点击、视频卡片可打开）。
+- **已知坑（已修复）**：`__init__` 中实例属性 `self._object_info = None` 与同名异步方法 `_object_info()` 冲突，实例属性遮蔽方法，导致 `list_models()` 调用 `self._object_info()` 抛 `'NoneType' object is not callable`。缓存属性已改名为 `self._object_info_cache`，方法保持 `_object_info()`。改此模块时不得再用 `self._object_info` 作为属性名。
+
+### ComfyUI 技能（`Skill/comfyui-image-video/`）
+- `SKILL.md`：使用契约、模型预设表、输出位置与调用要点；`scripts/comfy_cli.py` 提供 `status/models/generate-image/edit-image/generate-video` 命令行入口。
+
+### `CosyVoiceTTS`（`HomeAgent/home_modules/cosyvoice_tts.py`）
+- 独立 CosyVoice2 情绪 TTS 模块；`HomeAgent.__init__` 用根 `config.yaml` 的 `cosyvoice` 节创建 `self.cosyvoice`。
+- `ensure_running()`：探测 `/openapi.json`；未运行且 `auto_start=true` 时用 `.venv` Python 启动 `runtime/python/fastapi/server.py --port 50000 --model_dir ...`，日志在 `E:\OtherProgram\CosyVoice\logs\`。
+- `parse_stage_directions(text)`：剥离全角/半角括号里的语气描写，按 `MOOD_HINTS` 映射表生成 `instruct_text`（如“请用语气温柔、声音黏腻绵软、带微微喘息、语速缓慢的语气说这段话”）；无括号时原样返回。
+- 情绪指令防机械感：情绪词最多保留 4 条 + 1 条语速提示（共 ≤5），并消除“语速缓慢/稍快”冲突；提示词堆叠过多会让 CosyVoice2 产出机械感。
+- `synthesize(text, instruct_text, reference, filename_prefix)`：调用 `/inference_instruct2`（multipart：`tts_text` + `instruct_text` + `prompt_wav`），流式返回 16bit PCM，封装为 24kHz 单声道 WAV，保存到 `outputs/cosyvoice/`，返回 `{ok, media:[{path, kind:"audio"}], instruct_text, directions, reference, duration_seconds}`。
+- `list_reference_audios()`：枚举 `outputs/cosyvoice_refs/` 下的 wav/mp3/flac/ogg 作为参考音色；`reference` 支持文件名或绝对路径，默认取第一个。
+- 音频媒体（`kind:"audio"`）与 image/video 一样经 `media_ready` 回调进入 Qt 媒体气泡（音频卡片可点击打开）。
+
+### CosyVoice2 本地服务（`E:\OtherProgram\CosyVoice`）
+- 官方仓库 Python 3.12 venv；torch/torchaudio 为 `2.10.0+cu130`（适配 RTX 5070 Ti）；依赖按 Windows 裁剪（去掉 torch/torchaudio/tensorrt/deepspeed/wetext/grpcio 固定版本，安装 torchcodec、pyworld 0.3.5 等 cp312 轮子）。
+- 两处官方代码兼容补丁（升级/重装时需重新应用）：
+  1. `cosyvoice/utils/file_utils.py::load_wav`：改用 `soundfile.read`（含 `seek(0)` 以支持文件对象重复读取），避免 torchaudio 2.10 强依赖 torchcodec；
+     并增加多声道均值转单声道（`speech.mean(dim=0, keepdim=True)`），保证立体声参考也能正常推理。
+  2. `runtime/python/fastapi/server.py`：zero_shot/cross_lingual/instruct2 端点把上传音频读入 `io.BytesIO` 后直传模型，不再预加载成 16k 张量（当前 frontend 期望原始音频源），避免 FastAPI 关闭上传文件导致惰性生成失败。
+- 服务缺省端口 50000；模型 `CosyVoice2-0.5B` 位于 `pretrained_models/`。
 
 ### 角色管理器 MiMo 多模态布局
 - `MiMoMultimodalPage(embedded=True)` 嵌入 `ModelPage.provider_tabs`，内部使用 `QScrollArea` 承载三组表单，避免较小窗口裁切输入项。

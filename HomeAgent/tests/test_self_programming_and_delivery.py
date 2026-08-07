@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 import inspect
 import json
 import tempfile
@@ -66,6 +67,34 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         used_path = agent.mimo_multimodal.analyze_image_auto.await_args.args[1]
         self.assertTrue(used_path.is_absolute())
         self.assertEqual(used_path.name, "角色三视图.png")
+
+    async def test_comfy_edit_image_resolves_registered_character_alias(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"computer_control": {"full_access": False, "allowed_roots": []}}
+        agent.comfyui = SimpleNamespace(edit_image=AsyncMock(return_value={"ok": True, "media": [{"path": "out.png", "kind": "image"}]}))
+        result = await agent._run_tool("comfy_edit_image", {"image": "primary", "prompt": "改成坐姿"})
+        self.assertTrue(result["ok"])
+        used_path = agent.comfyui.edit_image.await_args.args[0]
+        self.assertTrue(Path(used_path).is_absolute())
+        self.assertIn("character_images", str(used_path))
+
+    def test_cosyvoice_tools_hidden_when_disabled(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"agent": {}, "vision_mcp": {"enabled": False}}
+        agent.comfyui = None
+        agent.cosyvoice = SimpleNamespace(config={"enabled": False})
+        names = [tool["function"]["name"] for tool in agent._tools(scoped=True)]
+        self.assertNotIn("cosyvoice_speak", names)
+        self.assertNotIn("cosyvoice_references", names)
+
+    def test_cosyvoice_tools_exposed_when_enabled(self) -> None:
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {"agent": {}, "vision_mcp": {"enabled": False}}
+        agent.comfyui = None
+        agent.cosyvoice = SimpleNamespace(config={"enabled": True})
+        names = [tool["function"]["name"] for tool in agent._tools(scoped=True)]
+        self.assertIn("cosyvoice_speak", names)
+        self.assertIn("cosyvoice_references", names)
 
     def test_local_code_does_not_rewrite_model_intent(self) -> None:
         self.assertFalse(hasattr(HomeAgent, "_apply_implementation_change_plan"))
@@ -193,6 +222,114 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
             read = await agent._run_tool("code_read_file", {"path": "Projects/demo/main.py"})
             self.assertTrue(written["ok"])
             self.assertEqual("VALUE = 1\n", read["content"])
+
+    async def test_tool_messages_stay_contiguous_when_round_instruction_is_emitted(self) -> None:
+        """Regression: post_tool_instruction must not be inserted between tool messages of one assistant tool_calls round."""
+        agent = HomeAgent.__new__(HomeAgent)
+        agent.config = {
+            "home": {"max_context_messages": 8, "auto_speak": False},
+            "semantic_planner": {"context_messages": 4},
+            "agent": {"prefer_local_code_tools": False, "max_tool_rounds": 8, "max_tool_iterations": 32},
+            "mimo_multimodal": {"completion_visual_max_age_seconds": 45},
+        }
+        agent.project = {
+            "llm": {
+                "provider": "deepseek",
+                "providers": {"deepseek": {
+                    "base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY",
+                }},
+                "home": {"temperature": 0.7, "max_tokens": 300},
+                "timeout_seconds": 10,
+            }
+        }
+        agent.history = []
+        agent.log_event = Mock()
+        agent.current_task_submitted_at = "2026-08-07T00:00:00+08:00"
+        agent.current_code_self_edit = False
+        agent._acknowledge_common_response = lambda text: None
+        agent._system_prompt = lambda: "system"
+        agent._tools = lambda scoped=False: []
+        agent._provider = lambda: (agent.project["llm"]["providers"]["deepseek"], "test-key")
+        agent._run_tool = AsyncMock(return_value={"ok": True, "status": "success"})
+
+        async def plan(text: str, context: str = "") -> dict:
+            return {
+                "is_task": True, "actionable": True, "execution_strategy": "tool_loop",
+                "domain": "code", "code_scope": "external", "requires_clarification": False,
+                "success_criteria": "完成", "reasoning_short": "测试", "steps": [],
+            }
+
+        agent._plan_task = plan
+
+        async def speak(session, text, status=None, ignore_cancel=False):
+            return []
+
+        agent._speak_home = speak
+
+        async def remember(text, answer, session, provider, key):
+            return None
+
+        agent._maybe_remember_home = remember
+
+        async def verify(session, task, plan, answer, evidence):
+            return {"passed": True, "reason": "ok", "next_action": ""}
+
+        agent.mimo_multimodal = SimpleNamespace(verify_completion=verify)
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, message, finish_reason):
+                self._data = {"choices": [{"message": message, "finish_reason": finish_reason}]}
+
+            async def text(self):
+                return json.dumps(self._data, ensure_ascii=False)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        def tool_call(tool_id: str):
+            return {"id": tool_id, "type": "function", "function": {"name": "code_read_file", "arguments": '{"path": "a.py"}'}}
+
+        captured = []
+
+        class FakePostResult:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *args):
+                return False
+
+        def fake_post(session, url, json=None, headers=None, **kwargs):
+            captured.append(json)
+            if len(captured) == 1:
+                return FakePostResult(FakeResponse({"role": "assistant", "content": None, "tool_calls": [tool_call(f"c{i}") for i in range(1, 6)]}, "tool_calls"))
+            if len(captured) == 2:
+                return FakePostResult(FakeResponse({"role": "assistant", "content": None, "tool_calls": [tool_call(f"c{i}") for i in range(6, 9)]}, "tool_calls"))
+            return FakePostResult(FakeResponse({"role": "assistant", "content": "完成", "tool_calls": None}, "stop"))
+
+        with patch("aiohttp.ClientSession.post", new=fake_post):
+            answer = await agent.chat("检查代码")
+
+        self.assertEqual(answer, "完成")
+        self.assertEqual(len(captured), 3)
+        messages = captured[2]["messages"]
+        assistant_indexes = [i for i, item in enumerate(messages) if item.get("role") == "assistant" and item.get("tool_calls")]
+        assistant_index = assistant_indexes[-1]
+        tool_ids = [call["id"] for call in messages[assistant_index]["tool_calls"]]
+        self.assertEqual(tool_ids, ["c6", "c7", "c8"])
+        following = messages[assistant_index + 1: assistant_index + 1 + len(tool_ids)]
+        self.assertEqual([item.get("role") for item in following], ["tool", "tool", "tool"])
+        self.assertEqual([item.get("tool_call_id") for item in following], tool_ids)
+        system_after = messages[assistant_index + 1 + len(tool_ids)]
+        self.assertEqual(system_after.get("role"), "system")
+        self.assertIn("连续8次只读检查", system_after.get("content", ""))
 
     async def test_codex_tool_receives_semantic_task_plan(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)

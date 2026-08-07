@@ -7,15 +7,10 @@ the execution contract and validation result exposed here.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
-import json
-import os
-import py_compile
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
+
+from .code_validator import CodeValidator
 
 
 class CodeEditorModule:
@@ -45,6 +40,7 @@ class CodeEditorModule:
         self.external_read_roots = [Path(value).expanduser().resolve() for value in (external_read_roots or []) if str(value).strip()]
         self._baseline: dict[str, str] = {}
         self._external_changed: set[str] = set()
+        self.validator = CodeValidator(self.root, self.home_agent)
 
     def _resolve_edit_path(self, value: str, self_edit: bool = False) -> Path:
         raw = str(value or "").strip()
@@ -208,27 +204,11 @@ class CodeEditorModule:
     def validate_files(self, changed: list[str]) -> dict[str, Any]:
         if not self.require_validation:
             return {"ok": True, "skipped": True, "checked": []}
-        checked: list[str] = []
-        try:
-            for relative in changed:
-                candidate = Path(relative)
-                path = candidate if candidate.is_absolute() else self.root / candidate
-                if not path.is_file():
-                    continue
-                suffix = path.suffix.lower()
-                if suffix == ".py":
-                    py_compile.compile(str(path), doraise=True)
-                    checked.append(relative)
-                elif suffix == ".json":
-                    json.loads(path.read_text(encoding="utf-8"))
-                    checked.append(relative)
-                elif suffix in {".yaml", ".yml"}:
-                    import yaml
-                    yaml.safe_load(path.read_text(encoding="utf-8"))
-                    checked.append(relative)
-            return {"ok": True, "checked": checked}
-        except Exception as exc:
-            return {"ok": False, "checked": checked, "error": str(exc)}
+        return self.validator.validate_files(changed)
+
+    def git_diff_check(self, timeout: int = 60) -> dict[str, Any]:
+        """运行仓库级 git diff --check 静态检查（委托独立校验模块）。"""
+        return self.validator.validate_repo(timeout=timeout)
 
     def validate_current_changes(self, require_changes: bool = False) -> dict[str, Any]:
         changed = self.changed_files()
@@ -276,88 +256,6 @@ class CodeEditorModule:
         )
         return contract, loaded
 
-    def _project_roots(self, changed: list[str]) -> list[Path]:
-        projects: set[Path] = set()
-        for relative in changed:
-            parts = Path(relative).parts
-            if len(parts) >= 2 and parts[0].casefold() == "projects":
-                projects.add((self.root / parts[0] / parts[1]).resolve())
-        return sorted(projects, key=str)
-
-    @staticmethod
-    def _run_command(command: list[str], cwd: Path, timeout: int) -> dict[str, Any]:
-        try:
-            result = subprocess.run(
-                command, cwd=str(cwd), stdin=subprocess.DEVNULL, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-            output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())[-6000:]
-            return {"command": command, "cwd": str(cwd), "ok": result.returncode == 0, "exit_code": result.returncode, "output": output}
-        except subprocess.TimeoutExpired as exc:
-            return {"command": command, "cwd": str(cwd), "ok": False, "error": f"测试超过 {timeout} 秒", "output": str(exc)[-1000:]}
-        except OSError as exc:
-            return {"command": command, "cwd": str(cwd), "ok": False, "error": str(exc)}
-
     def run_autonomous_tests(self, changed: list[str], timeout: int = 180) -> dict[str, Any]:
         """Detect project types and independently rerun their local checks."""
-        results: list[dict[str, Any]] = []
-        python = self.root / ".venv" / "Scripts" / "python.exe"
-        python_exe = str(python if python.is_file() else Path(sys.executable))
-        changed_paths = [self.root / relative for relative in changed]
-        non_project_python = [
-            path for path in changed_paths
-            if path.is_file() and path.suffix.lower() == ".py"
-            and not (len(path.relative_to(self.root).parts) >= 2 and path.relative_to(self.root).parts[0].casefold() == "projects")
-        ]
-        if non_project_python:
-            results.append(self._run_command([python_exe, "-m", "py_compile", *map(str, non_project_python)], self.root, timeout))
-
-        for project in self._project_roots(changed):
-            if not project.is_dir():
-                continue
-            project_python = [path for path in changed_paths if path.is_file() and path.suffix.lower() == ".py" and project in path.parents]
-            if project_python:
-                results.append(self._run_command([python_exe, "-m", "compileall", "-q", "."], project, timeout))
-                tests = project / "tests"
-                if tests.is_dir():
-                    if importlib.util.find_spec("pytest") is not None:
-                        results.append(self._run_command([python_exe, "-m", "pytest", "-q"], project, timeout))
-                    else:
-                        results.append(self._run_command([python_exe, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"], project, timeout))
-
-            node = shutil.which("node")
-            for path in changed_paths:
-                if node and path.is_file() and path.suffix.lower() in {".js", ".mjs", ".cjs"} and project in path.parents:
-                    results.append(self._run_command([node, "--check", str(path)], project, timeout))
-            static_files = [path for path in changed_paths if path.is_file() and path.suffix.lower() in {".html", ".css"} and project in path.parents]
-            if static_files:
-                static_errors: list[str] = []
-                for path in static_files:
-                    content = path.read_text(encoding="utf-8", errors="replace")
-                    if path.suffix.lower() == ".html" and not ("<html" in content.lower() and "</html>" in content.lower()):
-                        static_errors.append(f"{path.name}: 缺少完整 html 根标签")
-                    if path.suffix.lower() == ".css" and content.count("{") != content.count("}"):
-                        static_errors.append(f"{path.name}: CSS 大括号不平衡")
-                results.append({"command": ["static-asset-check"], "cwd": str(project), "ok": not static_errors, "output": "\n".join(static_errors)})
-            package = project / "package.json"
-            npm = shutil.which("npm")
-            if package.is_file() and npm:
-                try:
-                    script = str(json.loads(package.read_text(encoding="utf-8")).get("scripts", {}).get("test", "")).strip()
-                except (OSError, json.JSONDecodeError, TypeError):
-                    script = ""
-                if script and "no test specified" not in script.lower():
-                    results.append(self._run_command([npm, "test"], project, timeout))
-            tsconfig = project / "tsconfig.json"
-            npx = shutil.which("npx")
-            if tsconfig.is_file() and npx:
-                results.append(self._run_command([npx, "--no-install", "tsc", "--noEmit"], project, timeout))
-
-        if any(path.startswith("HomeAgent/") for path in changed):
-            results.append(self._run_command([python_exe, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"], self.home_agent, timeout))
-        if any(path.startswith("modules/live/") for path in changed):
-            results.append(self._run_command([python_exe, "-m", "unittest", "discover", "-s", "modules/live/tests", "-p", "test_*.py", "-v"], self.root, timeout))
-
-        failed = [row for row in results if not row.get("ok")]
-        return {"ok": bool(results) and not failed, "commands": results, "failed": failed, "changed": changed, "error": "没有检测到可运行的代码检查" if not results else ("自动测试失败" if failed else "")}
+        return self.validator.run_autonomous_tests(changed, timeout=timeout)

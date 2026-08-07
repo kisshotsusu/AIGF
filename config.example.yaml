@@ -144,6 +144,36 @@ mimo_multimodal:
     thinking:
       type: disabled
 
+# 本地 ComfyUI 图像/视频生成（Comfy Desktop 独立版）
+comfyui:
+  enabled: true
+  base_url: http://127.0.0.1:8188
+  auto_start: true
+  install_dir: D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI
+  python: D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI\.venv\Scripts\python.exe
+  extra_model_paths_config: C:\Users\21018\AppData\Roaming\Comfy Desktop\shared_model_paths.yaml
+  input_dir: D:\Comfy-Desktop\ComfyUI-Shared\input
+  output_dir: D:\Comfy-Desktop\ComfyUI-Shared\output
+  home_output_dir: outputs/comfyui
+  startup_timeout_seconds: 180
+  timeout_seconds: 900
+  poll_interval_seconds: 2
+
+# CosyVoice2 情绪指令 TTS（本地 FastAPI，端口 50000）
+cosyvoice:
+  enabled: true
+  base_url: http://127.0.0.1:50000
+  auto_start: true
+  install_dir: E:\OtherProgram\CosyVoice
+  python: E:\OtherProgram\CosyVoice\.venv\Scripts\python.exe
+  model_dir: E:\OtherProgram\CosyVoice\pretrained_models\CosyVoice2-0.5B
+  server_port: 50000
+  reference_dir: outputs/cosyvoice_refs
+  output_dir: outputs/cosyvoice
+  startup_timeout_seconds: 240
+  timeout_seconds: 180
+  sample_rate: 24000
+
 workspace:
   path: workspace
   identity_file: IDENTITY.yaml

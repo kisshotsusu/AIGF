@@ -16,6 +16,7 @@
 - 家庭与直播长期记忆的“是否值得保存、类别和摘要”均由记忆模型判断；已移除 `always_keywords`、`ignore_keywords`、消息长度和“生日/喜欢/讨厌”等本地语义分类兜底。
 - Codex 与本地工具并列开放，由模型根据任务选择，不由用户消息中的单个词自动触发，也不要求先耗尽本地工具。
 - 直接重启、停止当前任务和实例锁属于程序生命周期控制；普通业务任务不得新增确定性分类或固定业务步骤。
+- 工具循环保证单轮 assistant `tool_calls` 后 tool 消息连续（轮内提示词延迟到该轮末尾统一插入），避免 DeepSeek 的 “insufficient tool messages” 400 拒绝；单工具异常转为失败 tool 消息继续循环。
 
 ## Home Agent
 
@@ -43,7 +44,28 @@
 ## 文件、代码与自升级
 
 - 普通文档和角色资产使用文件工具读取、原子写入并重新读取验证，不进入代码验证。
-- 本地代码工具支持目录枚举、按行读取、搜索、原子写入、精确替换和自动测试。
+- 本地代码工具支持目录枚举、按行读取、搜索、原子写入、精确替换和自动测试；代码验证由独立的 `home_modules/code_validator.py` 模块执行。
+- `code_validate_project` 与 Codex 代码任务完成门禁包含三层验证：文件语法检查、`git diff --check` 静态检查和项目自动测试；任何一层失败都会进入自主修复或明确失败，不把无验证结果当作成功。
+
+## ComfyUI 图像与视频生成
+
+- HomeAgent 通过 `home_modules/comfyui_client.py` 调用本地 ComfyUI（`http://127.0.0.1:8188`）；服务未运行时按桌面版相同参数自动启动，逻辑全部封装在独立模块中，主程序只做薄委托。
+- 支持 `comfy_generate_image`（Qwen-Image-2512 写实 / Anima 动漫）、`comfy_edit_image`（Qwen-Image-Edit-2511）、`comfy_generate_video`（MiniMax-H3 文生视频/图生视频，带音频），以及 `comfy_status` / `comfy_list_models`。
+- 图像/编辑生成会自动追加质量与风格正向提示词（masterpiece、highly detailed 等），并始终应用预设负面提示词（Anima 用英文质量标签，Qwen 用中文画质/畸形/水印描述）；用户显式传入的负面提示词与默认合并，模块配置可全局覆盖。
+- 角色绘图采用“设定图优先”流程：`comfy_edit_image` 支持 primary/角色三视图/正面照片等别名，Agent 被引导先用设定图改姿势、再用结果改背景，避免文生图导致角色细节丢失或多出无关主体。
+- 改图预设强化：正向词条加入身份保持（same face/hairstyle/outfit），负面词条加入五官崩坏/多余手指/身体结构错误等解剖保护词，且编辑步数下限 8 步（默认 20 步），避免低步数导致五官肢体画崩。
+- 编辑步数策略修正：Lightning LoRA 按原生 4 步采样（此前 20 步 + LoRA 会过度处理导致与原图偏差大）；不带 LoRA 才用 20 步。`comfy_edit_image` 增加 `denoise` 参数（0.3～1.0，越低越保留原图）。
+- 生成结果复制到 `outputs/comfyui/`；工具结果携带 `media` 列表，聊天回复通过 Qt 媒体气泡直接展示图片缩略图（点击打开原图）和视频卡片（点击“打开”）。
+- 工作流已验证：Anima 8 步生图、Qwen-Edit 4 步改图、MiniMax-H3 8 帧/6 步视频均真实生成成功。
+
+## CosyVoice2 情绪 TTS
+
+- HomeAgent 通过 `home_modules/cosyvoice_tts.py` 调用本地 CosyVoice2-0.5B（`http://127.0.0.1:50000`，`/inference_instruct2` 指令式情绪合成）；服务未运行时按配置自动启动。
+- **当前状态：暂时屏蔽**（`cosyvoice.enabled: false`）。工具 `cosyvoice_speak` / `cosyvoice_references` 不再暴露给模型，服务已停止；模块、音色库与文档保留，恢复时把配置改回 `enabled: true` 并重启即可。
+- 台词中的（括号）语气描写会被自动解析为情绪指令（温柔/黏腻/喘息/颤抖/急促等映射表），括号内容剥离后朗读；`cosyvoice_speak` 工具返回音频文件，聊天界面以音频卡片展示。
+- 参考音色目录 `outputs/cosyvoice_refs/`：默认音色为 `0_甘雨_温柔.wav`（取自 GPT-SoVITS `logs/甘雨-v2ProPlus/5-wav32k` 数据集，6 秒 24kHz 单声道归一化），可继续放入 3～10 秒干净人声切换；输出 WAV 保存到 `outputs/cosyvoice/`。
+- 本地安装：`E:\OtherProgram\CosyVoice`（官方仓库 + `.venv` + CosyVoice2-0.5B 模型），并对官方代码做了两处 Windows 兼容补丁（见 07）。
+- 已验证：角色台词真实合成 22.8 秒 WAV，情绪指令生效。
 - 自我修改可编辑仓库内任意源码或配置路径，不再受预设模块目录限制；代码任务同时保留本地工具、Codex、命令和其他已启用工具，由模型选择执行方式。
 - Codex 使用用户现有 `CODEX_HOME`，以完全跳过审批和沙盒的模式执行；Home Agent 的完整磁盘访问及命令确认均已关闭限制。
 - 自升级只有在模型计划为 `domain=code` 且 `code_scope=self` 时启用；完成前必须有真实变更与测试证据。
@@ -67,7 +89,7 @@
 
 ## 当前验证基线
 
-- Home Agent：115 项自动测试。
+- Home Agent：158 项自动测试。
 - 角色管理器：4 项自动测试。
 - Vision：7 项窗口、截图与媒体停止测试。
 - 直播助手：5 项欢迎、队列和 TTS 可靠性测试。

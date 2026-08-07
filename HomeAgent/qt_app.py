@@ -194,6 +194,7 @@ class WakeWordListener(QThread):
 
 class Bridge(QObject):
     answer = Signal(str)
+    media = Signal(object)
     error = Signal(str)
     status = Signal(str)
     finished = Signal()
@@ -318,6 +319,12 @@ class ChatWorker(QThread):
             self.answer_emitted = True
             self.bridge.answer.emit(text)
 
+    def publish_media(self, media: list) -> None:
+        """Show generated images/videos after the tool loop finishes."""
+        items = [item for item in (media or []) if isinstance(item, dict) and item.get("path")]
+        if items:
+            self.bridge.media.emit(items)
+
     async def progress_clock(self):
         while True:
             await asyncio.sleep(5)
@@ -384,7 +391,7 @@ class ChatWorker(QThread):
             if self.file_paths:
                 listing = "\n".join(f"- {path}" for path in self.file_paths)
                 prompt += f"\n\n[用户本轮手动附加了以下本地文件。请按任务需要使用 read_text_file 或代码读取工具读取，不要忽略附件：\n{listing}\n]"
-            self.task = self.loop.create_task(self.agent.chat(prompt, self.report_status, self.confirm, self.publish_answer, image_path=self.image_paths))
+            self.task = self.loop.create_task(self.agent.chat(prompt, self.report_status, self.confirm, self.publish_answer, image_path=self.image_paths, media_ready=self.publish_media))
             self.clock = self.loop.create_task(self.progress_clock())
             answer = self.loop.run_until_complete(self.task)
             self.agent.finalize_task_recovery(answer)
@@ -438,6 +445,67 @@ class MessageBubble(QFrame):
         if mine: outer.addStretch(); outer.addWidget(card)
         else: outer.addWidget(card); outer.addStretch()
         card.setObjectName(bubble_name)
+
+
+class ClickableImageLabel(QLabel):
+    """Image thumbnail that opens the original file on click."""
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            try:
+                os.startfile(self.path)  # type: ignore[attr-defined]
+            except OSError:
+                pass
+        super().mousePressEvent(event)
+
+
+class MediaBubble(QFrame):
+    """Assistant reply media: inline image thumbnails and video open cards."""
+
+    def __init__(self, media: list):
+        super().__init__()
+        outer = QHBoxLayout(self); outer.setContentsMargins(10, 4, 10, 4)
+        card = QFrame(); card.setObjectName("bubbleAgent"); card.setMaximumWidth(620)
+        layout = QVBoxLayout(card); layout.setContentsMargins(15, 11, 15, 12); layout.setSpacing(8)
+        for item in media:
+            path = str(item.get("path") or "")
+            kind = str(item.get("kind") or "")
+            if not path or not Path(path).exists():
+                continue
+            if kind == "image":
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    scaled = pix.scaled(320, 320, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    thumb = ClickableImageLabel(path)
+                    thumb.setPixmap(scaled); thumb.setCursor(Qt.PointingHandCursor); thumb.setToolTip(path)
+                    layout.addWidget(thumb)
+                    continue
+            layout.addWidget(self._file_row(path, kind))
+        if layout.count() == 0:
+            layout.addWidget(QLabel("（媒体文件不可用）"))
+        outer.addWidget(card); outer.addStretch()
+
+    @staticmethod
+    def _open_path(path: str) -> None:
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+    def _file_row(self, path: str, kind: str = "file") -> QFrame:
+        row = QFrame(); row_layout = QHBoxLayout(row); row_layout.setContentsMargins(0, 0, 0, 0); row_layout.setSpacing(8)
+        icon_text = {"video": "🎬", "audio": "🎵"}.get(kind, "📄")
+        icon = QLabel(icon_text); icon.setStyleSheet("font-size:18px;")
+        name = QLabel(Path(path).name); name.setObjectName("bubbleText"); name.setWordWrap(True)
+        name.setTextInteractionFlags(Qt.TextSelectableByMouse); name.setToolTip(path)
+        open_btn = QPushButton("打开"); open_btn.setObjectName("softButton")
+        open_btn.clicked.connect(lambda _=False, p=path: self._open_path(p))
+        row_layout.addWidget(icon); row_layout.addWidget(name, 1); row_layout.addWidget(open_btn)
+        return row
 
 
 class TaskProgressCard(QFrame):
@@ -786,10 +854,13 @@ class HomeAgentWindow(QMainWindow):
     def _connect(self):
         self.send_btn.clicked.connect(self.send); self.stop_btn.clicked.connect(self.stop_task); self.voice_btn.clicked.connect(self.toggle_record); QShortcut(QKeySequence("Ctrl+Return"), self.input, activated=self.send)
         self.input.image_pasted.connect(self.accept_pasted_image); self.add_attachment_btn.clicked.connect(self.choose_attachments)
-        self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.progress.connect(self.update_task_progress); self.bridge.reminder.connect(self._show_reminder); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
+        self.bridge.answer.connect(lambda text: self.append_message("assistant", self.agent.character_name, text)); self.bridge.media.connect(self.append_media); self.bridge.error.connect(lambda text: self.append_message("error", "错误", text)); self.bridge.status.connect(self.set_status); self.bridge.progress.connect(self.update_task_progress); self.bridge.reminder.connect(self._show_reminder); self.bridge.finished.connect(self.finish_task); self.bridge.transcription.connect(self.accept_transcription); self.bridge.confirm.connect(self.show_confirmation)
 
     def append_message(self, role, name, text):
         self.message_layout.insertWidget(self.message_layout.count() - 1, MessageBubble(role, name, str(text)))
+
+    def append_media(self, media):
+        self.message_layout.insertWidget(self.message_layout.count() - 1, MediaBubble(list(media or [])))
         QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
 
     def set_status(self, text): self.status.setText(str(text))

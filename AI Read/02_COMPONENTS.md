@@ -39,7 +39,10 @@
 - `HomeAgent/self_upgrade.py`：未完成任务持久化、自升级校验与重启恢复。
 - `HomeAgent/restart_watchdog.py`：直接重启与升级后重启共用的进程接力器；等待旧 HomeAgent 退出后启动新实例。
 - `HomeAgent/home_modules/code_editor.py` 与 `self_upgrade.py` 共同保证自升级意图识别、真实变更要求、文档同步、语法校验和重启门禁；空变更不能完成自升级。
-- `HomeAgent/home_modules/code_editor.py`：隔离的代码工程模块，负责自身/独立项目识别、工程合同、文件追踪、Python/YAML/JSON/Node/TypeScript/静态网页校验和自主测试。
+- `HomeAgent/home_modules/code_editor.py`：隔离的代码工程模块，负责自身/独立项目识别、工程合同、文件追踪与变更基线；语法/静态校验和自主测试委托给独立的 `code_validator.py`。
+- `HomeAgent/home_modules/code_validator.py`：独立代码验证模块，负责文件级语法检查（Python/JSON/YAML/TOML/INI/JS/HTML/CSS）、`git diff --check` 仓库静态检查，以及按项目类型运行的自主测试（py_compile、pytest/unittest、node、tsc、npm test）。
+- `HomeAgent/home_modules/comfyui_client.py`：独立 ComfyUI 生成模块，负责服务探测/自动启动、模型枚举、API 工作流构造（Qwen-Image-2512 写实生图、Anima 动漫生图、Qwen-Image-Edit-2511 改图、MiniMax-H3 文生视频/图生视频）、任务轮询与输出下载。
+- `HomeAgent/home_modules/cosyvoice_tts.py`：独立 CosyVoice2 情绪 TTS 模块，负责服务探测/自动启动、参考音色枚举、把台词中的（括号）语气描写解析为情绪指令、调用 `/inference_instruct2` 合成并保存 24kHz WAV。
 - `HomeAgent/home_modules/mimo_multimodal.py`：MiMo 图片理解、DeepSeek 图像识别（视觉代理方案）、WAV/MP3 语音识别和基于工具证据的任务完成独立核验。
 - `HomeAgent/home_modules/audio_capture.py`：校验麦克风设备与采样率；配置采样率不可用时选择设备原生采样率，设备 ID 失效时回退系统默认输入。
 - `HomeAgent/agent.py::proactive_screen_care`：临时截取主屏幕、用 MiMo 生成隐私安全的简短关怀语、按配置播报并保证截图清理。
@@ -54,6 +57,7 @@
 ## Skills
 
 - `ai-live-character-image`：角色图片生成、编辑和登记。
+- `comfyui-image-video`：调用本地 ComfyUI 生成图像、编辑图像和生成带音频视频，输出可直接展示/打开的文件。
 - `schedule-home-task`：提醒、闹钟、一次性/周期任务。
 - `sing-with-mimo`：默认本地 TTS 朗读歌词，MiMo 为关闭的备用分支。
 - `web-agent-operator`：无图像识别的多步网页操作与最终状态验证。

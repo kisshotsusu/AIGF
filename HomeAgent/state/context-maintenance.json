@@ -1,7 +1,7 @@
 {
-  "next_run_at": "2026-08-04T03:00:00",
+  "next_run_at": "2026-08-08T03:00:00",
   "status": "pending",
-  "last_attempt_at": "2026-08-03T20:28:45",
-  "last_success_at": "2026-08-03T20:28:45",
+  "last_attempt_at": "2026-08-07T20:03:11",
+  "last_success_at": "2026-08-07T20:03:11",
   "last_error": null
 }

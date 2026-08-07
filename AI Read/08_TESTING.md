@@ -14,7 +14,7 @@
 
 ## 自动测试
 
-### Home Agent：115 项
+### Home Agent：161 项
 
 ```powershell
 Set-Location E:\Doc\AIAgent\HomeAgent
@@ -26,7 +26,10 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 | `test_command_executor.py` | 4 | PowerShell/CMD、工作目录、引号与退出码 |
 | `test_input_queue.py` | 14 | 多附件、异步预览、发送线程非阻塞、麦克风原生采样率协商与失效设备回退、缩放、FIFO、QThread 与重启门禁 |
 | `test_mimo_multimodal.py` | 25 | 图片/ASR 请求、DeepSeek 视觉代理与自动回退、纯文本图片消息、完成检查、音乐视觉终态、原生窗口输入保护、最新证据压缩、证据时间、截图重试、媒体停止与关怀 |
-| `test_self_programming_and_delivery.py` | 61 | 模型计划约束、定时任务与自升级状态隔离、完整代码路径与 Codex 权限、过期视觉证据淘汰、音乐完成门禁、自升级恢复、文件/代码工具、角色图片路径、消息/TTS 顺序 |
+| `test_code_validator.py` | 11 | 独立代码验证模块：Python/JSON/YAML/TOML/INI/JS/HTML/CSS 语法检查、git diff --check、项目自动测试与 code_editor 委托 |
+| `test_comfyui_client.py` | 19 | ComfyUI 模块：图像/编辑/视频工作流构造、正向质量后缀与默认负面提示词、编辑身份/解剖保护词、步数策略与 denoise、MiniMax 图生视频首帧与 INT8、尺寸吸附、输出收集、媒体发布与工具结果透传 |
+| `test_cosyvoice_tts.py` | 12 | CosyVoice2 模块：括号语气词解析与情绪指令映射（含娇羞/柔弱）、参考音色解析、WAV 输出、相对路径解析与音频媒体发布 |
+| `test_self_programming_and_delivery.py` | 65 | 模型计划约束、定时任务与自升级状态隔离、完整代码路径与 Codex 权限、过期视觉证据淘汰、音乐完成门禁、自升级恢复、文件/代码工具、角色图片路径与编辑别名解析、CosyVoice 工具开关、消息/TTS 顺序、tool 消息连续性回归 |
 | `test_system_startup.py` | 4 | 开机启动、手动启动保护与重启计数 |
 | `test_task_progress_card.py` | 7 | 紧凑任务卡、窄窗口、关怀设置、消息与气泡同步 |
 
@@ -69,7 +72,8 @@ Set-Location E:\Doc\AIAgent
 & .\.venv\Scripts\python.exe -m py_compile `
   HomeAgent\agent.py HomeAgent\app.py HomeAgent\qt_app.py `
   HomeAgent\self_upgrade.py HomeAgent\home_modules\code_editor.py `
-  HomeAgent\home_modules\mimo_multimodal.py `
+  HomeAgent\home_modules\mimo_multimodal.py HomeAgent\home_modules\comfyui_client.py `
+  HomeAgent\home_modules\cosyvoice_tts.py `
   Vision\agent.py modules\live\ai_live_assistant\app.py
 
 & .\.venv\Scripts\python.exe -c "from pathlib import Path; import yaml; [yaml.safe_load(Path(p).read_text(encoding='utf-8')) for p in ('config.yaml','HomeAgent/config.yaml')]; print('yaml-ok')"
@@ -78,6 +82,7 @@ git diff --check
 ```
 
 不要使用系统裸 `python` 跑 Qt 测试；它可能缺少 PySide6。
+静态检查现由 `HomeAgent/home_modules/code_validator.py` 封装：`code_validate_project` 工具和 Codex 代码任务门禁会自动执行文件语法检查、`git diff --check` 与项目自动测试。
 
 ## 规划器真实冒烟
 

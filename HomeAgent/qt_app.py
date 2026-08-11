@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from modules.live.ai_live_assistant.instance_lock import InstanceLock
 from home_modules.audio_capture import resolve_input_settings
-from home_modules.system_startup import AUTOSTART_ARGUMENT, run_network_guard, set_windows_autostart
+from home_modules.system_startup import AUTOSTART_ARGUMENT, configure_system_autostart, greeting_enabled, greeting_text, run_network_guard, set_windows_autostart
 
 
 COLORS = {
@@ -420,6 +420,30 @@ class ChatWorker(QThread):
             self.loop.call_soon_threadsafe(self.task.cancel)
 
 
+class AutostartGreetingWorker(QThread):
+    """Speak a short greeting after a real system-autostart launch.
+
+    Runs in its own thread so startup is never blocked; the greeting is only
+    spoken when the launch was triggered by Windows autostart and the feature
+    is enabled in the system_startup config.
+    """
+
+    failed = Signal(str)
+
+    def __init__(self, agent: HomeAgent, text: str, delay_seconds: float = 3.0):
+        super().__init__(); self.agent = agent; self.text = text; self.delay = max(0.0, float(delay_seconds))
+
+    def run(self):
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            if self.agent.cancel_event.is_set():
+                return
+            asyncio.run(self.agent._speak_with_fresh_session(self.text))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ScreenCareWorker(QThread):
     cared = Signal(str)
     failed = Signal(str)
@@ -778,7 +802,7 @@ class SettingsDialog(QDialog):
             upgrade = cfg.setdefault("self_upgrade", {}); upgrade["enabled"] = self.upgrade_enabled.isChecked(); upgrade["auto_restart"] = self.upgrade_restart.isChecked(); upgrade["require_validation"] = self.upgrade_validation.isChecked(); upgrade["max_restart_attempts"] = self.upgrade_attempts.value()
             wake = cfg.setdefault("prompt_wake", {}); wake["enabled"] = self.wake_enabled.isChecked(); wake["auto_send_after_wake"] = self.wake_auto_send.isChecked(); wake["wake_confirmation_sound"] = self.wake_confirmation.isChecked(); wake["wake_timeout_seconds"] = self.wake_timeout.value(); wake["energy_threshold"] = self.wake_energy.value(); wake["wake_words"] = [w.strip() for w in self.wake_words_input.text().split(",") if w.strip()]
             temp = path.with_suffix(".yaml.tmp"); temp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"); temp.replace(path)
-            set_windows_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")
+            configure_system_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")
             self._sync_startup_controls()
             self.agent.config = cfg; self.owner.apply_always_on_top(); self.owner.apply_screen_care_settings(); self.owner.apply_wake_listener_settings(); self.status.setText(f"已实时保存 · {datetime.now():%H:%M:%S}")
         except Exception as exc: self.status.setText(f"保存失败：{exc}")
@@ -1422,4 +1446,9 @@ def run():
             daemon=True,
             name="network-startup-guard",
         ).start()
+        if greeting_enabled(startup_cfg):
+            greeting = AutostartGreetingWorker(window.agent, greeting_text(startup_cfg))
+            greeting.failed.connect(lambda error: window.agent.log_event("autostart_greeting_failed", error=error))
+            greeting.start()
+            window.agent.log_event("autostart_greeting_scheduled", text=greeting_text(startup_cfg))
     return app.exec()

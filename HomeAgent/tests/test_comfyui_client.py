@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from home_modules.comfyui_client import ComfyUIClient
 from agent import HomeAgent
@@ -89,6 +90,40 @@ class ComfyUIClientTests(unittest.TestCase):
         self.assertEqual(workflow["20"]["class_type"], "LoadImage")
         self.assertEqual(workflow["6"]["inputs"]["first_frame"], ["20", 0])
         self.assertIn("int8", workflow["1"]["inputs"]["unet_name"])
+
+    def test_video_workflow_accepts_explicit_unet_name(self):
+        workflow = self.client._build_video_workflow(
+            self.client.PRESETS["minimax-h3"], "continue motion", 1344, 768, 24, 6, 5, 24,
+            None, "test/video", use_int8=False, unet_name="custom_video.safetensors",
+        )
+        self.assertEqual(workflow["1"]["inputs"]["unet_name"], "custom_video.safetensors")
+
+    def test_select_video_unet_prefers_nvfp4_when_available(self):
+        preset = self.client.PRESETS["minimax-h3"]
+        unet, use_int8 = self.client._select_video_unet(preset, [preset["unet"], preset["unet_int8"]])
+        self.assertEqual(unet, preset["unet"])
+        self.assertFalse(use_int8)
+
+    def test_select_video_unet_falls_back_to_int8_when_nvfp4_missing(self):
+        preset = self.client.PRESETS["minimax-h3"]
+        unet, use_int8 = self.client._select_video_unet(preset, [preset["unet_int8"]])
+        self.assertEqual(unet, preset["unet_int8"])
+        self.assertTrue(use_int8)
+
+    async def test_list_models_marks_video_preset_availability(self):
+        client = self.client
+        client._object_info = AsyncMock(return_value={"UNETLoader": {"input": {"required": {"unet_name": [[], {}]}}}})
+        client._available_diffusion_models = AsyncMock(return_value=[
+            "anima-base-v1.0.safetensors",
+            "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        ])
+        result = await client.list_models()
+        video = next(item for item in result["presets"] if item["name"] == "minimax-h3")
+        self.assertTrue(video["available"])
+        client._available_diffusion_models = AsyncMock(return_value=["anima-base-v1.0.safetensors"])
+        result = await client.list_models()
+        video = next(item for item in result["presets"] if item["name"] == "minimax-h3")
+        self.assertFalse(video["available"])
 
     def test_clamp_size_snaps_to_supported(self):
         width, height = self.client._clamp_size(1300, 700, self.client.PRESETS["minimax-h3"]["sizes"])

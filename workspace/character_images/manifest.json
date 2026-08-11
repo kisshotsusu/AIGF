@@ -1,5 +1,5 @@
 {
-  "primary": "64db0915e4bf4f52a63a6e1b4da9bb58",
+  "primary": "generated-primary-optimized-20260811",
   "images": [
     {
       "id": "64db0915e4bf4f52a63a6e1b4da9bb58",
@@ -32,6 +32,32 @@
       "label": "桌宠窗口图标",
       "tags": ["Q版", "桌宠", "图标", "透明背景", "170x170"],
       "created_at": "2026-07-17T21:00:00"
+    },
+    {
+      "id": "user-swimsuit-reference-20260810",
+      "filename": "泳装参考图.png",
+      "original_name": "泳装参考图.png",
+      "label": "泳装参考图",
+      "tags": ["泳装", "换装变体", "参考图", "用户提供"],
+      "created_at": "2026-08-10T23:11:44"
+    },
+    {
+      "id": "user-artwork-source-20260811",
+      "filename": "角色立绘原稿.png",
+      "original_name": "角色立绘原稿.png",
+      "label": "角色立绘原稿",
+      "tags": ["立绘", "参考图", "用户提供"],
+      "created_at": "2026-08-11T14:10:00"
+    },
+    {
+      "id": "generated-primary-optimized-20260811",
+      "filename": "主形象美术优化.png",
+      "original_name": "主形象美术优化.png",
+      "label": "主形象（美术优化）",
+      "tags": ["立绘", "主形象", "美术优化"],
+      "created_at": "2026-08-11T14:11:36",
+      "source": "comfyui-edit",
+      "prompt": "以角色立绘原稿为底图做高清美术优化：保持银灰及腰长发、红色挑染、猩红杏眼、黑白不对称挂脖露腰短上衣、渐变百褶裙、白色红饰浅口鞋；保持全身T字展示姿势、浅灰背景、赛璐璐平涂；重绘为高清精致线条，消除锯齿、像素化、模糊和多余杂线，修正肢体轮廓比例。"
     }
   ]
 }

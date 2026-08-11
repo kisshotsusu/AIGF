@@ -1,6 +1,6 @@
 # 当前实现状态
 
-核对日期：2026-07-24。本文件只记录当前有效行为，不保存逐次修复流水；历史问题应从 Git 和运行日志查询。
+核对日期：2026-08-10。本文件只记录当前有效行为，不保存逐次修复流水；历史问题应从 Git 和运行日志查询。
 
 ## 任务理解与执行
 
@@ -51,8 +51,13 @@
 
 - HomeAgent 通过 `home_modules/comfyui_client.py` 调用本地 ComfyUI（`http://127.0.0.1:8188`）；服务未运行时按桌面版相同参数自动启动，逻辑全部封装在独立模块中，主程序只做薄委托。
 - 支持 `comfy_generate_image`（Qwen-Image-2512 写实 / Anima 动漫）、`comfy_edit_image`（Qwen-Image-Edit-2511）、`comfy_generate_video`（MiniMax-H3 文生视频/图生视频，带音频），以及 `comfy_status` / `comfy_list_models`。
+- 视频生成防死循环：MiniMax nvfp4 模型缺失时自动回退 int8（`list_models` 带 available 标记）；工具与规划器明确“视频只能用 comfy_generate_video、失败就报告并停止、禁止改用画图工具冒充视频”；本机 16GB 显存下建议 frames≤24、steps≤10。
 - 图像/编辑生成会自动追加质量与风格正向提示词（masterpiece、highly detailed 等），并始终应用预设负面提示词（Anima 用英文质量标签，Qwen 用中文画质/畸形/水印描述）；用户显式传入的负面提示词与默认合并，模块配置可全局覆盖。
 - 角色绘图采用“设定图优先”流程：`comfy_edit_image` 支持 primary/角色三视图/正面照片等别名，Agent 被引导先用设定图改姿势、再用结果改背景，避免文生图导致角色细节丢失或多出无关主体。
+- 绘图路由按“有无参考图”执行：用户粘贴的附件路径会注入系统提示，有参考图/角色设定图/上一轮输出时一律 `comfy_edit_image`（`image` 用绝对路径、角色别名或上一轮 `media.path`），多张参考图分步串联，只有完全无参考图才允许 `comfy_generate_image`；用户风格词与负面词必须原样传入。
+- 防鬼图逻辑：skill 内置“先分析→按模板写提示词→选参数→生成→验收”五步规范与美术优化/改姿势提示词模板；负面词由 AI 智能填充（用户未给时自动补画质、脸部/手部/肢体、重复主体、多余人物、水印等，禁止留空）；编辑预设自动追加 single subject / clean lineart / no pixelation / no stray lines 正向词和线条断裂/锯齿/杂线/重复主体等负面词；编辑优先 4 步 Lightning LoRA（16GB 显存下 20 步无 LoRA 实测会中断/OOM）。
+- 图像/视频生成验收**只能**走 `analyze_image`（MiMo 视觉 API），验收模板检查身份锚点、构图、画质、崩坏（脸/手/肢体、重复主体）、文字水印；不通过只允许修改提示词或参数重试一次，禁止同参数重试和未验收交付。本地视觉识别只用于桌面点击操作，禁止用于生成质量判断。
+- Codex 用户级技能已安装第三方 `comfyui`（ComfyUI-Agent-Kit，含 minimax-h3/krea/seedance 配套）与 `auto-skill-installer`（find-skill），位于 `~/.codex/skills` 与 `~/.agents/skills`；HomeAgent 自身仍走 `Skill/comfyui-image-video` + `home_modules/comfyui_client.py`。
 - 改图预设强化：正向词条加入身份保持（same face/hairstyle/outfit），负面词条加入五官崩坏/多余手指/身体结构错误等解剖保护词，且编辑步数下限 8 步（默认 20 步），避免低步数导致五官肢体画崩。
 - 编辑步数策略修正：Lightning LoRA 按原生 4 步采样（此前 20 步 + LoRA 会过度处理导致与原图偏差大）；不带 LoRA 才用 20 步。`comfy_edit_image` 增加 `denoise` 参数（0.3～1.0，越低越保留原图）。
 - 生成结果复制到 `outputs/comfyui/`；工具结果携带 `media` 列表，聊天回复通过 Qt 媒体气泡直接展示图片缩略图（点击打开原图）和视频卡片（点击“打开”）。
@@ -85,11 +90,12 @@
 
 - 总控制台、Home Agent、角色管理器、直播助手、Vision 和 Sound 使用跨进程文件锁防止重复实例。
 - Home Agent 可按配置拉起 Vision 与 Sound；组件重启应只影响发生代码变化的服务。
+- 开机自启动通过 `configure_system_autostart` 同时登记启动文件夹、注册表 Run 键（`HKCU\...\Run\HomeAgent`）和登录触发任务计划（`HomeAgentAutostart`），自启动入口带 `--system-autostart`；`greeting_on_startup` 为真时 Home Agent 在后台线程用 TTS 向主人播放 `greeting_text` 打招呼，不阻塞启动。
 - 主形象、三视图和固定外观文档位于 `workspace/character_images/` 与 `workspace/CHARACTER.md`。
 
 ## 当前验证基线
 
-- Home Agent：158 项自动测试。
+- Home Agent：172 项自动测试。
 - 角色管理器：4 项自动测试。
 - Vision：7 项窗口、截图与媒体停止测试。
 - 直播助手：5 项欢迎、队列和 TTS 可靠性测试。

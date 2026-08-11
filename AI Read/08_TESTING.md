@@ -14,7 +14,7 @@
 
 ## 自动测试
 
-### Home Agent：161 项
+### Home Agent：172 项
 
 ```powershell
 Set-Location E:\Doc\AIAgent\HomeAgent
@@ -27,10 +27,10 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 | `test_input_queue.py` | 14 | 多附件、异步预览、发送线程非阻塞、麦克风原生采样率协商与失效设备回退、缩放、FIFO、QThread 与重启门禁 |
 | `test_mimo_multimodal.py` | 25 | 图片/ASR 请求、DeepSeek 视觉代理与自动回退、纯文本图片消息、完成检查、音乐视觉终态、原生窗口输入保护、最新证据压缩、证据时间、截图重试、媒体停止与关怀 |
 | `test_code_validator.py` | 11 | 独立代码验证模块：Python/JSON/YAML/TOML/INI/JS/HTML/CSS 语法检查、git diff --check、项目自动测试与 code_editor 委托 |
-| `test_comfyui_client.py` | 19 | ComfyUI 模块：图像/编辑/视频工作流构造、正向质量后缀与默认负面提示词、编辑身份/解剖保护词、步数策略与 denoise、MiniMax 图生视频首帧与 INT8、尺寸吸附、输出收集、媒体发布与工具结果透传 |
+| `test_comfyui_client.py` | 23 | ComfyUI 模块：图像/编辑/视频工作流构造、正向质量后缀与默认负面提示词、编辑身份/解剖保护词、步数策略与 denoise、MiniMax 模型探测/回退与可用性标记、图生视频首帧、尺寸吸附、输出收集、媒体发布与工具结果透传 |
 | `test_cosyvoice_tts.py` | 12 | CosyVoice2 模块：括号语气词解析与情绪指令映射（含娇羞/柔弱）、参考音色解析、WAV 输出、相对路径解析与音频媒体发布 |
 | `test_self_programming_and_delivery.py` | 65 | 模型计划约束、定时任务与自升级状态隔离、完整代码路径与 Codex 权限、过期视觉证据淘汰、音乐完成门禁、自升级恢复、文件/代码工具、角色图片路径与编辑别名解析、CosyVoice 工具开关、消息/TTS 顺序、tool 消息连续性回归 |
-| `test_system_startup.py` | 4 | 开机启动、手动启动保护与重启计数 |
+| `test_system_startup.py` | 11 | 开机启动、手动启动保护、重启计数、开机打招呼配置、注册表 Run 键与登录任务计划命令构造/登记 |
 | `test_task_progress_card.py` | 7 | 紧凑任务卡、窄窗口、关怀设置、消息与气泡同步 |
 
 单项定位：
@@ -136,6 +136,7 @@ GPT-SoVITS 成功时不得调用 Windows SAPI；只有主 TTS 真实失败才允
 4. 发送大图时 UI 不阻塞、不跳位，任务忙碌时输入进入队列。
 5. 提醒或关怀触发时，聊天消息和桌宠气泡同步出现，TTS 随后播放。
 6. 打开上下文调试页，确认家庭系统提示不包含原始直播聊天流水。
+7. 粘贴一张参考图并说“改成坐姿”，执行模型应调用 `comfy_edit_image` 并把附件绝对路径传给 `image`，而不是改用 `comfy_generate_image`；检查任务活动卡工具名与最终图片。
 
 ## 重启与日志
 

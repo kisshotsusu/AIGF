@@ -559,7 +559,7 @@ class HomeAgent:
         
         # 如果不支持多模态，只返回文本描述
         if not support_multimodal:
-            image_names = [Path(v).name for v in values]
+            image_names = [f"{Path(v).name}（{Path(v).expanduser().resolve()}）" for v in values]
             prompt = str(text or "").strip()
             if not prompt:
                 prompt = f"[用户发送了 {len(values)} 张图片：{', '.join(image_names)}，但当前模型不支持图片识别，请用文字描述图片内容。]"
@@ -698,8 +698,22 @@ class HomeAgent:
                 "必须判定implementation_change=false、domain=file、execution_strategy=tool_loop；持久写入文件本身不等于修改程序实现。"
                 "例如“读取你自己的角色三视图，并完善固定外观文档”应先列出已登记角色图片，使用清单返回的绝对路径分析三视图，"
                 "再读取、写入并重新读取CHARACTER.md；不得进入code_loop或调用code_validate_project。"
-                "涉及已有角色形象/设定图（primary、角色三视图、正面照片等）的绘图任务：优先 comfy_edit_image 以设定图为底修改姿势，"
-                "再用改好姿势的结果修改背景；禁止用 comfy_generate_image 凭空重新生成导致角色细节丢失，只有没有现成角色图时才允许文生图。"
+                "绘图任务必须先判断有无参考图再选工具：用户附带了图片（本消息已附带 N 张图片）、有已登记角色设定图"
+                 "（primary、角色三视图、正面照片等）、明确说“这张图/刚才那张图”，或要沿用上一轮生成结果时，"
+                 "一律用 comfy_edit_image，image 填参考图绝对路径或角色别名，禁止用 comfy_generate_image 凭空重画；"
+                 "多张参考图时先选最合适的底图，或按“设定图改姿势→结果图改背景”分步串联，第二次的 image 用第一次输出 media.path；"
+                 "只有完全没有参考图、要求全新场景或全新角色时才允许 comfy_generate_image。"
+                 "用户给的风格词、构图词、负面词必须原样传入 prompt/negative_prompt，不要丢弃；"
+                 "参考图细节不清楚时可先 list_character_images 或 analyze_image 再编辑。"
+                 "图像编辑的提示词必须按 Skill/comfyui-image-video/SKILL.md 的防鬼图模板组织："
+                 "先写“以这张图为底图，保持角色身份和构图完全一致”，再列出 CHARACTER.md 角色锚点与要修复/修改的点，"
+                 "最后用负面词库；编辑优先 use_lora=true 4步、denoise 0.65～0.85；"
+                 "生成后必须用 analyze_image 验收，不合格只允许改提示词或参数重试一次，禁止同参数重试。"
+                 "图像/视频生成验收只能走 analyze_image（MiMo 视觉 API），禁止用本地视觉或截图工具判断生成质量；"
+                 "本地视觉工具只用于桌面点击操作。"
+                 "负面词必须由你智能填充：用户未给时根据任务自动补画质、肢体结构、重复主体、多余人物、水印等词，禁止留空或只靠默认。"
+                "视频/动画请求只能用 comfy_generate_video；视频生成失败时如实报告原因并停止，"
+                "禁止改用 comfy_generate_image/comfy_edit_image 画静态图冒充视频，也不要反复重试相同参数。"
                 "调用现有维护能力清理数据不等于修改程序实现。例如“清理直播消息/直播上下文”必须为"
                 "implementation_change=false、domain=memory、execution_strategy=tool_loop，并调用clear_live_context；"
                 "若用户否定清理或只询问功能原理，则actionable=false且不得调用该工具。"
@@ -1719,7 +1733,7 @@ class HomeAgent:
             {"type": "function", "function": {"name": "clear_live_context", "description": "清空直播短期模型上下文；不删除审计日志和长期记忆，返回清理数量。", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "list_character_images", "description": "列出角色形象库、主形象以及每张图片的规范绝对路径和元数据。", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "generate_character_image", "description": "调用 ai-live-character-image 技能生成或编辑角色形象", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "operation": {"type": "string", "enum": ["generate", "edit"]}, "reference": {"type": "string", "description": "编辑时使用 primary 或图片路径"}, "label": {"type": "string"}, "tags": {"type": "string"}, "set_primary": {"type": "boolean"}}, "required": ["prompt"]}}},
-            {"type": "function", "function": {"name": "analyze_image", "description": "理解图片内容、识别画面细节或文字（按配置优先 DeepSeek 视觉代理，失败自动回退 MiMo）；不用于生成图片。已登记角色图可传 primary、图片ID、文件名、标签或 list_character_images 返回的绝对路径。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片绝对路径；已登记角色图也可用 primary、ID、文件名或标签"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
+            {"type": "function", "function": {"name": "analyze_image", "description": "理解图片内容、识别画面细节或文字（按配置优先 DeepSeek 视觉代理，失败自动回退 MiMo）；不用于生成图片。它是图像/视频生成验收的唯一通道：ComfyUI 生成后必须用它检查身份、画质与崩坏。做图像编辑前也可用它分析参考图。本地视觉工具只用于桌面点击操作，禁止用于生成质量判断。已登记角色图可传 primary、图片ID、文件名、标签或 list_character_images 返回的绝对路径。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "图片绝对路径；已登记角色图也可用 primary、ID、文件名或标签"}, "prompt": {"type": "string", "description": "希望从图片中分析的问题"}}, "required": ["image", "prompt"]}}},
             {"type": "function", "function": {"name": "mimo_transcribe_audio", "description": "使用 MiMo API 识别项目内 WAV 或 MP3 语音文件", "parameters": {"type": "object", "properties": {"audio": {"type": "string", "description": "项目内音频路径"}, "language": {"type": "string", "enum": ["auto", "zh", "en"]}}, "required": ["audio"]}}},
             {"type": "function", "function": {"name": "sing_song", "description": "使用角色当前本地 TTS/SVC 音色朗读最多十行给定歌词，并返回生成和播放结果。", "parameters": {"type": "object", "properties": {"song": {"type": "string", "description": "歌曲名称或演唱主题"}, "lyrics": {"type": "string", "description": "最多十行需要朗读的歌词或测试文本"}, "style": {"type": "string", "description": "演唱或朗读情绪"}, "voice": {"type": "string", "description": "仅备用 MiMo 分支使用"}}, "required": ["song", "lyrics"]}}},
             {"type": "function", "function": {"name": "create_scheduled_task", "description": "创建TTS语音提醒或闹钟。一次性任务成功执行后自动删除；重复任务会保留并等待下一次。必须根据当前本地时间解析用户的自然语言时间。", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "message": {"type": "string", "description": "触发时由TTS播放的文本"}, "recurrence": {"type": "string", "enum": ["once", "daily", "weekdays", "weekly"]}, "scheduled_at": {"type": "string", "description": "仅once使用，本地ISO时间，如2026-07-17T15:00"}, "time": {"type": "string", "description": "重复任务使用的24小时HH:MM"}, "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 7}, "description": "仅weekly使用，周一为1、周日为7"}, "action": {"type": "string", "enum": ["tts"]}}, "required": ["title", "message", "recurrence"]}}},
@@ -1732,9 +1746,9 @@ class HomeAgent:
             tools += [
                 {"type": "function", "function": {"name": "comfy_status", "description": "检查本地 ComfyUI 服务是否运行、版本与当前队列状态；未运行时按配置自动拉起。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "comfy_list_models", "description": "列出 ComfyUI 已安装的生成模型预设（图像/编辑/视频）与可用模型文件名。", "parameters": {"type": "object", "properties": {}}}},
-                {"type": "function", "function": {"name": "comfy_generate_image", "description": "调用本地 ComfyUI 从文字生成全新图像（Qwen-Image-2512 写实 / Anima 动漫）。注意：已有角色设定图（primary、角色三视图、正面照片等）时禁止用它凭空重画角色，应改用 comfy_edit_image 基于设定图修改。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "英文或中文正向提示词，描述主体、风格、构图、光影"}, "negative_prompt": {"type": "string", "description": "负向提示词"}, "model": {"type": "string", "enum": ["qwen-image-2512", "anima"], "description": "写实默认 qwen-image-2512；动漫风格用 anima"}, "width": {"type": "integer", "description": "宽度，默认 1024（会自动吸附到模型支持尺寸）"}, "height": {"type": "integer", "description": "高度，默认 1024"}, "steps": {"type": "integer", "description": "采样步数；使用 Lightning LoRA 时 4 步即可，默认 40"}, "cfg": {"type": "number"}, "seed": {"type": "integer"}, "use_lora": {"type": "boolean", "description": "是否加载加速 LoRA，默认 true"}}, "required": ["prompt"]}}},
-                {"type": "function", "function": {"name": "comfy_edit_image", "description": "调用本地 ComfyUI（Qwen-Image-Edit-2511）基于一张现有图片修改内容，角色一致性最好。image 支持绝对路径或已登记角色图（primary、角色三视图、正面照片、文件名）。推荐流程：先用角色设定图改姿势，再用改好姿势的结果改背景。denoise 越低越贴近原图（0.6～0.8 适合微调，1.0 完全重绘）。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "待编辑图片路径或已登记角色图（primary/角色三视图/正面照片/文件名）"}, "prompt": {"type": "string", "description": "编辑指令，例如“改成水彩画风格”“改成坐姿，侧身回眸”"}, "negative_prompt": {"type": "string"}, "model": {"type": "string", "enum": ["qwen-image-edit-2511"]}, "steps": {"type": "integer"}, "cfg": {"type": "number"}, "seed": {"type": "integer"}, "denoise": {"type": "number", "minimum": 0.3, "maximum": 1.0, "description": "重绘强度，默认 1.0；想保留更多原图细节用 0.6～0.8"}}, "required": ["image", "prompt"]}}},
-                {"type": "function", "function": {"name": "comfy_generate_video", "description": "调用本地 ComfyUI（MiniMax-H3）生成带音频的视频，支持文字生视频或首帧图生视频。生成耗时很长（数分钟），完成后返回视频文件路径。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "视频描述：画面主体、动作、镜头运动、氛围，可带时间线分段"}, "model": {"type": "string", "enum": ["minimax-h3"]}, "width": {"type": "integer", "description": "默认 1344"}, "height": {"type": "integer", "description": "默认 768"}, "frames": {"type": "integer", "description": "帧数，默认 49（约 2 秒 @24fps），最多 1024"}, "steps": {"type": "integer", "description": "采样步数，默认 20"}, "fps": {"type": "integer", "description": "帧率，默认 24"}, "seed": {"type": "integer"}, "first_frame": {"type": "string", "description": "可选：首帧图片路径，用于图生视频"}, "use_int8": {"type": "boolean", "description": "使用 INT8 量化版模型节省显存，默认 false"}}, "required": ["prompt"]}}},
+                {"type": "function", "function": {"name": "comfy_generate_image", "description": "调用本地 ComfyUI 从文字生成全新图像（Qwen-Image-2512 写实 / Anima 动漫）。只在完全没有参考图时使用：只要存在用户粘贴的附件图、已登记角色设定图（primary、角色三视图、正面照片等）或上一步生成的图，就必须改用 comfy_edit_image 以该图路径为底图，禁止凭空重画导致角色/构图丢失。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "英文或中文正向提示词，描述主体、风格、构图、光影"}, "negative_prompt": {"type": "string", "description": "负向提示词；若用户未提供，你必须根据任务智能填充（画质、肢体结构、重复主体、多余人物、水印等），禁止留空；程序会自动合并默认负面词"}, "model": {"type": "string", "enum": ["qwen-image-2512", "anima"], "description": "写实默认 qwen-image-2512；动漫风格用 anima"}, "width": {"type": "integer", "description": "宽度，默认 1024（会自动吸附到模型支持尺寸）"}, "height": {"type": "integer", "description": "高度，默认 1024"}, "steps": {"type": "integer", "description": "采样步数；使用 Lightning LoRA 时 4 步即可，默认 40"}, "cfg": {"type": "number"}, "seed": {"type": "integer"}, "use_lora": {"type": "boolean", "description": "是否加载加速 LoRA，默认 true"}}, "required": ["prompt"]}}},
+                {"type": "function", "function": {"name": "comfy_edit_image", "description": "调用本地 ComfyUI（Qwen-Image-Edit-2511）基于一张现有图片修改内容，角色一致性最好。image 参数必填：传用户附件绝对路径（见系统提示【本次消息附带的图片】）、list_character_images 返回的路径、已登记角色图别名（primary/角色三视图/正面照片/文件名），或上一轮 comfy_edit_image 输出结果的 media.path。编辑指令请按 Skill/comfyui-image-video/SKILL.md 防鬼图模板组织：先写“以这张图为底图，保持角色身份和构图完全一致”，列出 CHARACTER.md 角色锚点，再写要修复/修改的点，用户给的风格/构图/负面词原样放进 prompt/negative_prompt（程序会自动合并默认质量词）。推荐流程：先用角色设定图改姿势，再用第一次输出路径改背景。优先 use_lora=true 4 步；denoise 0.6～0.7 保细节微调，0.7～0.85 改姿势/背景，0.9～1.0 大改。", "parameters": {"type": "object", "properties": {"image": {"type": "string", "description": "待编辑图片绝对路径或已登记角色图（primary/角色三视图/正面照片/文件名），或用上一轮编辑输出的 media.path"}, "prompt": {"type": "string", "description": "编辑指令，例如“改成水彩画风格”“改成坐姿，侧身回眸”；必须保留角色外貌/服装细节，风格词原样带上"}, "negative_prompt": {"type": "string", "description": "负向提示词；若用户未提供，你必须根据任务智能填充（画质、肢体结构、脸部/手部、重复主体、多余人物、水印等），禁止留空；程序会自动合并默认画质/结构负面词"}, "model": {"type": "string", "enum": ["qwen-image-edit-2511"]}, "steps": {"type": "integer", "description": "默认 4（Lightning LoRA 原生步数）；本机 16GB 显存不要无 LoRA 跑 20 步，易中断/OOM"}, "cfg": {"type": "number"}, "seed": {"type": "integer"}, "denoise": {"type": "number", "minimum": 0.3, "maximum": 1.0, "description": "重绘强度，默认 1.0；美术优化/清线稿 0.65～0.75，改姿势/背景 0.7～0.85，保细节微调 0.6～0.7"}}, "required": ["image", "prompt"]}}},
+                {"type": "function", "function": {"name": "comfy_generate_video", "description": "生成视频的唯一工具：调用本地 ComfyUI（MiniMax-H3）生成带音频的视频，支持文字生视频或首帧图生视频。模型版本自动探测：nvfp4 缺失时自动回退 int8。生成耗时很长（数分钟）。失败时如实报告原因并停止，禁止改用 comfy_generate_image/comfy_edit_image 画静态图代替，也不要反复重试相同参数。", "parameters": {"type": "object", "properties": {"prompt": {"type": "string", "description": "视频描述：画面主体、动作、镜头运动、氛围，可带时间线分段"}, "model": {"type": "string", "enum": ["minimax-h3"]}, "width": {"type": "integer", "description": "默认 1344"}, "height": {"type": "integer", "description": "默认 768"}, "frames": {"type": "integer", "description": "帧数，默认 49（约 2 秒 @24fps），最多 1024；显存紧张时建议 ≤24"}, "steps": {"type": "integer", "description": "采样步数，默认 20；显存紧张时建议 ≤10"}, "fps": {"type": "integer", "description": "帧率，默认 24"}, "seed": {"type": "integer"}, "first_frame": {"type": "string", "description": "可选：首帧图片路径，用于图生视频"}, "use_int8": {"type": "boolean", "description": "强制 INT8 量化版模型，默认自动选择"}}, "required": ["prompt"]}}},
             ]
         if getattr(self, "cosyvoice", None) is not None and self.cosyvoice.config.get("enabled", True):
             tools += [
@@ -2142,8 +2156,19 @@ class HomeAgent:
                 "本地工具与 Codex 均可直接使用；根据任务复杂度和当前证据自主选择，不必先制造本地工具失败。"
                 "每次工具返回后由你结合目标和证据重新判断下一步。"
                 "点击、输入、快捷键和滚动工具会自动等待并重新截图；读取 state_changed 与 post_action_verified，但不要把工具结果当成业务结论。"
-                "所有工具证据都带 task_submitted_at、tool_submitted_at、tool_completed_at 和 tool_sequence；判断状态时必须让较新的同对象证据覆盖旧证据。"
-                "Vision 的 vision_request_submitted_at/screenshot_captured_at 表示画面所属时刻，分析完成较晚时不得把旧画面当成当前状态。"
+                 "所有工具证据都带 task_submitted_at、tool_submitted_at、tool_completed_at 和 tool_sequence；判断状态时必须让较新的同对象证据覆盖旧证据。"
+                 "Vision 的 vision_request_submitted_at/screenshot_captured_at 表示画面所属时刻，分析完成较晚时不得把旧画面当成当前状态。"
+            )
+        if task_plan.get("actionable") and any(
+            name in str(task_plan.get("preferred_tools") or [])
+            for name in ("comfy_generate_image", "comfy_edit_image", "comfy_generate_video")
+        ):
+            operation_contract += (
+                "\n\n【ComfyUI 生成验收铁律】\n"
+                "ComfyUI 生成成功返回 media 后，下一步必须先调用 analyze_image（MiMo 视觉 API）用 media.path 验收："
+                "检查角色身份锚点、构图、画质，以及是否崩坏（脸/手/肢体、重复主体、多余人物、无关物体）、有无文字水印。"
+                "验收通过才能向用户交付；不通过只允许修改提示词或参数重试一次，禁止同参数重试，"
+                "更禁止把未验收图片直接交付。本地视觉工具只用于桌面点击操作，禁止用于图像验收。"
             )
         if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True):
             local_code_contract, loaded_documents = self.self_upgrade.code_editor.build_execution_contract(self_edit=self.current_code_self_edit)
@@ -2153,6 +2178,17 @@ class HomeAgent:
                 "可以直接使用 code_list_files、code_read_file、code_search_text、code_write_file、code_replace_text，"
                 "也可以直接调用 Codex 完成编辑。无论选择哪条路径，都必须取得真实变更和通过的本地验证后才能结束。"
             )
+        if image_paths:
+            attachment_block = "\n\n【本次消息附带的图片（可直接作为参考图/编辑底图）】\n"
+            for p in image_paths:
+                attachment_block += f"- {Path(p).expanduser().resolve()}\n"
+            attachment_block += (
+                "只要用户要求基于这些图片修改（改姿势/背景/风格/表情/服装/局部细节等），"
+                "必须调用 comfy_edit_image 并把上面对应的绝对路径传给 image 参数，"
+                "禁止改用 comfy_generate_image 凭空重画导致角色/构图丢失；"
+                "想先理解参考图细节可调用 analyze_image。"
+            )
+            operation_contract += attachment_block
         messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt() + operation_contract}, *self.history]
         if image_paths:
             for message_index in range(len(messages) - 1, 0, -1):

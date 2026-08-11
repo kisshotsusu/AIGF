@@ -80,8 +80,8 @@ class ComfyUIClient:
             "clip_type": "qwen_image",
             "vae": "qwen_image_vae.safetensors",
             "lora": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
-            "positive_suffix": "high quality, highly detailed, sharp focus, consistent lighting, coherent composition, keep the exact same character identity, same face, same hairstyle, same outfit",
-            "negative_default": "低分辨率，低画质，五官崩坏，脸部变形，眼睛错位，嘴歪，多余手指，手指数量错误，手臂扭曲，肢体比例失调，多手多脚，身体结构错误，透视错误，肢体畸形，手指畸形，文字模糊，构图混乱，画面过饱和，过度光滑，AI感，水印，签名，模糊，噪点，边缘破损，低清，模糊不清",
+            "positive_suffix": "high quality, highly detailed, sharp focus, consistent lighting, coherent composition, keep the exact same character identity, same face, same hairstyle, same outfit, single subject only, no duplicate characters, clean continuous lineart, no jagged edges, no pixelation, crisp clear details, no stray lines, no watermark",
+            "negative_default": "低分辨率，低画质，线条断裂，锯齿，像素化，多余线条，杂线，细红线，乱线，五官崩坏，脸部变形，眼睛错位，嘴歪，多余手指，手指数量错误，手臂扭曲，肢体比例失调，多手多脚，身体结构错误，透视错误，肢体畸形，手指畸形，重复主体，多余人物，双人，无关物体，文字模糊，构图混乱，画面过饱和，过度光滑，AI感，水印，签名，模糊，噪点，边缘破损，低清，模糊不清",
             "min_steps": 8,
             "shift": 3.1,
             "default_steps": 20,
@@ -214,6 +214,7 @@ class ComfyUIClient:
                     values = [str(v) for v in spec[0] if isinstance(v, str) and v.endswith((".safetensors", ".ckpt", ".pt", ".pth", ".bin"))]
                     if values:
                         choices.setdefault(node_name, []).extend(values)
+        available_diffusion = set(await self._available_diffusion_models())
         presets = []
         for name, preset in self.PRESETS.items():
             presets.append({
@@ -221,6 +222,10 @@ class ComfyUIClient:
                 "kind": preset["kind"],
                 "unet": preset.get("unet") or preset.get("unet_int8"),
                 "default_size": preset.get("sizes", [None])[0],
+                "available": bool(
+                    (preset.get("unet") in available_diffusion)
+                    or (preset.get("unet_int8") in available_diffusion)
+                ),
             })
         return {
             "ok": True,
@@ -228,6 +233,25 @@ class ComfyUIClient:
             "available_models": choices,
             "note": "文件名来自 ComfyUI /object_info；实际可用性以生成结果为准",
         }
+
+    async def _available_diffusion_models(self) -> list[str]:
+        """查询 ComfyUI 当前注册的 diffusion_models 文件名。"""
+        info = await self._object_info()
+        spec = (info.get("UNETLoader", {}).get("input", {}).get("required", {}) or {}).get("unet_name")
+        values = spec[0] if isinstance(spec, list) and spec and isinstance(spec[0], list) else []
+        return [str(value) for value in values if isinstance(value, str)]
+
+    @staticmethod
+    def _select_video_unet(preset: dict[str, Any], available: list[str]) -> tuple[str, bool]:
+        """优先 nvfp4，缺失时自动回退 int8；两者都缺返回首选（留给校验报错）。"""
+        available_set = set(available)
+        preferred = preset.get("unet")
+        alt = preset.get("unet_int8")
+        if preferred in available_set:
+            return preferred, False
+        if alt in available_set:
+            return alt, True
+        return preferred, False
 
     # ---------- 上传与输出 ----------
 
@@ -413,8 +437,8 @@ class ComfyUIClient:
         nodes["12"] = {"class_type": "SaveImage", "inputs": {"images": ["11", 0], "filename_prefix": filename_prefix}}
         return nodes
 
-    def _build_video_workflow(self, preset: dict[str, Any], prompt: str, width: int, height: int, frames: int, steps: int, seed: int, fps: int, first_frame_name: str | None, filename_prefix: str, use_int8: bool) -> dict[str, Any]:
-        unet = preset.get("unet_int8") if use_int8 else preset.get("unet")
+    def _build_video_workflow(self, preset: dict[str, Any], prompt: str, width: int, height: int, frames: int, steps: int, seed: int, fps: int, first_frame_name: str | None, filename_prefix: str, use_int8: bool, unet_name: str | None = None) -> dict[str, Any]:
+        unet = unet_name or (preset.get("unet_int8") if use_int8 else preset.get("unet"))
         nodes: dict[str, Any] = {
             "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet, "weight_dtype": "default"}},
             "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": preset["clip"], "type": preset["clip_type"]}},
@@ -513,14 +537,29 @@ class ComfyUIClient:
         fps = int(fps or preset.get("default_fps", 24))
         width, height = self._clamp_size(width, height, preset.get("sizes"))
         frames = max(1, min(1024, int(frames)))
+        available = await self._available_diffusion_models()
+        requested_int8 = bool(use_int8)
+        available_set = set(available)
+        if requested_int8 and preset.get("unet_int8") in available_set:
+            unet_name = preset["unet_int8"]
+            fallback_int8 = False
+        else:
+            unet_name, fallback_int8 = self._select_video_unet(preset, available)
         first_frame_name = None
         if first_frame:
             timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 first_frame_name = await self._upload_image(session, Path(first_frame))
-        workflow = self._build_video_workflow(preset, prompt, width, height, frames, steps, seed, fps, first_frame_name, filename_prefix, bool(use_int8))
+        workflow = self._build_video_workflow(preset, prompt, width, height, frames, steps, seed, fps, first_frame_name, filename_prefix, use_int8=False, unet_name=unet_name)
         default_video_timeout = 1800
-        return await self._run_workflow(workflow, filename_prefix, status, timeout_seconds or default_video_timeout)
+        try:
+            return await self._run_workflow(workflow, filename_prefix, status, timeout_seconds or default_video_timeout)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "value_not_in_list" in message and "unet_name" in message and not fallback_int8 and preset.get("unet_int8"):
+                workflow = self._build_video_workflow(preset, prompt, width, height, frames, steps, seed, fps, first_frame_name, filename_prefix, True, preset["unet_int8"])
+                return await self._run_workflow(workflow, filename_prefix, status, timeout_seconds or default_video_timeout)
+            raise
 
     @staticmethod
     def _clamp_size(width: int, height: int, allowed: list[tuple[int, int]] | None) -> tuple[int, int]:

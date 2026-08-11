@@ -47,7 +47,9 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         three_view = next(item for item in catalog["images"] if item["filename"] == "角色三视图.png")
         self.assertTrue(Path(three_view["path"]).is_absolute())
         self.assertTrue(Path(three_view["path"]).is_file())
-        self.assertEqual(Path(catalog["primary_path"]).name, "64db0915e4bf4f52a63a6e1b4da9bb58.png")
+        primary = next(item for item in catalog["images"] if item["filename"] == Path(catalog["primary_path"]).name)
+        self.assertTrue(Path(primary["path"]).is_file())
+        self.assertTrue(Path(catalog["primary_path"]).is_absolute())
 
     def test_registered_character_image_resolves_aliases_without_cwd_guessing(self) -> None:
         expected = (Path(__file__).resolve().parents[2] / "workspace" / "character_images" / "角色三视图.png").resolve()

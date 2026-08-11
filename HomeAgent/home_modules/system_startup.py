@@ -6,15 +6,19 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 
 AUTOSTART_ARGUMENT = "--system-autostart"
+REGISTRY_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+REGISTRY_VALUE_NAME = "HomeAgent"
+SCHEDULED_TASK_NAME = "HomeAgentAutostart"
 DEFAULT_TEST_URLS = (
     "https://www.bilibili.com/",
     "https://www.baidu.com/",
     "https://www.qq.com/",
 )
+DEFAULT_GREETING = "主人，早上好呀，苏苏已经准备好陪你了。"
 
 
 def startup_script_path(appdata: str | None = None) -> Path:
@@ -39,6 +43,61 @@ def set_windows_autostart(enabled: bool, launcher: Path, target: Path | None = N
     else:
         target.unlink(missing_ok=True)
     return target
+
+
+def registry_autostart_command(enabled: bool, launcher: Path) -> str:
+    """Return the reg.exe command that installs/removes the HKCU Run entry."""
+    if enabled:
+        quoted = f'"{launcher.resolve()}" {AUTOSTART_ARGUMENT}'
+        return f'reg add "{REGISTRY_RUN_KEY}" /v {REGISTRY_VALUE_NAME} /t REG_SZ /d "{quoted}" /f'
+    return f'reg delete "{REGISTRY_RUN_KEY}" /v {REGISTRY_VALUE_NAME} /f'
+
+
+def scheduled_task_command(enabled: bool, launcher: Path) -> str:
+    """Return the schtasks command that installs/removes a login-triggered task."""
+    if enabled:
+        quoted = f'"{launcher.resolve()}" {AUTOSTART_ARGUMENT}'
+        return (
+            f'schtasks /create /tn "{SCHEDULED_TASK_NAME}" /tr "{quoted}" '
+            f'/sc onlogon /rl limited /f'
+        )
+    return f'schtasks /delete /tn "{SCHEDULED_TASK_NAME}" /f'
+
+
+def _run_commands(commands: Sequence[str], runner: Callable[[str], None]) -> None:
+    for command in commands:
+        runner(command)
+
+
+def configure_system_autostart(
+    enabled: bool,
+    launcher: Path,
+    *,
+    startup_target: Path | None = None,
+    runner: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Register autostart through every available mechanism.
+
+    Keeps the Startup-folder entry and additionally registers the HKCU Run key
+    and a login-triggered scheduled task so Home Agent survives as many launch
+    paths as possible. Returns the list of commands that were issued.
+    """
+    commands: list[str] = [registry_autostart_command(enabled, launcher), scheduled_task_command(enabled, launcher)]
+    if runner is not None:
+        _run_commands(commands, runner)
+    set_windows_autostart(enabled, launcher, startup_target)
+    return commands
+
+
+def greeting_enabled(config: dict) -> bool:
+    """Whether a system-autostart launch should speak a greeting to the owner."""
+    return bool(config.get("greeting_on_startup", True))
+
+
+def greeting_text(config: dict) -> str:
+    """Return the startup greeting line, falling back to a sensible default."""
+    text = str(config.get("greeting_text") or "").strip()
+    return text or DEFAULT_GREETING
 
 
 def probe_network(urls=DEFAULT_TEST_URLS, timeout_seconds: float = 6.0) -> bool:

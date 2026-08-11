@@ -19,6 +19,14 @@
 - `agent.max_tool_rounds` 是失败预算而非总调用数；每次模型迭代最多累计一个失败轮。成功工具结果不增加 `failed_rounds`。`max_tool_iterations` 是强制总上限，两者必须分别写入 `tool_round_limit_reached` 日志。
 - `_speak_with_fresh_session` 仍调用 `_speak_home`，后者首先执行 `TTSClient`（GPT-SoVITS）；只有 `_speak_home_unlocked` 抛出异常时才允许 `_windows_sapi_speak` 降级。
 
+## 开机自动启动打招呼契约
+
+- `HomeAgent/home_modules/system_startup.py` 提供 `greeting_enabled(config)` 与 `greeting_text(config)`：前者判断 `system_startup.greeting_on_startup`（默认真），后者返回 `system_startup.greeting_text` 或默认欢迎语。二者独立于 Qt，可单测。
+- 开机自启动登记统一走 `configure_system_autostart(enabled, launcher, *, startup_target=None, runner=None) -> list[str]`：同时返回并（当传入 `runner` 时）执行注册表 Run 键与任务计划程序两条命令，并始终调用 `set_windows_autostart` 写启动文件夹。命令构造函数 `registry_autostart_command(enabled, launcher)` 与 `scheduled_task_command(enabled, launcher)` 纯字符串、可单测；`runner` 用于注入命令执行器以便测试。常量 `REGISTRY_RUN_KEY`、`REGISTRY_VALUE_NAME`、`SCHEDULED_TASK_NAME`。
+- 注册表项为 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\HomeAgent`（`reg add/delete`，无需管理员）；任务计划为登录触发 `HomeAgentAutostart`（`schtasks /create /tn ... /sc onlogon /rl limited /f`，创建需管理员权限，非提权环境会访问被拒并跳过）。设置页保存时调用 `configure_system_autostart(startup["enabled"], HOME_AGENT / "启动家庭Agent.bat")`。
+- `AutostartGreetingWorker(QThread)`（在 `qt_app.py`）在独立线程中延迟约 3 秒后调用 `asyncio.run(agent._speak_with_fresh_session(text))` 播放打招呼；失败只发 `failed` 信号并记日志，不阻塞 Home Agent 启动。
+- 打招呼仅在 `run()` 检测到 `AUTOSTART_ARGUMENT` 且 `greeting_enabled` 为真时启动；手动启动绝不触发。`greeting_text` 默认"主人，早上好呀，苏苏已经准备好陪你了。"
+
 ## HomeAgent 主动屏幕关怀契约
 
 - `HomeAgent.proactive_screen_care() -> str`：后台抓取屏幕并调用 `MiMoMultimodalClient.analyze_image`；成功返回简短关怀语，关闭、接口失败或无结果返回空字符串。该方法不向外暴露截图路径，`finally` 必须删除临时 PNG。
@@ -106,9 +114,10 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 ### HomeAgent 图片消息与供应商能力
 - `HomeAgent._provider_supports_images(provider)`：判断供应商能否直接接收图片（MiMo 或显式 `supports_images: true`）；DeepSeek 官方 API 为纯文本模型，返回 `false`。
 - `chat` 带附件时：供应商支持图片则构造 `image_url + text` 消息；纯文本供应商（DeepSeek）调用 `_text_only_image_message`，经 `describe_images_for_chat` 把图片转成文字描述后提交，代理失败退化为只列文件名的文本消息（`image_vision_proxy_failed` 事件）。
+- `chat` 带附件时会把每张图片的**绝对路径**注入系统提示（【本次消息附带的图片】），供执行模型直接传给 `comfy_edit_image` 的 `image` 参数；纯文本回退消息也带完整路径，不再只有文件名。
 - `analyze_image` 工具与 `analyze_current_screen`（`ui_analyze_screen`）改用 `analyze_image_auto`，按配置优先 DeepSeek 并自动回退 MiMo；`proactive_screen_care` 仍固定使用 MiMo `analyze_image`。
 - `comfy_edit_image` 工具支持已登记角色图别名（`primary`、`角色三视图`、`正面照片`、文件名/标签），与 `analyze_image` 一样先经 `_resolve_character_image` 解析，再交给 ComfyUI 编辑。
-- 规划器与工具描述引导“有设定图的角色绘图”：先用 `comfy_edit_image` 以设定图为底改姿势，再用结果改背景；禁止用 `comfy_generate_image` 凭空重画导致角色细节丢失。
+- 绘图路由按“有无参考图”执行：有用户附件、角色设定图（`primary`/角色三视图/正面照片）、或上一轮生成结果时，必须 `comfy_edit_image` 并把路径/别名/上一轮 `media.path` 传给 `image`；多张参考图按“设定图改姿势→结果图改背景”分步串联；只有完全无参考图才允许 `comfy_generate_image`。用户给的风格词、构图词、负面词必须原样传入 `prompt` / `negative_prompt`。
 
 ### `CodeEditorModule` 变更与验证
 - 跟踪范围覆盖整个仓库中的源码、配置、README 与 `AI Read`，不再依赖固定模块目录清单。
@@ -130,12 +139,15 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `edit_image(image_path, prompt, ...)`：上传图片到 `/upload/image`，用 `TextEncodeQwenImageEditPlus` + VAEEncode 构造编辑工作流。
 - 编辑步数策略（`_edit_steps`）：启用 Lightning LoRA 时用其原生 4 步，避免高步数过度处理；关闭 LoRA 时用 20 步并强制下限 `min_steps=8`。`edit_image` 新增 `denoise` 参数（0.3～1.0，默认 1.0），越低越贴近原图。
 - `generate_video(prompt, model, width, height, frames, steps, fps, first_frame, use_int8)`：MiniMax-H3 `MiniMaxH3ImageToVideo` 管线（SigmaShift + SamplerCustomAdvanced + VAEDecode/VAEDecodeAudio + CreateVideo + SaveVideo）；`first_frame` 非空时自动图生视频，默认视频超时 1800 秒。
+- 视频模型自动探测与回退：`_available_diffusion_models()` 查询 ComfyUI 实际注册的 diffusion_models，nvfp4 缺失时自动改用 int8（`_select_video_unet`）；`list_models` 返回的预设带 `available` 标记；若校验仍报 `value_not_in_list`（unet_name），会自动用另一版本重试一次。
 - 输出通过 `/history/{id}` 轮询、`/view` 下载到 `outputs/comfyui/`，返回 `{ok, status, prompt_id, media:[{path, kind, caption}], message}`；`media` 由工具循环收集并经 `media_ready` 回调交给 Qt 界面。
 - `chat(..., media_ready=None)`：`_run_tool` 返回的 `media` 列表被去重收集，在最终答案发布前调用 `_publish_media` 推送；`qt_app.Bridge.media` 信号驱动 `MediaBubble` 渲染（图片缩略图可点击、视频卡片可打开）。
 - **已知坑（已修复）**：`__init__` 中实例属性 `self._object_info = None` 与同名异步方法 `_object_info()` 冲突，实例属性遮蔽方法，导致 `list_models()` 调用 `self._object_info()` 抛 `'NoneType' object is not callable`。缓存属性已改名为 `self._object_info_cache`，方法保持 `_object_info()`。改此模块时不得再用 `self._object_info` 作为属性名。
 
 ### ComfyUI 技能（`Skill/comfyui-image-video/`）
-- `SKILL.md`：使用契约、模型预设表、输出位置与调用要点；`scripts/comfy_cli.py` 提供 `status/models/generate-image/edit-image/generate-video` 命令行入口。
+- `SKILL.md`：使用契约、模型预设表、输出位置、调用要点与“防鬼图规范”（先分析参考图→按模板写提示词→AI 智能填充负面词→选稳定参数→生成→`analyze_image` 验收；内置美术优化/改姿势模板、负面词库和验收提示词模板；明确本地视觉只用于桌面点击、验收只能走 MiMo）；`scripts/comfy_cli.py` 提供 `status/models/generate-image/edit-image/generate-video` 命令行入口。
+- 编辑预设内置防鬼保险：`qwen-image-edit-2511` 的 `positive_suffix` 含 single subject / clean lineart / no jagged edges / no pixelation / no stray lines，`negative_default` 含线条断裂、锯齿、像素化、多余线条、杂线、细红线、重复主体、多余人物、双人、无关物体等；用户提示词与默认词自动合并。
+- ComfyUI 生成验收铁律：工具循环中，若任务计划含 `comfy_generate_image/comfy_edit_image/comfy_generate_video`，操作契约强制生成后用 `analyze_image`（MiMo）验收 `media.path`，不通过只允许改提示词/参数重试一次；本地视觉（`ui_analyze_screen` 等）只用于桌面点击操作，禁止用于生成质量判断。
 
 ### `CosyVoiceTTS`（`HomeAgent/home_modules/cosyvoice_tts.py`）
 - 独立 CosyVoice2 情绪 TTS 模块；`HomeAgent.__init__` 用根 `config.yaml` 的 `cosyvoice` 节创建 `self.cosyvoice`。

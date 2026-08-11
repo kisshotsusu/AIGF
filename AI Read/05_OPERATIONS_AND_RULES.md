@@ -10,6 +10,16 @@
 
 批处理默认隐藏控制台，仅保留 GUI。端口 9888 被占用通常表示管理器已运行，不要重复启动。
 
+### 开机自动启动与打招呼
+
+- 通过 `system_startup.enabled` 启用"跟随 Windows 自动启动"，自启动入口带 `--system-autostart` 标记。
+- 启用开机自启动时，`configure_system_autostart` 会同时登记三条启动路径，做到"不放过任何一个机会"：
+  1. 启动文件夹 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\HomeAgent.cmd`（`set_windows_autostart`，无需管理员权限）；
+  2. 注册表 Run 键 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\HomeAgent`（`reg add`，无需管理员权限）；
+  3. 任务计划程序登录触发任务 `HomeAgentAutostart`（`schtasks /create /sc onlogon`，需管理员权限，非提权环境会因访问被拒而跳过并记录）。
+- 真实开机自启动时，若 `system_startup.greeting_on_startup` 为真，Home Agent 会在后台线程延迟约 3 秒后，用 `_speak_with_fresh_session` 播放 `system_startup.greeting_text` 向主人打招呼；手动启动不会触发。
+- 打招呼在独立 QThread 中执行，不阻塞启动流程；TTS 失败会自动降级为系统语音，不中断 Home Agent。
+
 ## 修改后的最低验证
 
 完整测试矩阵、单用例命令、真实冒烟和重启验收统一维护在 `08_TESTING.md`；本节只保留最低门槛。

@@ -3,11 +3,11 @@
 """
 Vision 视觉控制核心 (双后端)。
 
-后端由环境变量 VISION_BACKEND 选择, 默认 gui_owl:
-  - gui_owl  : mPLUG/GUI-Owl-1.5-2B-Instruct (Qwen3-VL 原生 GUI agent,
-               输出 <tool_call> JSON + 0~1000 相对坐标)  [默认]
+后端由环境变量 VISION_BACKEND 选择, 默认 gui_actor:
   - gui_actor: microsoft/GUI-Actor-2B-Qwen2-VL (Qwen2-VL pointer head,
-               输出 0~1 归一化坐标, 需要 Vision/GUI-Actor 仓库)
+               输出 0~1 归一化坐标, 需要 Vision/GUI-Actor 仓库)  [默认]
+  - gui_owl  : mPLUG/GUI-Owl-1.5-2B-Instruct (Qwen3-VL 原生 GUI agent,
+               输出 <tool_call> JSON + 0~1000 相对坐标)  [可选]
 
 统一流程: 截图当前视口 -> ground_image() 视觉 grounding 得到归一化坐标(0~1)
         -> 映射到视口像素 -> Playwright 点击/输入/滚动 (或 Win32 桌面动作)。
@@ -34,9 +34,9 @@ REPO_DIR = os.environ.get("GUI_ACTOR_REPO", os.path.join(HERE, "GUI-Actor"))
 MODEL_DIR = os.environ.get(
     "GUI_ACTOR_MODEL", os.path.join(HERE, "models", "GUI-Actor-2B-Qwen2-VL")
 )
-BACKEND = os.environ.get("VISION_BACKEND", "gui_owl").strip().lower()
+BACKEND = os.environ.get("VISION_BACKEND", "gui_actor").strip().lower()
 if BACKEND not in ("gui_owl", "gui_actor"):
-    BACKEND = "gui_owl"
+    BACKEND = "gui_actor"
 GUI_OWL_MODEL = os.environ.get("GUI_OWL_MODEL", "").strip()
 if not GUI_OWL_MODEL:
     _default_gui_owl = os.path.join(HERE, "models", "GUI-Owl-1.5-2B-Instruct")

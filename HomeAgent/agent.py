@@ -1254,7 +1254,7 @@ class HomeAgent:
         env = os.environ.copy(); env.update({
             "VISION_MCP_TRANSPORT": "http", "VISION_MCP_HOST": host, "VISION_MCP_PORT": str(port),
             "VISION_PRELOAD_MODEL": "1" if cfg.get("preload_model", True) else "0",
-            "VISION_BACKEND": str(cfg.get("backend") or "gui_owl"),
+            "VISION_BACKEND": str(cfg.get("backend") or "gui_actor"),
             "GUI_OWL_MODEL": str(cfg.get("gui_owl_model") or ROOT / "Vision" / "models" / "GUI-Owl-1.5-2B-Instruct"),
             "GUI_ACTOR_MODEL": str(ROOT / "Vision" / "models" / "GUI-Actor-2B-Qwen2-VL"),
             "GUI_ACTOR_REPO": str(ROOT / "Vision" / "GUI-Actor"),

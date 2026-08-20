@@ -4,8 +4,8 @@
 下载 Vision 模型权重到 ./models/。
 
 用法:
-  python download_model.py --model gui-owl    # 默认: GUI-Owl-1.5-2B-Instruct (~5GB)
-  python download_model.py --model gui-actor  # 旧版 GUI-Actor-2B-Qwen2-VL (~4.5GB)
+  python download_model.py --model gui-actor  # 默认: GUI-Actor-2B-Qwen2-VL (~4.5GB)
+  python download_model.py --model gui-owl    # 可选: GUI-Owl-1.5-2B-Instruct (~5GB)
   python download_model.py --proxy http://127.0.0.1:7897   # 手动指定代理
 
 用 curl 逐文件断点续传下载, 规避 huggingface_hub 大文件单连接被代理掐断的问题。
@@ -95,8 +95,8 @@ def main() -> None:
     parser.add_argument(
         "--model",
         choices=list(MODELS),
-        default="gui-owl",
-        help="要下载的模型 (默认 gui-owl)",
+        default="gui-actor",
+        help="要下载的模型 (默认 gui-actor)",
     )
     parser.add_argument(
         "--proxy",

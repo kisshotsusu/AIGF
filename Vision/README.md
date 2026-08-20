@@ -3,27 +3,27 @@
 用本地视觉模型控制 Playwright 浏览器与 Windows 桌面，封装成 **MCP 工具**，
 可用自然语言识别、点击、输入和滚动界面。全部本地运行，截图不上云。
 
-## 双后端识别（默认 GUI-Owl）
+## 双后端识别（默认 GUI-Actor）
 
 识图入口 `agent.ground_image()` 按环境变量 `VISION_BACKEND` 分流，两种后端
 都统一返回 **0~1 归一化坐标**，上层 `click / type_text / 窗口 / 桌面` 工具无需区分：
 
 | 后端 | 模型 | 说明 |
 |------|------|------|
-| `gui_owl`（默认） | `mPLUG/GUI-Owl-1.5-2B-Instruct`（Qwen3-VL 原生 GUI agent） | 生成式 `<tool_call>` JSON，输出 0~1000 相对坐标；支持桌面/浏览器/手机，长任务能力更强 |
-| `gui_actor`（可选） | `microsoft/GUI-Actor-2B-Qwen2-VL`（Qwen2-VL pointer head） | 旧后端，输出 0~1 top-k 候选点；需要 `Vision/GUI-Actor` 仓库 |
+| `gui_actor`（默认） | `microsoft/GUI-Actor-2B-Qwen2-VL`（Qwen2-VL pointer head） | 输出 0~1 top-k 候选点；需要 `Vision/GUI-Actor` 仓库 |
+| `gui_owl`（可选） | `mPLUG/GUI-Owl-1.5-2B-Instruct`（Qwen3-VL 原生 GUI agent） | 生成式 `<tool_call>` JSON，输出 0~1000 相对坐标；支持桌面/浏览器/手机 |
 
 环境变量：
 
-- `VISION_BACKEND=gui_owl|gui_actor`（默认 `gui_owl`）
+- `VISION_BACKEND=gui_actor|gui_owl`（默认 `gui_actor`）
 - `GUI_OWL_MODEL=<本地目录或 HF repo id>`（默认 `Vision/models/GUI-Owl-1.5-2B-Instruct`，不存在时回退 `mPLUG/GUI-Owl-1.5-2B-Instruct`）
 - `GUI_ACTOR_MODEL` / `GUI_ACTOR_REPO`：GUI-Actor 路径（兼容旧配置）
 
 ## 目录结构
 ```
 Vision/
-├── models/GUI-Owl-1.5-2B-Instruct/  # 默认识别模型权重 (~5GB)
-├── models/GUI-Actor-2B-Qwen2-VL/    # 旧后端权重 (~4.5GB, 可选)
+├── models/GUI-Actor-2B-Qwen2-VL/    # 默认识别模型权重 (~4.5GB)
+├── models/GUI-Owl-1.5-2B-Instruct/  # 可选后端权重 (~5GB)
 ├── agent.py                   # 控制核心: 截图→grounding→点击/输入/滚动 (双后端)
 ├── mcp_server.py              # MCP server(暴露为工具)
 ├── download_model.py          # 下载模型: --model gui-owl|gui-actor
@@ -32,15 +32,16 @@ Vision/
 ```
 > 注意：本目录**不再单独持有 venv**，统一使用项目根目录的共享环境 `.venv`
 > （Python 3.12 + torch cu128，详见父目录 README「共享环境」一节）。
-> GUI-Owl 需要 `transformers>=4.57` 与 `qwen-vl-utils>=0.0.14`（已写入 requirements）。
+> 依赖版本：GUI-Actor（默认）固定 `transformers==4.51.3` + `qwen-vl-utils==0.0.8`（microsoft/GUI-Actor 只兼容这组版本）。
+> 可选的 GUI-Owl 需要 `transformers>=4.57` + `qwen-vl-utils>=0.0.14`，两者不能同装一个环境；用 GUI-Owl 时再升级。
 
 ## 下载模型
 ```bat
-.venv\Scripts\python.exe Vision\download_model.py --model gui-owl
-REM 可选旧后端:
-REM .venv\Scripts\python.exe Vision\download_model.py --model gui-actor
+.venv\Scripts\python.exe Vision\download_model.py --model gui-actor
+REM 可选 GUI-Owl:
+REM .venv\Scripts\python.exe Vision\download_model.py --model gui-owl
 ```
-或直接运行项目根目录 `down_model.bat`（默认下载 GUI-Owl + SenseVoice）。
+或直接运行项目根目录 `down_model.bat`（默认下载 GUI-Actor + SenseVoice）。
 下载使用 curl 断点续传，中断后重跑即可续传。
 
 ## 运行方式（两种）
@@ -67,8 +68,9 @@ set VISION_PRELOAD_MODEL=1
   "command": ".venv\\Scripts\\python.exe",
   "args": ["Vision\\mcp_server.py"],
   "env": {
-    "VISION_BACKEND": "gui_owl",
-    "GUI_OWL_MODEL": "Vision\\models\\GUI-Owl-1.5-2B-Instruct"
+    "VISION_BACKEND": "gui_actor",
+    "GUI_ACTOR_MODEL": "Vision\\models\\GUI-Actor-2B-Qwen2-VL",
+    "GUI_ACTOR_REPO": "Vision\\GUI-Actor"
   }
 }
 ```

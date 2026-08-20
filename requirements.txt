@@ -7,9 +7,9 @@
 # pip 可能装回 CPU 版, 导致推理无法用 GPU。
 # ============================================================
 
-# --- Vision: GUI-Actor-2B 网页视觉控制 (MCP: vision-gui) ---
-transformers==4.51.3
-qwen-vl-utils==0.0.8
+# --- Vision: GUI 视觉控制 (MCP: vision-gui, 默认 GUI-Owl / 可选 GUI-Actor) ---
+transformers>=4.57.1
+qwen-vl-utils>=0.0.14
 accelerate
 pillow
 numpy

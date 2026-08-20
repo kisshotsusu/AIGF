@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-GUI-Actor-2B + Playwright 网页控制核心。
+Vision 视觉控制核心 (双后端)。
 
-流程: 截图当前视口 -> GUI-Actor 视觉 grounding 得到归一化坐标(0~1)
-      -> 映射到视口像素 -> Playwright 点击/输入/滚动。
+后端由环境变量 VISION_BACKEND 选择, 默认 gui_owl:
+  - gui_owl  : mPLUG/GUI-Owl-1.5-2B-Instruct (Qwen3-VL 原生 GUI agent,
+               输出 <tool_call> JSON + 0~1000 相对坐标)  [默认]
+  - gui_actor: microsoft/GUI-Actor-2B-Qwen2-VL (Qwen2-VL pointer head,
+               输出 0~1 归一化坐标, 需要 Vision/GUI-Actor 仓库)
 
-GUI-Actor 推理接口(来自 microsoft/GUI-Actor):
-    from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer
-    from gui_actor.inference import inference
-    pred = inference(conv, model, tokenizer, processor, use_placeholder=True, topk=N)
-    px, py = pred["topk_points"][0]   # 归一化 0~1
+统一流程: 截图当前视口 -> ground_image() 视觉 grounding 得到归一化坐标(0~1)
+        -> 映射到视口像素 -> Playwright 点击/输入/滚动 (或 Win32 桌面动作)。
 """
 import os
 import sys
@@ -34,12 +34,35 @@ REPO_DIR = os.environ.get("GUI_ACTOR_REPO", os.path.join(HERE, "GUI-Actor"))
 MODEL_DIR = os.environ.get(
     "GUI_ACTOR_MODEL", os.path.join(HERE, "models", "GUI-Actor-2B-Qwen2-VL")
 )
-sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+BACKEND = os.environ.get("VISION_BACKEND", "gui_owl").strip().lower()
+if BACKEND not in ("gui_owl", "gui_actor"):
+    BACKEND = "gui_owl"
+GUI_OWL_MODEL = os.environ.get("GUI_OWL_MODEL", "").strip()
+if not GUI_OWL_MODEL:
+    _default_gui_owl = os.path.join(HERE, "models", "GUI-Owl-1.5-2B-Instruct")
+    GUI_OWL_MODEL = _default_gui_owl if os.path.isdir(_default_gui_owl) else "mPLUG/GUI-Owl-1.5-2B-Instruct"
 
-from transformers import AutoProcessor  # noqa: E402
-from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer  # noqa: E402
-from gui_actor.inference import inference  # noqa: E402
-from gui_actor.constants import grounding_system_message  # noqa: E402
+# GUI-Owl grounding 使用官方评测(ScreenSpot 系列)相同的系统提示词:
+# 只允许 left_click / mouse_move, 屏幕按 1000x1000 归一化, 输出 <tool_call> JSON。
+_GUI_OWL_SYSTEM_PROMPT = r'''# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "computer_use", "description": "Use a mouse to interact with a computer.\n* The screen's resolution is 1000x1000.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n* don't use any other computer use tool like type, key, scroll, left_click_drag and so on.\n* you can only use the left_click and mouse_move action to interact with the computer. if you can't find the element, you should terminate the task and report the failure.", "parameters": {"properties": {"action": {"description": "The action to perform. The available actions are:\n* `mouse_move`: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n* `left_click`: Click the left mouse button with coordinate (x, y) pixel coordinate on the screen.", "enum": ["mouse_move", "left_click"], "type": "string"}, "coordinate": {"description": "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates to move the mouse to. Required only by `action=mouse_move` and `action=left_click`.", "type": "array"}}, "required": ["action"], "type": "object"}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+'''
+_GUI_OWL_INFEASIBLE_SUFFIX = (
+    "\nAdditionally, if you think the task is infeasible (e.g., the task is not related to the image), "
+    'return <tool_call>\n{"name": "computer_use", "arguments": {"action": "terminate", "status": "failure"}}\n</tool_call>'
+)
+
 from playwright.sync_api import Error as PlaywrightError, sync_playwright  # noqa: E402
 
 # ---- 配置 ----
@@ -54,6 +77,10 @@ if os.name == "nt":
 _model = None
 _processor = None
 _tokenizer = None
+_loaded_backend = None
+_gui_actor_inference = None
+_gui_actor_system_message = None
+_last_raw_output = ""
 _pw = None
 _browser = None
 _page = None
@@ -141,11 +168,92 @@ def inspect_active_target():
     return {**window, "mode": mode, "cdp_endpoint": endpoint or "", "reason": reason}
 
 
+def backend_info() -> dict:
+    """返回当前识别后端与模型信息, 供 MCP 工具/日志诊断。"""
+    if BACKEND == "gui_owl":
+        model = _gui_owl_model_path()
+    else:
+        model = MODEL_DIR
+    return {
+        "backend": BACKEND,
+        "model": model,
+        "loaded": _model is not None,
+        "device": str(getattr(_model, "device", "")),
+    }
+
+
+def _gui_owl_model_path() -> str:
+    """解析 GUI-Owl 模型来源: 本地目录优先, 否则回退 Hugging Face repo id。"""
+    candidate = GUI_OWL_MODEL
+    if os.path.isdir(candidate):
+        return candidate
+    if os.path.sep in candidate or ("/" in candidate or "\\" in candidate):
+        # 环境变量指向了一个不存在的本地路径时, 回退官方 repo id
+        return "mPLUG/GUI-Owl-1.5-2B-Instruct"
+    return candidate
+
+
 def load_model():
-    global _model, _processor, _tokenizer
-    if _model is not None:
+    """按 VISION_BACKEND 懒加载模型; 后端切换后自动重载。"""
+    global _model, _processor, _tokenizer, _loaded_backend
+    if _model is not None and _loaded_backend == BACKEND:
         return
-    print("[agent] loading GUI-Actor-2B ...", file=sys.stderr, flush=True)
+    _model = _processor = _tokenizer = None
+    if BACKEND == "gui_owl":
+        _load_gui_owl()
+    else:
+        _load_gui_actor()
+    _loaded_backend = BACKEND
+
+
+def _load_gui_owl():
+    """加载 GUI-Owl-1.5 (Qwen3-VL) 标准生成式模型。"""
+    global _model, _processor, _tokenizer
+    try:
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+    except ImportError as exc:
+        raise RuntimeError(
+            "GUI-Owl 后端需要 transformers>=4.57 与 qwen-vl-utils>=0.0.14, "
+            "请先升级依赖 (pip install -U 'transformers>=4.57' 'qwen-vl-utils>=0.0.14')"
+        ) from exc
+    model_path = _gui_owl_model_path()
+    print(f"[agent] loading GUI-Owl ({model_path}) ...", file=sys.stderr, flush=True)
+    # min/max_pixels 与官方 grounding 评测一致
+    _processor = AutoProcessor.from_pretrained(
+        model_path,
+        min_pixels=196 * 32 * 32,
+        max_pixels=9800 * 32 * 32,
+    )
+    _tokenizer = _processor.tokenizer
+    _model = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_path,
+        dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="sdpa",
+    ).eval()
+    print(f"[agent] GUI-Owl loaded on {_model.device}", file=sys.stderr, flush=True)
+
+
+def _load_gui_actor():
+    """加载 GUI-Actor-2B (Qwen2-VL pointer head); 需要 microsoft/GUI-Actor 仓库。"""
+    global _model, _processor, _tokenizer, _gui_actor_inference, _gui_actor_system_message
+    repo_src = os.path.join(REPO_DIR, "src")
+    if not os.path.isdir(repo_src):
+        raise RuntimeError(
+            "GUI-Actor 后端需要 microsoft/GUI-Actor 仓库, 请执行: "
+            'git clone https://github.com/microsoft/GUI-Actor.git "Vision\\GUI-Actor"'
+        )
+    sys.path.insert(0, repo_src)
+    try:
+        from transformers import AutoProcessor  # noqa: F401
+        from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer
+        from gui_actor.inference import inference
+        from gui_actor.constants import grounding_system_message
+    except ImportError as exc:
+        raise RuntimeError(f"gui_actor 包导入失败: {exc}") from exc
+    _gui_actor_inference = inference
+    _gui_actor_system_message = grounding_system_message
+    print(f"[agent] loading GUI-Actor-2B ({MODEL_DIR}) ...", file=sys.stderr, flush=True)
     _processor = AutoProcessor.from_pretrained(MODEL_DIR)
     _tokenizer = _processor.tokenizer
     _model = Qwen2VLForConditionalGenerationWithPointer.from_pretrained(
@@ -154,7 +262,7 @@ def load_model():
         device_map="auto",
         attn_implementation="sdpa",
     ).eval()
-    print(f"[agent] model loaded on {_model.device}", file=sys.stderr, flush=True)
+    print(f"[agent] GUI-Actor loaded on {_model.device}", file=sys.stderr, flush=True)
 
 
 _USER_AGENT = (
@@ -264,12 +372,23 @@ def screenshot_pil() -> Image.Image:
 
 
 def ground_image(instruction: str, img: Image.Image, topk: int = 3):
-    """在给定图像上返回 topk 个归一化坐标。"""
+    """图像识别入口: 在给定图像上返回最多 topk 个归一化坐标 (0~1)。
+
+    根据 VISION_BACKEND 自动分流到 GUI-Owl (默认) 或 GUI-Actor,
+    上层 click/type_text/窗口/桌面动作无需区分后端。
+    """
     load_model()
+    if BACKEND == "gui_owl":
+        return _gui_owl_ground(instruction, img, topk)
+    return _gui_actor_ground(instruction, img, topk)
+
+
+def _gui_actor_ground(instruction: str, img: Image.Image, topk: int):
+    """GUI-Actor 后端: pointer head 直接输出 0~1 归一化 topk 点。"""
     conversation = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": grounding_system_message}],
+            "content": [{"type": "text", "text": _gui_actor_system_message}],
         },
         {
             "role": "user",
@@ -282,12 +401,128 @@ def ground_image(instruction: str, img: Image.Image, topk: int = 3):
     # Grounding is inference-only.  Disabling autograd prevents an accidental
     # graph from surviving in the returned prediction and growing VRAM usage.
     with torch.inference_mode():
-        pred = inference(
+        pred = _gui_actor_inference(
             conversation, _model, _tokenizer, _processor,
             use_placeholder=True, topk=topk,
         )
     points = pred.get("topk_points") or []
     return [[float(point[0]), float(point[1])] for point in points]
+
+
+def _gui_owl_ground(instruction: str, img: Image.Image, topk: int):
+    """GUI-Owl 后端: 生成式 <tool_call> JSON, 解析 0~1000 相对坐标。"""
+    global _last_raw_output
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ImportError as exc:
+        raise RuntimeError("GUI-Owl 后端需要 qwen-vl-utils>=0.0.14") from exc
+
+    messages = [
+        {
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": _GUI_OWL_SYSTEM_PROMPT + _GUI_OWL_INFEASIBLE_SUFFIX,
+            }],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": str(instruction)},
+            ],
+        },
+    ]
+    text = _processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = _processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to(_model.device)
+    with torch.inference_mode():
+        generated_ids = _model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=True,
+            temperature=0.01,
+            top_p=0.01,
+            top_k=1,
+            repetition_penalty=1.0,
+        )
+    generated_ids_trimmed = [
+        out_ids[len(in_ids):]
+        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    ]
+    output_text = _processor.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0]
+    _last_raw_output = output_text
+    return _parse_gui_owl_points(output_text, topk)
+
+
+def _parse_gui_owl_points(output_text: str, topk: int = 3):
+    """解析 GUI-Owl 输出中的点击坐标, 统一归一化到 0~1。
+
+    优先解析 <tool_call> JSON (computer_use.arguments.coordinate, 0~1000),
+    失败时回退正则匹配 "(x, y)" / "[x, y]"。
+    terminate/answer 等非点击动作返回空列表。
+    """
+    import ast
+    import re
+
+    raw_points = []
+    block_re = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+    for block in block_re.findall(output_text):
+        block = block.strip()
+        parsed = None
+        try:
+            parsed = json.loads(block)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(block)
+            except Exception:
+                parsed = None
+        if not isinstance(parsed, dict):
+            continue
+        args = parsed.get("arguments")
+        if not isinstance(args, dict):
+            continue
+        action = str(args.get("action") or "").lower()
+        if action in ("terminate", "answer", "interact", "wait", "stop", "done"):
+            continue
+        coord = args.get("coordinate")
+        if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+            raw_points.append((coord[0], coord[1]))
+    if not raw_points:
+        pair_re = re.compile(
+            r"[\(\[]\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*[\)\]]"
+        )
+        raw_points = pair_re.findall(output_text)
+
+    points = []
+    for x, y in raw_points:
+        try:
+            fx, fy = float(x), float(y)
+        except (TypeError, ValueError):
+            continue
+        if fx > 1.0 or fy > 1.0:
+            # GUI-Owl 屏幕按 1000x1000 归一化
+            fx, fy = fx / 1000.0, fy / 1000.0
+        points.append([
+            max(0.0, min(1.0, fx)),
+            max(0.0, min(1.0, fy)),
+        ])
+        if len(points) >= max(1, int(topk)):
+            break
+    return points
 
 
 def ground(instruction: str, topk: int = 3):
@@ -325,7 +560,7 @@ def click(instruction: str, topk: int = 3, idx: int = 0, region: str = "full"):
     cropped = image.crop(box)
     pts = ground_image(instruction, cropped, topk=topk)
     if not pts:
-        return {"clicked": False, "reason": "model returned no point", "all_points": []}
+        return {"clicked": False, "reason": "model returned no point", "all_points": [], "raw_output": _last_raw_output}
     x, y = pts[min(idx, len(pts) - 1)]
     x = max(0.0, min(1.0, x))
     y = max(0.0, min(1.0, y))
@@ -356,6 +591,7 @@ def click(instruction: str, topk: int = 3, idx: int = 0, region: str = "full"):
     return {
         "clicked": True,
         "instruction": instruction,
+        "backend": BACKEND,
         "norm": [round(global_x, 4), round(global_y, 4)],
         "pixel": [px, py],
         "region": str(region).lower(),
@@ -369,7 +605,7 @@ def type_text(instruction: str, text: str, topk: int = 3):
     page = ensure_browser()
     pts = ground(instruction, topk=topk)
     if not pts:
-        return {"typed": False, "reason": "model returned no point"}
+        return {"typed": False, "reason": "model returned no point", "raw_output": _last_raw_output}
     x, y = pts[0]
     px = int(max(0.0, min(1.0, x)) * VIEWPORT["width"])
     py = int(max(0.0, min(1.0, y)) * VIEWPORT["height"])
@@ -378,7 +614,7 @@ def type_text(instruction: str, text: str, topk: int = 3):
     page.keyboard.press("Control+A")
     page.keyboard.press("Backspace")
     page.keyboard.type(text, delay=20)
-    return {"typed": True, "pixel": [px, py], "text": text}
+    return {"typed": True, "backend": BACKEND, "pixel": [px, py], "text": text}
 
 
 def type_active_text(text: str, clear: bool = True):
@@ -478,8 +714,26 @@ def _primary_screen():
     return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
+def _session_screen_unavailable() -> str:
+    """检测屏幕当前是否不可截取(锁屏/安全桌面/会话断开), 返回原因或空字符串。"""
+    if os.name != "nt":
+        return ""
+    try:
+        user32 = ctypes.windll.user32
+        if user32.GetForegroundWindow() == 0:
+            # 锁屏/安全桌面上没有普通前台窗口
+            return "屏幕当前不可用(可能已锁定、显示安全桌面或会话断开), 无法截图"
+    except OSError:
+        pass
+    return ""
+
+
 def _grab_windows_image(*, hwnd: int | None = None, bbox=None, all_screens: bool = False, attempts: int = 3) -> Image.Image:
     """Serialize and retry Pillow GDI captures; prefer HWND capture for windows."""
+    locked_reason = _session_screen_unavailable()
+    if locked_reason:
+        # 屏幕不可用时重试没有意义, 一次失败后直接给出明确原因
+        attempts = 1
     errors = []
     with _SCREENSHOT_LOCK:
         for attempt in range(max(1, attempts)):
@@ -519,7 +773,7 @@ def _grab_windows_image(*, hwnd: int | None = None, bbox=None, all_screens: bool
                         source.close()
             if attempt + 1 < attempts:
                 time.sleep(0.15 * (attempt + 1))
-    detail = errors[-1] if errors else "unknown capture error"
+    detail = locked_reason or (errors[-1] if errors else "unknown capture error")
     raise RuntimeError(f"screen grab failed after {max(1, attempts)} attempts: {detail}")
 
 
@@ -677,28 +931,53 @@ def _wait_and_compare_window(window: dict, before: Image.Image, before_title: st
         return {"post_screenshot_captured": False, "waited_ms": delay, "state_changed": False, "execution_likely_succeeded": False, "reason": f"操作后截图失败，无法验证状态变化：{exc}", "next_action": "重新列出窗口并截图验证；验证成功前不得假设操作成功"}
 
 
+def _window_ground_points(instruction: str, img: Image.Image, topk: int):
+    """窗口截图 grounding; 整窗找不到时自动放大顶部工具栏区域重试一次。
+
+    返回 (points, used_height): points 为该识别区域内的归一化坐标,
+    used_height 为实际识别图的高度(整窗=img.height, 顶部裁剪=裁剪高度)。
+    常见桌面应用(音乐/IM/办公)的搜索框、菜单都在窗口顶部, 放大后 2B 模型
+    定位成功率明显更高。
+    """
+    points = ground_image(instruction, img, topk)
+    if points:
+        return points, img.height
+    top_h = max(120, int(img.height * 0.45))
+    if top_h >= img.height:
+        return points, img.height
+    top_img = img.crop((0, 0, img.width, top_h))
+    top_points = ground_image(instruction, top_img, topk)
+    if top_points:
+        return top_points, top_img.height
+    return points, img.height
+
+
 def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
     window = _find_window(title_contains); activate_window(title_contains)
-    img = window_screenshot_pil(title_contains); points = ground_image(instruction, img, topk)
-    if not points: return {"clicked": False, "reason": "model returned no point", "window": window}
+    img = window_screenshot_pil(title_contains)
+    points, used_height = _window_ground_points(instruction, img, topk)
+    if not points: return {"clicked": False, "reason": "model returned no point", "window": window, "raw_output": _last_raw_output}
     x, y = points[min(max(0, idx), len(points) - 1)]
     left, top, _, _ = window["bounds"]
-    px = left + int(x * img.width); py = top + int(y * img.height)
+    px = left + int(x * img.width); py = top + int(y * used_height)
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
     evidence = _wait_and_compare_window(window, img, str(window.get("title", "")))
-    return {"clicked": True, "pixel": [px, py], "window": window, "all_points": points, **evidence}
+    return {"clicked": True, "backend": BACKEND, "pixel": [px, py], "window": window,
+            "all_points": points, "grounding_region": "full" if used_height == img.height else "top",
+            **evidence}
 
 
 def window_double_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
     """Ground a window element once, then double-click that exact point."""
     window = _find_window(title_contains); activate_window(title_contains)
-    img = window_screenshot_pil(title_contains); points = ground_image(instruction, img, topk)
-    if not points: return {"clicked": False, "reason": "model returned no point", "window": window}
+    img = window_screenshot_pil(title_contains)
+    points, used_height = _window_ground_points(instruction, img, topk)
+    if not points: return {"clicked": False, "reason": "model returned no point", "window": window, "raw_output": _last_raw_output}
     x, y = points[min(max(0, idx), len(points) - 1)]
     left, top, _, _ = window["bounds"]
-    px = left + int(x * img.width); py = top + int(y * img.height)
+    px = left + int(x * img.width); py = top + int(y * used_height)
     ctypes.windll.user32.SetCursorPos(px, py)
     for _ in range(2):
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
@@ -709,12 +988,14 @@ def window_double_click(title_contains: str, instruction: str, topk: int = 3, id
     return {
         "double_clicked": True,
         "instruction": instruction,
+        "backend": BACKEND,
         "pixel": [px, py],
         "window": window,
         "before_title": window.get("title", ""),
         "after_title": after_title,
         "title_changed": bool(after_title and after_title != window.get("title", "")),
         "all_points": points,
+        "grounding_region": "full" if used_height == img.height else "top",
         **evidence,
     }
 
@@ -778,14 +1059,14 @@ def window_type_text(title_contains: str, instruction: str, text: str):
 
 def desktop_click(instruction: str, topk: int = 3, idx: int = 0):
     img = desktop_screenshot_pil(); points = ground_image(instruction, img, topk)
-    if not points: return {"clicked": False, "reason": "model returned no point", "all_points": []}
+    if not points: return {"clicked": False, "reason": "model returned no point", "all_points": [], "raw_output": _last_raw_output}
     x, y = points[min(idx, len(points) - 1)]; left, top, width, height = _primary_screen()
     px = left + int(max(0.0, min(1.0, x)) * width); py = top + int(max(0.0, min(1.0, y)) * height)
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0); ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
     delay = max(100, int(os.environ.get("GUI_POST_ACTION_WAIT_MS", "550"))); time.sleep(delay / 1000.0)
     after = desktop_screenshot_pil(); evidence = _visual_change_evidence(img, after); evidence["waited_ms"] = delay
-    return {"clicked": True, "instruction": instruction, "pixel": [px, py], "primary_screen": [width, height], "all_points": points, **evidence}
+    return {"clicked": True, "instruction": instruction, "backend": BACKEND, "pixel": [px, py], "primary_screen": [width, height], "all_points": points, **evidence}
 
 
 def _key_event(vk: int, up: bool = False):

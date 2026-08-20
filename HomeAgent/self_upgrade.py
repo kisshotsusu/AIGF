@@ -37,8 +37,15 @@ class SelfUpgradeManager:
 
     def _write(self, value: dict[str, Any]) -> None:
         temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(self.path)
+        try:
+            temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(self.path)
+        finally:
+            # 无论替换是否成功，都清理临时文件，避免异常退出后残留 .tmp。
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def clear(self) -> None:
         """Remove recovery state once a task no longer needs recovery."""
@@ -160,6 +167,11 @@ class SelfUpgradeManager:
         if status == "restart_pending":
             # finalize() already validated and completed this task.  Restart only
             # loads the new code; it must never submit the original prompt again.
+            self.clear()
+            return ""
+        if status in {"failed", "validation_failed"} and not (state.get("changed_files") or []):
+            # 零变更的失败自升级没有可恢复的写入证据，属于过期错误；
+            # 下次启动自动清理，避免残留“已阻止重启”的诊断阻塞用户。
             self.clear()
             return ""
         if status != "running" or not str(state.get("prompt", "")).strip():

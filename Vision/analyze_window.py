@@ -18,6 +18,11 @@ import agent as vision_agent
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# 动画类界面(音乐播放器/视频/桌面动态壁纸)全窗口差异天然很高。
+# 只有“标题变化”或“整窗级大变化”才判定截图过期, 避免音乐播放器分析结果被误弃。
+_STALE_RATIO_THRESHOLD = float(os.environ.get("ANALYZE_STALE_RATIO", "0.45"))
+_STALE_MEAN_THRESHOLD = float(os.environ.get("ANALYZE_STALE_MEAN", "0.20"))
+
 
 async def analyze(title: str, prompt: str, request_submitted_at: str = "") -> dict:
     config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
@@ -69,12 +74,12 @@ async def analyze(title: str, prompt: str, request_submitted_at: str = "") -> di
         )
         visual_change_ratio = float(change.get("visual_change_ratio") or 0.0)
         visual_mean_delta = float(change.get("visual_mean_delta") or 0.0)
-        # Ignore tiny progress/animation changes. A title change or substantial
-        # layout change means the model described a frame that is no longer current.
+        # 只有标题变化或整窗级大变化(如页面切换/弹窗)才判过期;
+        # 播放进度、封面旋转、音量动画等持续变化不废弃识别结果。
         state_changed_during_analysis = bool(
             state_changed_during_analysis
-            or visual_change_ratio >= 0.08
-            or visual_mean_delta >= 0.04
+            or visual_change_ratio >= _STALE_RATIO_THRESHOLD
+            or visual_mean_delta >= _STALE_MEAN_THRESHOLD
         )
         current_image.close()
     except Exception:

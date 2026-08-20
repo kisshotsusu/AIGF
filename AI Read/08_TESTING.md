@@ -32,6 +32,9 @@ Set-Location E:\Doc\AIAgent\HomeAgent
 | `test_self_programming_and_delivery.py` | 65 | 模型计划约束、定时任务与自升级状态隔离、完整代码路径与 Codex 权限、过期视觉证据淘汰、音乐完成门禁、自升级恢复、文件/代码工具、角色图片路径与编辑别名解析、CosyVoice 工具开关、消息/TTS 顺序、tool 消息连续性回归 |
 | `test_system_startup.py` | 11 | 开机启动、手动启动保护、重启计数、开机打招呼配置、注册表 Run 键与登录任务计划命令构造/登记 |
 | `test_task_progress_card.py` | 7 | 紧凑任务卡、窄窗口、关怀设置、消息与气泡同步 |
+| `test_video_understanding.py` | 16 | 视频理解：MiMo/Qwen provider 载荷与认证、失败兜底、时间解析（MM:SS/HH:MM:SS）、时间轴解析、工具开关 |
+| `test_video_editing.py` | 9 | 视频编辑：SRT 生成、分割/字幕/配音/拼接端到端（ffmpeg）、输入校验 |
+| `test_edge_browser.py` | 8 | Edge 控制：端点/配置解析、扩展页识别、输出目录、工具开关 |
 
 单项定位：
 

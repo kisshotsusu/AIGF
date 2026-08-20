@@ -692,6 +692,8 @@ class SelfProgrammingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "没有产生任何代码或配置变更"):
                 manager.finalize("已经完成")
             self.assertEqual(manager.read()["status"], "validation_failed")
+            self.assertEqual(manager.resume_prompt(), "")
+            self.assertFalse(manager.path.exists())
 
     def test_completed_task_removes_recovery_file(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

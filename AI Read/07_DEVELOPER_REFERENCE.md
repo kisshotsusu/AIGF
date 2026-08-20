@@ -123,6 +123,7 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - 跟踪范围覆盖整个仓库中的源码、配置、README 与 `AI Read`，不再依赖固定模块目录清单。
 - `validate_current_changes` 检查真实变更以及 Python/YAML/JSON 等文件语法，不会因为缺少 `AI Read` 或项目 README 变更而人为失败。
 - 执行模型仍应按实际影响维护文档，但这是交付判断，不是代码工具内部的任务类型硬编码。
+- `SelfUpgradeManager.resume_prompt`：`failed`/`validation_failed` 且 `changed_files` 为空时，下次启动自动 `clear()`，防止过期失败记录长期残留；有变更的失败记录仍保留供诊断。
 
 ### `CodeValidator`（`HomeAgent/home_modules/code_validator.py`）
 - 独立验证模块，不包含编辑、变更追踪或任务恢复；`CodeEditorModule` 在 `__init__` 创建 `self.validator` 并委托 `validate_files` / `run_autonomous_tests` / `git_diff_check`。
@@ -148,6 +149,21 @@ app.py  bilibili.py  config.py  llm.py  tts.py  workspace.py  long_term_memory.p
 - `SKILL.md`：使用契约、模型预设表、输出位置、调用要点与“防鬼图规范”（先分析参考图→按模板写提示词→AI 智能填充负面词→选稳定参数→生成→`analyze_image` 验收；内置美术优化/改姿势模板、负面词库和验收提示词模板；明确本地视觉只用于桌面点击、验收只能走 MiMo）；`scripts/comfy_cli.py` 提供 `status/models/generate-image/edit-image/generate-video` 命令行入口。
 - 编辑预设内置防鬼保险：`qwen-image-edit-2511` 的 `positive_suffix` 含 single subject / clean lineart / no jagged edges / no pixelation / no stray lines，`negative_default` 含线条断裂、锯齿、像素化、多余线条、杂线、细红线、重复主体、多余人物、双人、无关物体等；用户提示词与默认词自动合并。
 - ComfyUI 生成验收铁律：工具循环中，若任务计划含 `comfy_generate_image/comfy_edit_image/comfy_generate_video`，操作契约强制生成后用 `analyze_image`（MiMo）验收 `media.path`，不通过只允许改提示词/参数重试一次；本地视觉（`ui_analyze_screen` 等）只用于桌面点击操作，禁止用于生成质量判断。
+
+### 视频理解（`HomeAgent/home_modules/video_understanding.py`）
+- `VideoUnderstandingClient`：`provider` 默认 `mimo`（`api-key` 认证、`max_completion_tokens`、`thinking.disabled`），`fallback_provider` 默认 `qwen`（DashScope Bearer 认证）；本地视频按 `max_video_mb` 校验后 Base64 编码，`fps` 抽帧，返回 `{ok, provider, model, event_count, events:[{start_time,end_time,event}], raw_text, fps}`。
+- `parse_events` / `normalize_event` / `parse_time`：把 JSON 事件、Markdown 围栏 JSON 或 `00:00:00 - 00:00:05 描述` 行解析成规范时间轴；双段时间按 `MM:SS`（1:02=62 秒）解释，三段时间按 `HH:MM:SS`。
+- `probe_video_duration`：用 ffprobe 读取时长，失败返回 None；理解模块不再依赖编辑模块。
+
+### 视频编辑（`HomeAgent/home_modules/video_editing.py`）
+- `VideoEditor`：`probe` 读取时长/分辨率；`cut_segments` 分割；`concat_videos` 拼接（h264+aac 转码，concat demuxer）；`build_srt`/`burn_subtitles` 字幕；`mix_voiceover`/`finalize` 配音（可选，不参与固定流程）。ffmpeg 过滤参数必须放在所有 `-i` 之后（否则被当作输入选项）。
+- HomeAgent 工具：`qwen_analyze_video`、`video_cut_segments`、`video_concat_segments`、`video_add_subtitles`、`video_generate_voiceover`；全部为独立原子能力，可自由组合；输出默认 `outputs/video_understanding`。
+- 已知坑（已修复）：`_run_codex_task` 创建子进程时未设置流缓冲，Codex 超长 JSON 行超过 asyncio 默认 64KB 后 `readline()` 抛 `LimitOverrunError`（“Separator is not found, and chunk exceed the limit”），并泄漏 `read_stderr` pending task。现已把 `limit` 设为 8MB，并在异常/超时/取消/finally 中统一取消并回收读取任务。
+
+### Edge 浏览器控制（`HomeAgent/home_modules/edge_browser.py`）
+- `EdgeBrowserClient`：CDP 直连。`ensure_running` 优先复用已有 CDP 端点（9222/9223/9333），否则用独立用户目录拉起 `msedge.exe --remote-debugging-port`；`status` 返回版本、标签页和 `chrome-extension://` 插件页；`open_url`/`open_chatgpt` 开标签；`eval_js` 在目标页执行 JS（读取 DOM/点击/输入）；`navigate` 导航；`screenshot` 保存 PNG 到 `outputs/edge`。
+- 与 ChatGPT 插件配合：插件页属于 `chrome-extension://` target，`edge_status` 会列出；通过 `edge_eval_js` 可读取/操作插件页内容。若插件装在用户日常 Edge 配置里，先手动用 `--remote-debugging-port=9223` 启动该配置，或把 `chatgpt_extension_url` 配成插件页地址。
+- HomeAgent 工具：`edge_status`、`edge_open_url`、`edge_open_chatgpt`、`edge_eval_js`、`edge_screenshot`。
 
 ### `CosyVoiceTTS`（`HomeAgent/home_modules/cosyvoice_tts.py`）
 - 独立 CosyVoice2 情绪 TTS 模块；`HomeAgent.__init__` 用根 `config.yaml` 的 `cosyvoice` 节创建 `self.cosyvoice`。

@@ -119,6 +119,9 @@ from home_modules.command_executor import CommandExecutor
 from home_modules.mimo_multimodal import MiMoMultimodalClient
 from home_modules.comfyui_client import ComfyUIClient
 from home_modules.cosyvoice_tts import CosyVoiceTTS
+from home_modules.video_understanding import QwenVideoClient
+from home_modules.video_editing import VideoEditor
+from home_modules.edge_browser import EdgeBrowserClient
 
 
 class HomeAgent:
@@ -151,6 +154,13 @@ class HomeAgent:
         cosy_cfg = dict(self.project.get("cosyvoice", {}) or {})
         cosy_cfg.setdefault("project_root", str(ROOT))
         self.cosyvoice = CosyVoiceTTS(cosy_cfg)
+        qwen_video_cfg = dict(self.project.get("qwen_video_understanding", {}) or {})
+        qwen_video_cfg.setdefault("project_root", str(ROOT))
+        self.qwen_video = QwenVideoClient(qwen_video_cfg)
+        self.video_editor = VideoEditor(qwen_video_cfg)
+        edge_cfg = dict(self.project.get("edge_browser", {}) or {})
+        edge_cfg.setdefault("project_root", str(ROOT))
+        self.edge_browser = EdgeBrowserClient(edge_cfg)
         self.restart_requested = False
         self.current_task_resumed = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
@@ -755,7 +765,9 @@ class HomeAgent:
                 "success_criteria, confidence(0到1), reasoning_short。工具可从ui_analyze_screen/ui_inspect_target/web_read/web_fill/web_click_text/"
                 "ui_list_windows/ui_activate_window/ui_analyze_window/ui_click_window/ui_double_click_window/ui_type_window/ui_hotkey/ui_type_active_text/"
                 "launch_app/media_stop/clear_live_context/list_character_images/analyze_image/comfy_status/comfy_list_models/"
-                "comfy_generate_image/comfy_edit_image/comfy_generate_video/read_text_file/write_text_file/code_tools中选择，不要发明工具。\n"
+                "comfy_generate_image/comfy_edit_image/comfy_generate_video/qwen_analyze_video/video_cut_segments/"
+                "video_concat_segments/video_add_subtitles/video_generate_voiceover/edge_status/edge_open_url/"
+                "edge_open_chatgpt/edge_eval_js/edge_screenshot/read_text_file/write_text_file/code_tools中选择，不要发明工具。\n"
                 f"最近上下文：{context[-1200:]}\n当前请求：{text}"
             )
             timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
@@ -901,6 +913,26 @@ class HomeAgent:
             return f"情绪语音：{cls._activity_text(args.get('text'), 64)}"
         if name == "cosyvoice_references":
             return "列出 CosyVoice2 参考音色"
+        if name == "qwen_analyze_video":
+            return f"分析视频：{cls._activity_text(args.get('video'), 60)}"
+        if name == "video_cut_segments":
+            return f"剪辑 {len(args.get('segments') or [])} 个片段"
+        if name == "video_concat_segments":
+            return f"拼接 {len(args.get('videos') or [])} 个视频"
+        if name == "video_add_subtitles":
+            return f"添加 {len(args.get('subtitles') or [])} 条字幕"
+        if name == "video_generate_voiceover":
+            return f"配音：{cls._activity_text(args.get('script'), 60)}"
+        if name == "edge_status":
+            return "检查 Edge 浏览器"
+        if name == "edge_open_url":
+            return f"Edge 打开：{cls._activity_text(args.get('url'), 60)}"
+        if name == "edge_open_chatgpt":
+            return "Edge 打开 ChatGPT"
+        if name == "edge_eval_js":
+            return "Edge 执行脚本"
+        if name == "edge_screenshot":
+            return "Edge 截图"
         if name in {"read_text_file", "write_text_file", "code_read_file", "code_write_file", "code_replace_text"}:
             path = args.get("path") or args.get("file_path")
             return f"文件：{cls._activity_text(path, 76)}" if path else "处理目标文件"
@@ -949,6 +981,12 @@ class HomeAgent:
             return str(result.get("message") or "语音合成完成")
         if name == "cosyvoice_references" and isinstance(result, dict):
             return f"可用音色 {int(result.get('count') or 0)} 个"
+        if name == "qwen_analyze_video" and isinstance(result, dict):
+            return f"识别出 {int(result.get('event_count') or 0)} 个事件片段"
+        if name in {"video_cut_segments", "video_concat_segments", "video_add_subtitles", "video_generate_voiceover"} and isinstance(result, dict):
+            return "视频处理完成，已生成文件"
+        if name == "edge_screenshot" and isinstance(result, dict):
+            return "Edge 截图完成"
         if name.startswith("code_") or name in {"read_text_file", "write_text_file"}:
             return "文件处理完成"
         return cls._activity_text(result.get("next_action") or result.get("message") or "执行完成", 96)
@@ -964,6 +1002,12 @@ class HomeAgent:
             "comfy_status": "检查生成服务", "comfy_list_models": "查看生成模型",
             "comfy_generate_image": "生成图像", "comfy_edit_image": "编辑图像", "comfy_generate_video": "生成视频",
             "cosyvoice_references": "查看情绪语音音色", "cosyvoice_speak": "情绪语音合成",
+            "qwen_analyze_video": "理解视频内容", "video_cut_segments": "按时间段分割视频",
+            "video_concat_segments": "拼接视频", "video_add_subtitles": "添加字幕",
+            "video_generate_voiceover": "生成配音",
+            "edge_status": "检查 Edge 浏览器", "edge_open_url": "Edge 打开网址",
+            "edge_open_chatgpt": "Edge 打开 ChatGPT", "edge_eval_js": "Edge 执行脚本",
+            "edge_screenshot": "Edge 截图",
             "code_read_file": "读取代码", "code_search_text": "搜索代码",
             "code_replace_text": "修改代码", "code_write_file": "写入代码",
             "code_validate_project": "验证代码和测试", "media_stop": "停止媒体",
@@ -1210,6 +1254,8 @@ class HomeAgent:
         env = os.environ.copy(); env.update({
             "VISION_MCP_TRANSPORT": "http", "VISION_MCP_HOST": host, "VISION_MCP_PORT": str(port),
             "VISION_PRELOAD_MODEL": "1" if cfg.get("preload_model", True) else "0",
+            "VISION_BACKEND": str(cfg.get("backend") or "gui_owl"),
+            "GUI_OWL_MODEL": str(cfg.get("gui_owl_model") or ROOT / "Vision" / "models" / "GUI-Owl-1.5-2B-Instruct"),
             "GUI_ACTOR_MODEL": str(ROOT / "Vision" / "models" / "GUI-Actor-2B-Qwen2-VL"),
             "GUI_ACTOR_REPO": str(ROOT / "Vision" / "GUI-Actor"),
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -1544,6 +1590,9 @@ class HomeAgent:
                 *command, cwd=str(working_directory), stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.PIPE,
                 creationflags=creationflags, env=env,
+                # Codex 的 JSON 进度行可能远超 asyncio 默认 64KB 行缓冲，
+                # 否则 readline() 会抛 "Separator is not found, and chunk exceed the limit"。
+                limit=8 * 1024 * 1024,
             )
         except OSError as exc:
             self.log_event("codex_process_start_failed", error=str(exc), prompt_chars=len(prompt))
@@ -1653,7 +1702,22 @@ class HomeAgent:
             detail = "\n".join(stderr_lines).strip()[-1200:]
             self.log_event("codex_task_timeout", detail=detail)
             return {"error": "Codex CLI 执行超时。请检查网络、登录状态和 MCP 服务。" + (f"\n{detail}" if detail else "")}
+        except Exception as exc:
+            # 输出流读取异常（例如超长行/管道关闭）也必须清理子进程与读取任务，
+            # 避免 "Task was destroyed but it is pending" 与未关闭管道。
+            if proc.returncode is None:
+                try: proc.kill()
+                except ProcessLookupError: pass
+            await proc.wait()
+            for reader in (stdout_task, stderr_task):
+                if not reader.done(): reader.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            self.log_event("codex_stream_error", error=str(exc)[:500])
+            return {"error": f"Codex 输出流读取失败：{exc}", "mcp_calls": mcp_calls}
         finally:
+            for reader in (stdout_task, stderr_task):
+                if not reader.done(): reader.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             with self.active_process_lock:
                 if self.active_process is proc:
                     self.active_process = None
@@ -1754,6 +1818,22 @@ class HomeAgent:
             tools += [
                 {"type": "function", "function": {"name": "cosyvoice_references", "description": "列出 CosyVoice2 可用的参考音色文件（3～10 秒干净人声）。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "cosyvoice_speak", "description": "用 CosyVoice2 指令式情绪 TTS 朗读文本：自动把（括号）里的语气描写转为情绪指令（如温柔、喘息、黏腻、急促），生成并返回音频文件路径。", "parameters": {"type": "object", "properties": {"text": {"type": "string", "description": "要朗读的台词，可带（语气描写）括号，程序会自动剥离并转成情绪指令"}, "reference": {"type": "string", "description": "参考音色文件名或路径；不填用默认音色"}, "instruct_text": {"type": "string", "description": "可选：直接指定情绪指令，覆盖括号自动解析"}}, "required": ["text"]}}},
+            ]
+        if getattr(self, "qwen_video", None) is not None and self.qwen_video.config.get("enabled", True):
+            tools += [
+                {"type": "function", "function": {"name": "qwen_analyze_video", "description": "独立原子能力：理解视频内容并返回带 start_time/end_time/event 的事件时间轴 JSON；默认调用 MiMo V2.5（MIMO_API_KEY），失败自动回退 Qwen/DashScope（DASHSCOPE_API_KEY）。支持本地视频文件（自动 Base64 编码）或 http(s) 视频 URL。它只负责“看懂”，不隐含剪辑/拼接/字幕，可与其它视频工具自由组合。", "parameters": {"type": "object", "properties": {"video": {"type": "string", "description": "视频文件绝对路径或 http(s) 视频 URL"}, "prompt": {"type": "string", "description": "可选：分析要求；不填默认输出事件时间轴 JSON"}, "fps": {"type": "number", "description": "抽帧频率 0.1～10，默认按配置"}}, "required": ["video"]}}},
+                {"type": "function", "function": {"name": "video_cut_segments", "description": "独立原子能力：用 ffmpeg 按给定时间段把视频切成片段，返回每个片段的输出路径和实际时长。只负责分割，不依赖视频理解、拼接或字幕；需要先知道时间段时可另调 qwen_analyze_video。", "parameters": {"type": "object", "properties": {"video": {"type": "string", "description": "输入视频绝对路径"}, "segments": {"type": "array", "items": {"type": "object", "properties": {"start_time": {"type": "string", "description": "开始时间，如 00:00:03 或 3.5"}, "end_time": {"type": "string", "description": "结束时间，必须大于开始时间"}, "event": {"type": "string", "description": "可选片段名，会进入输出文件名"}}, "required": ["start_time", "end_time"]}}, "output_dir": {"type": "string", "description": "可选输出目录；默认 outputs/video_understanding"}}, "required": ["video", "segments"]}}},
+                {"type": "function", "function": {"name": "video_concat_segments", "description": "独立原子能力：把多个视频按给定顺序拼接成一个文件（转码为 h264+aac 保证兼容），返回成品视频路径。只负责拼接，不依赖理解/分割/字幕。", "parameters": {"type": "object", "properties": {"videos": {"type": "array", "items": {"type": "string"}, "description": "按顺序排列的输入视频绝对路径列表"}, "output": {"type": "string", "description": "可选输出路径；默认自动生成到 outputs/video_understanding"}}, "required": ["videos"]}}},
+                {"type": "function", "function": {"name": "video_add_subtitles", "description": "独立原子能力：根据时间轴文本生成 SRT 字幕并烧录到视频，返回成品视频路径。只负责字幕，不依赖理解/分割/拼接；时间轴可由用户给或另调 qwen_analyze_video 生成。", "parameters": {"type": "object", "properties": {"video": {"type": "string", "description": "输入视频绝对路径"}, "subtitles": {"type": "array", "items": {"type": "object", "properties": {"start_time": {"type": "string"}, "end_time": {"type": "string"}, "text": {"type": "string"}}, "required": ["start_time", "end_time", "text"]}}, "output": {"type": "string", "description": "可选输出路径；默认自动生成"}, "fontsize": {"type": "integer", "description": "可选字幕字号"}}, "required": ["video", "subtitles"]}}},
+                {"type": "function", "function": {"name": "video_generate_voiceover", "description": "用当前本地 TTS 合成旁白音频，并与视频合成（默认替换原声，也可与原声混合），返回成品视频和旁白音频路径。", "parameters": {"type": "object", "properties": {"video": {"type": "string", "description": "输入视频绝对路径"}, "script": {"type": "string", "description": "要朗读的旁白文本"}, "output": {"type": "string", "description": "可选输出路径；默认自动生成"}, "mode": {"type": "string", "enum": ["replace", "mix"], "description": "replace 用旁白替换原声；mix 与原声混合"}, "volume": {"type": "number", "description": "旁白音量倍率，默认 1.0"}}, "required": ["video", "script"]}}},
+            ]
+        if getattr(self, "edge_browser", None) is not None and self.edge_browser.config.get("enabled", True):
+            tools += [
+                {"type": "function", "function": {"name": "edge_status", "description": "独立能力：查询 Edge 浏览器 CDP 状态，返回浏览器版本、当前标签页列表和 chrome-extension:// 插件页列表（可用于发现 ChatGPT 插件页）。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "edge_open_url", "description": "独立能力：在 Edge 中打开一个新标签页并返回 target_id；浏览器未运行时会自动拉起独立 Edge（独立用户目录）。", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "要打开的网址，如 https://chatgpt.com/"}}, "required": ["url"]}}},
+                {"type": "function", "function": {"name": "edge_open_chatgpt", "description": "独立能力：在 Edge 中打开 ChatGPT（默认 https://chatgpt.com/；若配置了 chatgpt_extension_url 则打开该插件页）。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "edge_eval_js", "description": "独立能力：在 Edge 指定标签页执行 JavaScript（读取 DOM、点击、输入、读取插件页内容等）；不传 target_id 时操作当前第一个标签页。", "parameters": {"type": "object", "properties": {"expression": {"type": "string", "description": "要执行的 JS 表达式，例如 document.title 或 document.querySelector(...).click()"}, "target_id": {"type": "string", "description": "可选：edge_status 返回的标签页/插件页 id"}}, "required": ["expression"]}}},
+                {"type": "function", "function": {"name": "edge_screenshot", "description": "独立能力：对 Edge 指定标签页截图并保存 PNG，返回图片路径（可配合 analyze_image 验收页面状态）。", "parameters": {"type": "object", "properties": {"target_id": {"type": "string", "description": "可选：edge_status 返回的标签页/插件页 id"}}, "required": []}}},
             ]
         if self.config.get("agent", {}).get("prefer_local_code_tools", True):
             tools += [
@@ -2221,8 +2301,13 @@ class HomeAgent:
                 round_post_tool_instructions: list[str] = []
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
+                max_tokens = int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600)))
+                if getattr(self, "current_code_task", False):
+                    # 代码任务上下文大、工具结果长，600 token 输出必被截断成
+                    # finish_reason=length，导致反复拒绝重试；代码任务放大输出预算。
+                    max_tokens = max(max_tokens, int(self.config.get("agent", {}).get("code_max_tokens", 4096)))
                 payload = {"model": provider["model"], "messages": messages, "tools": self._tools(scoped=True), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
-                self._set_token_limit(payload, provider, int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600))))
+                self._set_token_limit(payload, provider, max_tokens)
                 async with session.post(url, json=payload, headers=self._provider_headers(provider, key)) as response:
                     raw = await response.text()
                     if response.status >= 400: raise RuntimeError(f"LLM HTTP {response.status}: {raw[:600]}")
@@ -2793,6 +2878,109 @@ class HomeAgent:
                 )
             except Exception as exc:
                 return {"status": "failed", "error": f"语音合成失败：{str(exc)[:400]}"}
+        if name == "qwen_analyze_video":
+            try:
+                video = str(args.get("video") or "").strip()
+                if not video:
+                    return {"error": "video 参数不能为空"}
+                timeout = aiohttp.ClientTimeout(total=int(self.qwen_video.config.get("timeout_seconds", 120)))
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    result = await self.qwen_video.analyze(
+                        session, video, str(args.get("prompt") or "")
+                    )
+                result["source"] = str(video)
+                return result
+            except Exception as exc:
+                return {"status": "failed", "error": f"视频理解失败：{str(exc)[:400]}"}
+        if name == "video_cut_segments":
+            try:
+                source = self._allowed_path(str(args.get("video") or ""))
+                if not source.is_file():
+                    return {"error": f"视频不存在：{source}"}
+                output_dir = None
+                if args.get("output_dir"):
+                    output_dir = self._allowed_path(str(args.get("output_dir") or ""))
+                result = await asyncio.to_thread(
+                    self.video_editor.cut_segments, source, args.get("segments") or [], output_dir
+                )
+                result["media"] = [
+                    {"path": clip["path"], "kind": "video", "caption": f"片段 {clip['index']}"}
+                    for clip in result.get("clips", [])
+                ]
+                return result
+            except Exception as exc:
+                return {"status": "failed", "error": f"视频剪辑失败：{str(exc)[:400]}"}
+        if name == "video_concat_segments":
+            try:
+                videos = args.get("videos") or []
+                if not isinstance(videos, list) or not videos:
+                    return {"error": "videos 需要非空视频路径列表"}
+                paths = [self._allowed_path(str(video)) for video in videos]
+                output = None
+                if args.get("output"):
+                    output = self._allowed_path(str(args.get("output") or ""))
+                result = await asyncio.to_thread(
+                    self.video_editor.concat_videos, paths, output
+                )
+                result["media"] = [{"path": result["path"], "kind": "video", "caption": "拼接视频"}]
+                return result
+            except Exception as exc:
+                return {"status": "failed", "error": f"视频拼接失败：{str(exc)[:400]}"}
+        if name == "video_add_subtitles":
+            try:
+                source = self._allowed_path(str(args.get("video") or ""))
+                if not source.is_file():
+                    return {"error": f"视频不存在：{source}"}
+                subtitles = args.get("subtitles") or []
+                if not isinstance(subtitles, list) or not subtitles:
+                    return {"error": "subtitles 需要非空时间轴列表"}
+                srt_path = self.video_editor.build_srt(
+                    subtitles,
+                    output_path=self.video_editor.output_dir / f"{source.stem}_subs.srt",
+                )
+                if args.get("output"):
+                    output = self._allowed_path(str(args.get("output") or ""))
+                else:
+                    output = self.video_editor.output_dir / f"{source.stem}_subtitled.mp4"
+                result = await asyncio.to_thread(
+                    self.video_editor.burn_subtitles, source, srt_path, output,
+                    int(args.get("fontsize") or 0) or None,
+                )
+                result["srt_path"] = str(srt_path)
+                result["media"] = [{"path": str(output), "kind": "video", "caption": "字幕视频"}]
+                return result
+            except Exception as exc:
+                return {"status": "failed", "error": f"添加字幕失败：{str(exc)[:400]}"}
+        if name == "video_generate_voiceover":
+            try:
+                source = self._allowed_path(str(args.get("video") or ""))
+                if not source.is_file():
+                    return {"error": f"视频不存在：{source}"}
+                script = str(args.get("script") or "").strip()
+                if not script:
+                    return {"error": "script 不能为空"}
+                timeout = aiohttp.ClientTimeout(total=int(self.project.get("tts", {}).get("timeout_seconds", 60)) + 10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    voice_path = await TTSClient(session, self.project["tts"], ROOT / "audio").synthesize(script)
+                if not voice_path:
+                    return {"status": "failed", "error": "TTS 没有生成旁白音频"}
+                voice_path = Path(voice_path)
+                if args.get("output"):
+                    output = self._allowed_path(str(args.get("output") or ""))
+                else:
+                    output = self.video_editor.output_dir / f"{source.stem}_voiceover.mp4"
+                result = await asyncio.to_thread(
+                    self.video_editor.mix_voiceover, source, voice_path, output,
+                    volume=float(args.get("volume") or 1.0),
+                    mode=str(args.get("mode") or "replace"),
+                )
+                result["media"] = [
+                    {"path": str(output), "kind": "video", "caption": "配音视频"},
+                    {"path": str(voice_path), "kind": "audio", "caption": "配音旁白"},
+                ]
+                return result
+            except Exception as exc:
+                return {"status": "failed", "error": f"配音失败：{str(exc)[:400]}"}
         if name == "mimo_transcribe_audio":
             path = self._allowed_path(str(args.get("audio") or ""))
             try:
@@ -2801,6 +2989,53 @@ class HomeAgent:
                     return await self.mimo_multimodal.transcribe_audio(session, path, str(args.get("language") or self.mimo_multimodal.config.get("speech_language", "auto")))
             except Exception as exc:
                 return {"status": "failed", "error": str(exc)}
+        if name == "edge_status":
+            try:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await self.edge_browser.status(session)
+            except Exception as exc:
+                return {"status": "failed", "error": f"Edge 状态查询失败：{str(exc)[:400]}"}
+        if name == "edge_open_url":
+            try:
+                url = str(args.get("url") or "").strip()
+                if not url:
+                    return {"error": "url 不能为空"}
+                timeout = aiohttp.ClientTimeout(total=60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await self.edge_browser.open_url(session, url)
+            except Exception as exc:
+                return {"status": "failed", "error": f"Edge 打开网址失败：{str(exc)[:400]}"}
+        if name == "edge_open_chatgpt":
+            try:
+                timeout = aiohttp.ClientTimeout(total=60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await self.edge_browser.open_chatgpt(session)
+            except Exception as exc:
+                return {"status": "failed", "error": f"Edge 打开 ChatGPT 失败：{str(exc)[:400]}"}
+        if name == "edge_eval_js":
+            try:
+                expression = str(args.get("expression") or "").strip()
+                if not expression:
+                    return {"error": "expression 不能为空"}
+                timeout = aiohttp.ClientTimeout(total=60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    return await self.edge_browser.eval_js(
+                        session, expression, str(args.get("target_id") or "")
+                    )
+            except Exception as exc:
+                return {"status": "failed", "error": f"Edge 执行脚本失败：{str(exc)[:400]}"}
+        if name == "edge_screenshot":
+            try:
+                timeout = aiohttp.ClientTimeout(total=60)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    result = await self.edge_browser.screenshot(
+                        session, str(args.get("target_id") or "")
+                    )
+                result["media"] = [{"path": result["path"], "kind": "image", "caption": "Edge 截图"}]
+                return result
+            except Exception as exc:
+                return {"status": "failed", "error": f"Edge 截图失败：{str(exc)[:400]}"}
         if name in {"web_agent_task", "web_agent_operator", "web-agent-operator"}:
             task = str(args.get("task", "")).strip()
             if not task: return {"error": "网页任务内容为空"}

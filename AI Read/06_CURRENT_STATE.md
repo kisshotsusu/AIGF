@@ -1,6 +1,6 @@
 # 当前实现状态
 
-核对日期：2026-08-10。本文件只记录当前有效行为，不保存逐次修复流水；历史问题应从 Git 和运行日志查询。
+核对日期：2026-08-13。本文件只记录当前有效行为，不保存逐次修复流水；历史问题应从 Git 和运行日志查询。
 
 ## 任务理解与执行
 
@@ -40,12 +40,16 @@
 - 网易云等原生程序文本输入优先绑定目标窗口，但活动窗口输入和 Enter 均可正常使用；不会用平台安全门槛阻断常规操作，结果由操作后窗口与新截图验证。
 - 停止媒体使用幂等 `media_stop`，不会用 Space 切换状态，也不会把停止播放变成退出应用。
 - B站等网页任务由模型组合通用 DOM、窗口和导航工具执行；不再暴露收藏夹专用组合工具或站点专用完成门槛。
+- 视频能力全部独立：`qwen_analyze_video`（理解，默认 MiMo V2.5、Qwen 兜底）、`video_cut_segments`（分割）、`video_concat_segments`（拼接）、`video_add_subtitles`（字幕）、`video_generate_voiceover`（配音）都是原子工具，可自由组合，**不绑定“理解→剪辑→配音→字幕”固定流水线**。
+- Edge 浏览器控制：`edge_status` / `edge_open_url` / `edge_open_chatgpt` / `edge_eval_js` / `edge_screenshot` 通过 CDP 直连 Edge（优先复用已有端点，否则自动拉起独立用户目录实例）；`edge_status` 可列出 `chrome-extension://` 插件页，供与 ChatGPT 插件交互。
+- Codex 兜底修复：Codex 输出流行缓冲扩到 8MB，读取任务在异常/超时/取消时统一取消回收，避免 “Separator is not found, and chunk exceed the limit” 和 pending task/未关闭管道泄漏；代码任务的模型输出预算放大到 4096 token，避免 `finish_reason=length` 反复拒绝死循环。
 
 ## 文件、代码与自升级
 
 - 普通文档和角色资产使用文件工具读取、原子写入并重新读取验证，不进入代码验证。
 - 本地代码工具支持目录枚举、按行读取、搜索、原子写入、精确替换和自动测试；代码验证由独立的 `home_modules/code_validator.py` 模块执行。
 - `code_validate_project` 与 Codex 代码任务完成门禁包含三层验证：文件语法检查、`git diff --check` 静态检查和项目自动测试；任何一层失败都会进入自主修复或明确失败，不把无验证结果当作成功。
+- 自升级恢复状态：零变更的 `failed`/`validation_failed` 记录在下次启动时自动清理，避免残留“自升级校验失败，已阻止重启”的过期错误；有实际变更的失败记录仍保留供诊断。
 
 ## ComfyUI 图像与视频生成
 

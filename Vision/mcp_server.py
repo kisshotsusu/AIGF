@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-GUI Web Agent - MCP Server
+Vision GUI Agent - MCP Server
 
-把本地 GUI-Actor-2B + Playwright 封装成 MCP 工具, 可被 WorkBuddy / Claude 等
+把本地 GUI 视觉模型 (默认 GUI-Owl-1.5-2B / 可选 GUI-Actor-2B) + Playwright
+封装成 MCP 工具, 可被 WorkBuddy / Claude 等
 支持 MCP 的客户端调用, 用自然语言指挥浏览器(例如: "打开 B站, 播放某视频")。
 
 工具列表:
@@ -73,6 +74,12 @@ async def ground_page(instruction: str, topk: int = 3) -> str:
 async def vision_memory_status() -> str:
     """返回 Vision 进程自身的 CUDA 已分配、缓存和峰值显存。"""
     return str(await _web_call(agent.cuda_memory_status))
+
+
+@mcp.tool()
+async def vision_backend() -> str:
+    """返回 Vision 当前识别后端 (gui_owl 默认 / gui_actor) 与模型来源。"""
+    return str(agent.backend_info())
 
 
 @mcp.tool()

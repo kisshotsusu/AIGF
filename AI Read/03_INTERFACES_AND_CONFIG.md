@@ -22,6 +22,8 @@
   - Grok 预设使用 `xai_images`、`https://api.x.ai/v1`、`grok-imagine-image-quality` 与 `XAI_API_KEY`，调用 `/images/generations` 或 `/images/edits`，不会发送通用 `size` 字段。
   - 自定义模式继续支持 `images` 与 `chat_multimodal`，并保留配置中 UI 未识别的 `extra_body` 等供应商参数。
 - `mimo_multimodal`：统一 MiMo 多模态配置，包括总开关、Base URL、密钥环境变量、图片模型、ASR 模型/语言、完成检查模型、失败重试、超时和 `fail_closed`。当前图片模型 `mimo-v2.5`，语音模型 `mimo-v2.5-asr`，完成检查默认启用并重试 2 次。另含 DeepSeek 图像识别（`deepseek_image_*`）：DeepSeek 官方 API 为纯文本模型，采用官方推荐的“视觉代理”方案——先用 `deepseek_image_proxy_*` 指定的视觉模型（默认 MiMo `mimo-v2.5`）把图片转成文字描述，再交给 `deepseek-chat` 推理；`analyze_image` 工具与屏幕分析按 `deepseek_image_enabled` 优先走 DeepSeek，失败自动回退 MiMo。
+- `qwen_video_understanding`：视频理解配置。`provider` 默认 `mimo`（`mimo-v2.5`、`MIMO_API_KEY`、`api-key` 认证、`thinking` 关闭），`fallback_provider` 默认 `qwen`（`DASHSCOPE_API_KEY`）；另有 `fps` 抽帧、`max_video_mb`、`max_completion_tokens`、`timeout_seconds`、`output_dir` 与 `ffmpeg`/`ffprobe`。
+- `edge_browser`：Edge 浏览器控制配置。`enabled` 总开关、`executable`（msedge.exe 路径，留空自动探测）、`user_data_dir`（独立用户目录，默认 `%LOCALAPPDATA%\HomeAgent\EdgeProfile`）、`port`（默认 9223）、`chatgpt_url`（默认 https://chatgpt.com/）、`chatgpt_extension_url`（可选，填则优先打开该插件页）、`startup_wait_seconds` 与 `output_dir`。
 - `workspace`：人格、身份、记忆和图片相对路径。
 
 > 注意：直播管理后台的 `PUT /api/config` 与 `PUT /api/secrets` 已在服务端保护 `llm`/`tts`/`image_generation`/`memory_write`/`workspace` 以及除 `BILIBILI_COOKIE` 外的所有密钥——这些项已迁移到角色工作台（见下）。直播网页即使长时间未刷新，也不能用旧值覆盖它们。

@@ -44,6 +44,9 @@
 - `HomeAgent/home_modules/comfyui_client.py`：独立 ComfyUI 生成模块，负责服务探测/自动启动、模型枚举、API 工作流构造（Qwen-Image-2512 写实生图、Anima 动漫生图、Qwen-Image-Edit-2511 改图、MiniMax-H3 文生视频/图生视频）、任务轮询与输出下载。
 - `HomeAgent/home_modules/cosyvoice_tts.py`：独立 CosyVoice2 情绪 TTS 模块，负责服务探测/自动启动、参考音色枚举、把台词中的（括号）语气描写解析为情绪指令、调用 `/inference_instruct2` 合成并保存 24kHz WAV。
 - `HomeAgent/home_modules/mimo_multimodal.py`：MiMo 图片理解、DeepSeek 图像识别（视觉代理方案）、WAV/MP3 语音识别和基于工具证据的任务完成独立核验。
+- `HomeAgent/home_modules/video_understanding.py`：独立视频理解模块——`VideoUnderstandingClient`（默认 MiMo V2.5，Qwen/DashScope 兜底）把视频转成带 `start/end/event` 的事件时间轴；不包含任何剪辑/拼接/字幕逻辑。
+- `HomeAgent/home_modules/video_editing.py`：独立视频编辑模块——`VideoEditor` 用 ffmpeg 提供分割（`cut_segments`）、拼接（`concat_videos`）、SRT 字幕烧录（`burn_subtitles`）和旁白混音（`mix_voiceover`/`finalize`）；各方法相互独立，不强制固定流水线。
+- `HomeAgent/home_modules/edge_browser.py`：独立 Edge 浏览器控制模块——通过 CDP 直连 Edge，自动拉起独立用户目录实例，可列出/打开标签页、执行 JS、导航、截图，并发现 `chrome-extension://` 插件页（用于 ChatGPT 等插件）。
 - `HomeAgent/home_modules/audio_capture.py`：校验麦克风设备与采样率；配置采样率不可用时选择设备原生采样率，设备 ID 失效时回退系统默认输入。
 - `HomeAgent/agent.py::proactive_screen_care`：临时截取主屏幕、用 MiMo 生成隐私安全的简短关怀语、按配置播报并保证截图清理。
 - `HomeAgent/home_modules/command_executor.py`：执行模型规划后的 PowerShell/CMD 命令，统一工作目录、超时、输出和失败状态。

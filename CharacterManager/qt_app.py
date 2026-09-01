@@ -9,9 +9,9 @@ from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QSlider, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
-    QWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QSpinBox,
+    QSlider, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from service import CharacterService, CharacterServiceError
@@ -460,13 +460,89 @@ class ToolsPage(QWidget):
         except Exception as exc:alert(self,exc)
 
 
+class LongTermMemoryPage(QWidget):
+    """只读查看 HomeAgent 长期记忆 SQLite 库（高价值记忆：身体/情绪/事件/偏好/关系/约定）。"""
+    def __init__(self, service):
+        super().__init__(); self.service=service; self.rows=[]
+        lay=QVBoxLayout(self); lay.setContentsMargins(24,22,24,22)
+        lay.addWidget(page_title("长期记忆库", "查看已固化的高价值长期记忆（SQLite：身体/情绪/重大事件/偏好/关系/约定）。只读、与运行中的 Agent 共用同一数据库。"))
+        bar=QHBoxLayout(); self.search=QLineEdit(); self.search.setPlaceholderText("搜索摘要、详情、标签或类别…"); self.search.returnPressed.connect(self.refresh)
+        bar.addWidget(self.search,1); bar.addWidget(button("搜索",self.refresh)); bar.addWidget(button("刷新",self.refresh,primary=True)); lay.addLayout(bar)
+        self.table=QTableWidget(0,6); self.table.setAlternatingRowColors(True); self.table.setHorizontalHeaderLabels(["时间","类别","范围","标签","摘要","详情"]); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.verticalHeader().hide()
+        self.table.horizontalHeader().setSectionResizeMode(4,QHeaderView.Stretch); self.table.horizontalHeader().setSectionResizeMode(5,QHeaderView.Stretch)
+        lay.addWidget(self.table,1)
+        self.count=QLabel(); self.count.setStyleSheet("color:#526963"); row=QHBoxLayout(); row.addWidget(self.count); row.addStretch(); lay.addLayout(row)
+        self.refresh()
+    def refresh(self):
+        try:
+            self.rows=self.service.list_long_term_memories(self.search.text())
+            self.table.setRowCount(len(self.rows))
+            for r,x in enumerate(self.rows):
+                tags=" · ".join(x.get("tags") or []) if isinstance(x.get("tags"),list) else ""
+                vals=[str(x.get("created_at","")).replace("T"," "), str(x.get("category","")), "私密" if x.get("privacy")=="private" else "共享", tags, str(x.get("summary","")), str(x.get("detail","") or "")[:300]]
+                for c,v in enumerate(vals): self.table.setItem(r,c,QTableWidgetItem(v))
+            self.count.setText(f"{len(self.rows)} 条长期记忆")
+        except Exception as exc: alert(self,exc)
+
+
+class TaskTreePage(QWidget):
+    """实时查看 HomeAgent 正在执行的父子层级任务树（父目标 + 子任务 + 状态）。"""
+    STATUS_META = {
+        "pending": ("待执行", "#6b7c78"),
+        "running": ("执行中", "#1f6feb"),
+        "completed": ("已完成", "#1a7f4f"),
+        "failed": ("失败", "#c0392b"),
+        "blocked": ("阻塞", "#d98324"),
+        "skipped": ("跳过", "#9aa0a6"),
+    }
+    def __init__(self, service):
+        super().__init__(); self.service=service
+        lay=QVBoxLayout(self); lay.setContentsMargins(24,22,24,22)
+        lay.addWidget(page_title("当前任务与子任务", "实时查看 Agent 正在执行的父子层级任务树与进度。数据来自 HomeAgent 运行时快照，自动刷新。"))
+        hdr=QWidget(); hl=QHBoxLayout(hdr); hl.setContentsMargins(0,0,0,0)
+        self.summary=QLabel("当前没有正在执行的任务"); self.summary.setStyleSheet("color:#526963;font-weight:600")
+        self.progress=QProgressBar(); self.progress.setRange(0,100); self.progress.setTextVisible(True); self.progress.setMinimumHeight(18)
+        hl.addWidget(self.summary,1); hl.addSpacing(16); hl.addWidget(self.progress,1); lay.addWidget(hdr)
+        self.tree=QTreeWidget(); self.tree.setColumnCount(3); self.tree.setHeaderLabels(["任务步骤","状态","工具 / 结果"]); self.tree.setAlternatingRowColors(True); self.tree.setSelectionMode(QTreeWidget.NoSelection)
+        self.tree.header().setSectionResizeMode(0,QHeaderView.Stretch); lay.addWidget(self.tree,1)
+        bar=QHBoxLayout(); hint=QLabel("任务树为运行时状态，仅在 Agent 执行任务时更新；切到本页会自动刷新。"); hint.setStyleSheet("color:#8a9a96")
+        bar.addWidget(hint); bar.addStretch(); bar.addWidget(button("立即刷新",self.refresh)); lay.addLayout(bar)
+        self.timer=QTimer(self); self.timer.setInterval(3000); self.timer.timeout.connect(self.refresh)
+        self.refresh()
+    def showEvent(self, ev):
+        super().showEvent(ev); self.refresh(); self.timer.start()
+    def hideEvent(self, ev):
+        super().hideEvent(ev); self.timer.stop()
+    def refresh(self):
+        try:
+            data=self.service.read_task_tree()
+            if not data or not data.get("tree"):
+                self.summary.setText("当前没有正在执行的任务"); self.progress.setValue(0); self.tree.clear(); return
+            tree=data["tree"]
+            total=data.get("total_steps") or 0; done=data.get("completed_steps") or 0; failed=data.get("failed_steps") or 0
+            self.progress.setValue(int(round((data.get("progress") or 0)*100)))
+            cur=data.get("current","")
+            self.summary.setText(f"根目标：{tree.get('title','')}  ·  {done}/{total} 已完成 · {failed} 失败" + (f"  · 当前：{cur}" if cur else ""))
+            self.tree.clear(); self._add_node(self.tree, tree); self.tree.expandAll()
+        except Exception as exc: alert(self,exc)
+    def _add_node(self, parent, node):
+        title=str(node.get("title","")); status=str(node.get("status","pending"))
+        label,color=self.STATUS_META.get(status,("未知","#6b7c78"))
+        extra=str(node.get("tool") or node.get("result_summary") or node.get("error") or "")[:200]
+        item=QTreeWidgetItem(parent,[title,label,extra])
+        item.setForeground(1,QColor(color)); item.setForeground(0,QColor("#17211f"))
+        for child in node.get("children",[]) or []:
+            self._add_node(item, child)
+        return item
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__(); self.service=CharacterService(); self.setWindowTitle("AI 角色管理器"); self.resize(1180,780); self.setMinimumSize(940,650)
         root=QWidget(); root.setObjectName("root"); self.setCentralWidget(root); main=QHBoxLayout(root); main.setContentsMargins(0,0,0,0); main.setSpacing(0)
         side=QFrame(); side.setObjectName("sidebar"); side.setFixedWidth(210); sl=QVBoxLayout(side); sl.setContentsMargins(17,23,17,20); brand=QLabel("角色管理器"); brand.setObjectName("brand"); sub=QLabel("Character Studio"); sub.setObjectName("subtitle"); sl.addWidget(brand);sl.addWidget(sub);sl.addSpacing(20)
-        self.stack=QStackedWidget(); pages=[IdentityPage(self.service),MemoryPage(self.service),DocumentsPage(self.service),ModelPage(self.service),VoicePage(self.service),ToolsPage(self.service),ImagesPage(self.service),ImageApiPage(self.service)]
-        labels=["身份","记忆","人格规则","模型 API","语音","工具维护","形象","图片 API"]; self.nav=[]
+        self.stack=QStackedWidget();         pages=[IdentityPage(self.service),MemoryPage(self.service),DocumentsPage(self.service),ModelPage(self.service),VoicePage(self.service),ToolsPage(self.service),ImagesPage(self.service),ImageApiPage(self.service),LongTermMemoryPage(self.service),TaskTreePage(self.service)]
+        labels=["身份","记忆","人格规则","模型 API","语音","工具维护","形象","图片 API","长期记忆","当前任务"]; self.nav=[]
         for i,label in enumerate(labels):
             b=QPushButton(label);b.setObjectName("nav");b.setCheckable(True);b.clicked.connect(lambda checked,n=i:self.switch(n));sl.addWidget(b);self.nav.append(b)
             self.stack.addWidget(pages[i])

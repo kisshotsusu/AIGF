@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import shutil
 import tempfile
 import threading
@@ -37,6 +38,11 @@ TOOL_DOCUMENTS = {
     ("context_maintenance", True): TOOL_CONFIG_DIR / "context_maintenance.yaml",
     ("context_cleanup", False): TOOL_CONFIG_DIR / "live_context_cleanup.yaml",
 }
+
+# 长期记忆 SQLite 数据库（与 HomeAgent 共用，只读访问）
+LONG_TERM_DB = ROOT / "LongTermMemory" / "memory.db"
+# HomeAgent 实时写入的父子任务树快照（由 agent._persist_task_tree 维护）
+TASK_TREE_FILE = ROOT / "HomeAgent" / "state" / "task_tree.json"
 
 DOCUMENTS = {
     "灵魂与人格": WORKSPACE / "SOUL.md",
@@ -212,6 +218,50 @@ class CharacterService:
         else:
             lines[index] = json.dumps(replacement, ensure_ascii=False)
         self._atomic_text(path, "\n".join(lines) + ("\n" if lines else ""))
+
+    def list_long_term_memories(self, query: str = "", limit: int = 300) -> list[dict[str, Any]]:
+        """只读读取 HomeAgent 长期记忆 SQLite 库（memory.db）。
+
+        以只读方式连接，避免与运行中的 agent 写入冲突；数据库不存在时返回空列表。
+        """
+        if not LONG_TERM_DB.exists():
+            return []
+        try:
+            uri = f"file:{LONG_TERM_DB}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=10) as db:
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA busy_timeout=10000")
+                rows = db.execute(
+                    "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (int(limit),)
+                ).fetchall()
+        except (OSError, sqlite3.Error) as exc:
+            raise CharacterServiceError(f"无法读取长期记忆数据库：{exc}") from exc
+        needle = query.strip().lower()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = {k: row[k] for k in row.keys()}
+            try:
+                item["tags"] = json.loads(item.get("tags") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                item["tags"] = []
+            if needle:
+                haystack = json.dumps(item, ensure_ascii=False, default=str).lower()
+                if needle not in haystack:
+                    continue
+            out.append(item)
+        return out
+
+    def read_task_tree(self) -> dict[str, Any] | None:
+        """读取 HomeAgent 实时写入的父子任务树快照；无活动任务时返回 None。"""
+        if not TASK_TREE_FILE.exists():
+            return None
+        try:
+            data = self._read_json(TASK_TREE_FILE, None)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CharacterServiceError(f"无法读取任务树快照：{exc}") from exc
+        if not isinstance(data, dict) or not data.get("has_task"):
+            return None
+        return data
 
     def get_config_section(self, section: str, home: bool = False) -> dict[str, Any]:
         if section == "__mcp__":

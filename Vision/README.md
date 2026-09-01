@@ -35,6 +35,40 @@ Vision/
 > 依赖版本：GUI-Actor（默认）固定 `transformers==4.51.3` + `qwen-vl-utils==0.0.8`（microsoft/GUI-Actor 只兼容这组版本）。
 > 可选的 GUI-Owl 需要 `transformers>=4.57` + `qwen-vl-utils>=0.0.14`，两者不能同装一个环境；用 GUI-Owl 时再升级。
 
+## GUI-Owl 专用环境 (.venv-owl)  ★已验证可用
+
+GUI-Actor（默认，`transformers==4.51.3`）与 GUI-Owl（`transformers>=4.57`）依赖**强冲突**，
+若直接升级共享 `.venv` 会破坏默认后端。推荐为 GUI-Owl 单独建一个 venv，互不污染。
+
+```bat
+REM 1) 用共享 venv 的 python 新建隔离环境
+.venv\Scripts\python.exe -m venv .venv-owl
+.venv-owl\Scripts\python.exe -m pip install --upgrade pip
+
+REM 2) torch 走 cu128 索引, 其余走 PyPI (切勿用 --index-url 覆盖 PyPI, 否则 transformers 找不到)
+.venv-owl\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+.venv-owl\Scripts\python.exe -m pip install "transformers==4.57.1" "qwen-vl-utils>=0.0.14" accelerate pillow numpy opencv-python-headless playwright psutil
+
+REM 3) MCP 服务端依赖必须锁定 mcp<2：mcp 2.x 把 FastMCP 改名为 MCPServer，会直接 ImportError。
+REM    (HomeAgent 的 mcp_call.py 客户端可用共享 .venv 的 mcp 1.x 调用本服务)
+.venv-owl\Scripts\python.exe -m pip install "mcp<2"
+```
+
+运行/验证（仅 grounding，不触发任何鼠标键盘动作）：
+
+```bat
+set VISION_BACKEND=gui_owl
+.venv-owl\Scripts\python.exe Vision\test_gui_owl.py
+```
+
+实测（RTX 5070 Ti / 15.9GB 显存）：模型加载 **~6s**、占用 **~3.96GB** VRAM；
+合成图定位偏差 **0.3%~0.6%**，找不到元素时正确输出 `terminate`（工具返回"未找到"）。
+`mcp_server.py` 在 `.venv-owl` 下可干净导入并注册 32 个工具（含 `vision_backend`/`click`/`desktop_click`/`window_click`/`ground_page`），
+后端切换为 `gui_owl` 时由 `HomeAgent/agent.py` 自动用 `.venv-owl` 拉起该服务（见 `vision_mcp.backend: gui_owl`）。
+
+> 注意：GUI-Actor 与 GUI-Owl 是**互斥**的单例（各自持锁 `Vision/state/vision-mcp.lock`，
+> 端口同为 8765）。同一时间只能有一个后端在跑；切换后端前需先停掉另一个实例。
+
 ## 下载模型
 ```bat
 .venv\Scripts\python.exe Vision\download_model.py --model gui-actor

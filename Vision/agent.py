@@ -721,8 +721,10 @@ def _session_screen_unavailable() -> str:
     try:
         user32 = ctypes.windll.user32
         if user32.GetForegroundWindow() == 0:
-            # 锁屏/安全桌面上没有普通前台窗口
-            return "屏幕当前不可用(可能已锁定、显示安全桌面或会话断开), 无法截图"
+            # 前台窗口为 0 不一定代表锁屏：RDP/自动化场景下后台进程自身没有前台窗口，
+            # 但桌面上仍有可见窗口。仅当完全没有可见顶层窗口时才判定为不可用。
+            if not list_windows():
+                return "屏幕当前不可用(可能已锁定、显示安全桌面或会话断开), 无法截图"
     except OSError:
         pass
     return ""

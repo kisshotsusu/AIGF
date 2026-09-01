@@ -1,0 +1,113 @@
+# 示例配置（可直接复制为 settings.yaml 后按需修改）
+# 注意：所有密钥均用 ${ENV:VAR} 引用环境变量，切勿写入明文
+
+system:
+  mode: live                  # live(直播) | home(家庭) | standalone
+  data_dir: "./data"
+  log_level: INFO
+
+# ---------- 输入源（网络视频 / 桌面 / 摄像头 / 音频） ----------
+input_sources:
+  - name: live_stream
+    type: network_video
+    enabled: true
+    params:
+      url: "rtsp://192.168.1.10/live"
+      fps: 10
+      resolution: "1280x720"
+      auth:
+        user: "${ENV:CAM_USER}"
+        pass: "${ENV:CAM_PASS}"
+
+  - name: my_screen
+    type: desktop
+    enabled: true
+    params:
+      monitor: 0
+      region: [0, 0, 1920, 1080]
+      fps: 5
+
+  - name: webcam_main
+    type: webcam
+    enabled: false
+    params:
+      device_id: 0
+      resolution: "640x480"
+      fps: 15
+
+  - name: mic_in
+    type: microphone
+    enabled: true
+    params:
+      device: "默认输入设备"
+      sample_rate: 16000
+
+# ---------- 大语言模型接口（OpenAI 兼容，主备切换） ----------
+llm:
+  primary:
+    provider: openai-compatible
+    base_url: "https://api.deepseek.com/v1"
+    model: "deepseek-chat"
+    api_key: "${ENV:LLM_API_KEY}"
+    temperature: 0.8
+    top_p: 0.9
+    max_tokens: 1024
+    timeout_sec: 30
+    fallback: [miMo, local]
+  miMo:
+    base_url: "https://api.mimo.com/v1"
+    model: "mimo-7b"
+    api_key: "${ENV:MIMO_KEY}"
+  local:
+    base_url: "http://127.0.0.1:8000/v1"
+    model: "local-llm"
+
+# ---------- 音频输出接口（本地 TTS） ----------
+audio_output:
+  provider: local-tts
+  endpoint: "http://127.0.0.1:5000/tts"
+  voice: "default"
+  speed: 1.0
+  volume: 0.8
+  device: "默认输出设备"
+  split_by: sentence
+
+# ---------- 记忆系统（详见 01） ----------
+memory:
+  l1_retention_days: 30
+  l2_promote_importance: 60
+  forget_half_life_days: 14
+  vector_dim: 768
+  vector_backend: sqlite-vss
+  max_edges_per_node: 50
+  dedupe: true
+
+# ---------- 任务排序（详见 02） ----------
+scheduler:
+  policy: priority-preemptive
+  max_workers: 2
+  p1_max_wait_sec: 2
+  default_timeout_sec: 30
+  default_max_retry: 2
+  retry_backoff_sec: 5
+
+# ---------- 视觉与音频识别（详见 03） ----------
+perception:
+  vision_fps: 8
+  audio_sample_rate: 16000
+  models:
+    detector: yolov8n
+    ocr: paddleocr
+    vlm: disabled
+  vad: silero
+  asr: faster-whisper
+  frame_cache_ttl_sec: 30
+
+# ---------- 模拟输入（详见 04） ----------
+input_controller:
+  permission_tier: ui
+  require_confirm_for: [system]
+  coordinate_space: normalized
+  rate_limit_per_sec: 20
+  verify_after_action: true
+  backend: pyautogui

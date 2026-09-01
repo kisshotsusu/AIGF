@@ -122,6 +122,9 @@ from home_modules.cosyvoice_tts import CosyVoiceTTS
 from home_modules.video_understanding import QwenVideoClient
 from home_modules.video_editing import VideoEditor
 from home_modules.edge_browser import EdgeBrowserClient
+from home_modules.hierarchical_task import HierarchicalTaskManager
+from home_modules.speech_pipeline import SpeechPipeline
+from home_modules.knowledge_base import create_knowledge_base
 
 
 class HomeAgent:
@@ -161,6 +164,27 @@ class HomeAgent:
         edge_cfg = dict(self.project.get("edge_browser", {}) or {})
         edge_cfg.setdefault("project_root", str(ROOT))
         self.edge_browser = EdgeBrowserClient(edge_cfg)
+        # --- 人类化改造：父子任务树 / 并发语音 / 经验知识库 ---
+        hl = self.config.get("human_like", {})
+        self.human_like_enabled = bool(hl.get("enabled", True))
+        self.hierarchical_enabled = bool(hl.get("hierarchical_tasks", True))
+        self.parallel_speech_enabled = bool(hl.get("parallel_speech", True))
+        self.progress_speech_enabled = bool(hl.get("progress_speech", True))
+        self.acknowledge_on_start = bool(hl.get("acknowledge_on_start", True))
+        self.kb_inject_into_plan = bool(hl.get("kb_prior_experience_in_plan", True))
+        self.task_tree = None
+        self.task_tree_snapshot_path = HOME_AGENT / "state" / "task_tree.json"
+        self.speech_pipeline = SpeechPipeline(self, enabled=self.parallel_speech_enabled)
+        kb_cfg = self.config.get("knowledge_base", {})
+        self.kb_enabled = bool(kb_cfg.get("enabled", False))
+        self.knowledge_base = None
+        if self.kb_enabled:
+            try:
+                self.knowledge_base = create_knowledge_base(kb_cfg)
+            except Exception as exc:
+                self.log_event("knowledge_base_init_failed", error=str(exc))
+                self.knowledge_base = None
+                self.kb_enabled = False
         self.restart_requested = False
         self.current_task_resumed = False
         threading.Thread(target=self.ensure_vision_service, daemon=True, name="vision-mcp-autostart").start()
@@ -880,6 +904,41 @@ class HomeAgent:
             return
         status(payload if getattr(status, "supports_structured_status", False) else fallback)
 
+    def _persist_task_tree(self, status=None, note: str = "") -> None:
+        """把当前父子任务树快照写入磁盘，供角色管理器（独立进程）实时查看。
+
+        不抛异常、不影响主流程；写入采用临时文件 + 原子替换。
+        """
+        try:
+            path = self.task_tree_snapshot_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            now = datetime.now().isoformat(timespec="seconds")
+            if self.task_tree is None:
+                snapshot = {
+                    "has_task": False,
+                    "agent": self.character_name,
+                    "updated_at": now,
+                    "tree": None,
+                }
+            else:
+                payload = self.task_tree.progress_payload(note)
+                snapshot = {
+                    "has_task": True,
+                    "agent": self.character_name,
+                    "updated_at": now,
+                    "progress": payload.get("progress"),
+                    "total_steps": payload.get("total_steps"),
+                    "completed_steps": payload.get("completed_steps"),
+                    "failed_steps": payload.get("failed_steps"),
+                    "current": payload.get("current", ""),
+                    "tree": self.task_tree.root.to_dict(),
+                }
+            temp = path.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(path)
+        except Exception as exc:
+            self.log_event("task_tree_persist_failed", error=str(exc))
+
     @staticmethod
     def _activity_text(value: Any, limit: int = 96) -> str:
         text = " ".join(str(value or "").split())
@@ -1209,7 +1268,14 @@ class HomeAgent:
                 if ready(): return True
                 time.sleep(1)
             return False
-        python = ROOT / ".venv" / "Scripts" / "python.exe"; server = ROOT / "Vision" / "mcp_server.py"
+        backend = str(cfg.get("backend") or "gui_actor")
+        # GUI-Owl (Qwen3-VL) 需要 transformers>=4.57，与 GUI-Actor 的 4.51.3 冲突，
+        # 因此单独装在 .venv-owl 中；按后端选择对应的 python 解释器。
+        if backend == "gui_owl":
+            python = ROOT / ".venv-owl" / "Scripts" / "python.exe"
+        else:
+            python = ROOT / ".venv" / "Scripts" / "python.exe"
+        server = ROOT / "Vision" / "mcp_server.py"
         if not python.exists() or not server.exists():
             self.log_event("vision_service_missing", python=python, server=server); return False
         # The HTTP port is not opened until model preload finishes.  Coordinate
@@ -1254,7 +1320,7 @@ class HomeAgent:
         env = os.environ.copy(); env.update({
             "VISION_MCP_TRANSPORT": "http", "VISION_MCP_HOST": host, "VISION_MCP_PORT": str(port),
             "VISION_PRELOAD_MODEL": "1" if cfg.get("preload_model", True) else "0",
-            "VISION_BACKEND": str(cfg.get("backend") or "gui_actor"),
+            "VISION_BACKEND": backend,
             "GUI_OWL_MODEL": str(cfg.get("gui_owl_model") or ROOT / "Vision" / "models" / "GUI-Owl-1.5-2B-Instruct"),
             "GUI_ACTOR_MODEL": str(ROOT / "Vision" / "models" / "GUI-Actor-2B-Qwen2-VL"),
             "GUI_ACTOR_REPO": str(ROOT / "Vision" / "GUI-Actor"),
@@ -1804,7 +1870,8 @@ class HomeAgent:
             {"type": "function", "function": {"name": "list_scheduled_tasks", "description": "列出当前所有提醒、闹钟和重复任务", "parameters": {"type": "object", "properties": {}}}},
             {"type": "function", "function": {"name": "delete_scheduled_task", "description": "取消并删除一个定时任务", "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}}},
             {"type": "function", "function": {"name": "acknowledge_scheduled_task", "description": "确认指定或最近一个待回应定时任务，并返回确认结果和剩余任务数量。", "parameters": {"type": "object", "properties": {"task_id": {"type": "string", "description": "可选；不填时确认最近的待回应任务"}, "response": {"type": "string", "description": "用户的原始确认回复"}}}}},
-            {"type": "function", "function": {"name": "long_term_memory", "description": "存储或按标签检索结构化长期记忆，并返回数据库操作结果。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["store", "retrieve"]}, "tags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 5}, "summary": {"type": "string", "maxLength": 20}, "detail": {"type": "string"}, "category": {"type": "string", "enum": ["health", "emotion", "major_event", "preference", "habit", "relationship", "agreement"]}, "importance": {"type": "integer", "minimum": 70, "maximum": 100}, "query_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8}}, "required": ["action"]}}},
+                {"type": "function", "function": {"name": "long_term_memory", "description": "存储或按标签检索结构化长期记忆，并返回数据库操作结果。", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["store", "retrieve"]}, "tags": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 5}, "summary": {"type": "string", "maxLength": 20}, "detail": {"type": "string"}, "category": {"type": "string", "enum": ["health", "emotion", "major_event", "preference", "habit", "relationship", "agreement"]}, "importance": {"type": "integer", "minimum": 70, "maximum": 100}, "query_tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8}}, "required": ["action"]}}},
+                {"type": "function", "function": {"name": "recall_knowledge", "description": "从个人经验知识库检索过去已完成过的类似任务/解决方案，用于借鉴历史经验、避免重复踩坑。当用户提出一个你之前可能做过的任务时，先检索再动手。返回匹配的经验条目（目标、做法、结果）。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "要检索的经验关键词或问题描述"}, "limit": {"type": "integer", "description": "返回条数，默认 3", "minimum": 1, "maximum": 10}}, "required": ["query"]}}},
         ]
         if getattr(self, "comfyui", None) is not None and self.comfyui.config.get("enabled", True):
             tools += [
@@ -2028,6 +2095,26 @@ class HomeAgent:
         except Exception as exc:
             self.log_event("task_progress_speech_failed", error=str(exc))
 
+    # ------------------------------------------------------------------ #
+    # 人类化改造：并发语音辅助方法
+    # ------------------------------------------------------------------ #
+    async def _finish_speech(self, text: str, status=None) -> None:
+        """并行语音模式下把回复送入后台流水线；否则回退到同步朗读。"""
+        if self.human_like_enabled and self.parallel_speech_enabled:
+            self.speech_pipeline.enqueue(text)
+        else:
+            timeout = aiohttp.ClientTimeout(total=int(self.project.get("tts", {}).get("timeout_seconds", 60)) + 30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                await self._speak_home(session, text, status)
+
+    async def _flush_speech(self) -> None:
+        """等待后台语音队列清空（确保用户听到最终回复后再结束本轮）。"""
+        if self.human_like_enabled and self.parallel_speech_enabled:
+            try:
+                await self.speech_pipeline.flush()
+            except Exception as exc:
+                self.log_event("speech_flush_failed", error=str(exc))
+
     async def proactive_screen_care(self, notification_ready=None) -> str:
         """Capture the primary screen once, let MiMo compose a privacy-safe caring line, then discard it."""
         cfg = self.config.get("screen_care", {})
@@ -2188,11 +2275,42 @@ class HomeAgent:
         planning_text = text
         if image_paths:
             planning_text += f"\n[本消息已附带 {len(image_paths)} 张图片；执行模型可直接读取全部附件，不要仅因图片内容未知而追问。]"
+        # ---- 人类化改造：复用历史经验辅助规划 ----
+        prior_experience = ""
+        if self.kb_enabled and self.kb_inject_into_plan and self.knowledge_base is not None:
+            try:
+                hits = self.knowledge_base.search(text, k=3)
+                if hits:
+                    prior_experience = "\n[历史相关经验] " + "；".join(
+                        f"目标：{h.get('goal', '')[:80]}；做法：{h.get('approach', '')[:120]}" for h in hits
+                    )
+            except Exception as exc:
+                self.log_event("kb_recall_failed", error=str(exc))
+        if prior_experience:
+            planning_text += prior_experience
         task_plan = await self._plan_task(planning_text, recent_task_context)
         if image_paths:
             task_plan["has_image_attachment"] = True
             task_plan["image_attachment_count"] = len(image_paths)
         self.current_task_plan = task_plan
+        # ---- 人类化改造：构建父子任务树 + 启动并发语音流水线 ----
+        self.task_tree = None
+        if self.human_like_enabled and self.hierarchical_enabled and task_plan.get("is_task"):
+            try:
+                self.task_tree = HierarchicalTaskManager.build_from_plan(task_plan, text)
+                self._emit_activity(status, self.task_tree.progress_payload("已拆解任务步骤"), "已制定执行计划")
+                self._persist_task_tree(status, "已拆解任务步骤")
+            except Exception as exc:
+                self.log_event("task_tree_build_failed", error=str(exc))
+                self.task_tree = None
+        if self.human_like_enabled and self.parallel_speech_enabled and task_plan.get("is_task"):
+            try:
+                self.speech_pipeline.start()
+                if self.acknowledge_on_start:
+                    ack = "好的，我来帮你处理。" if not self.task_tree else f"好的，我把它拆成了 {len(self.task_tree.root.children)} 步来做。"
+                    self.speech_pipeline.acknowledge(ack)
+            except Exception as exc:
+                self.log_event("speech_pipeline_start_failed", error=str(exc))
         code_task = bool(task_plan.get("is_task") and task_plan.get("actionable") and task_plan.get("domain") == "code")
         self.current_code_task = code_task
         self.current_file_authoring_task = bool(task_plan.get("is_task") and task_plan.get("actionable") and task_plan.get("domain") == "file")
@@ -2221,7 +2339,8 @@ class HomeAgent:
             self._publish_answer(answer, answer_ready)
             async with aiohttp.ClientSession() as session:
                 if self.config["home"].get("auto_speak", True):
-                    await self._speak_home(session, answer, status)
+                    await self._finish_speech(answer, status)
+            await self._flush_speech()
             return answer
         web_route = self._should_route_to_web(task_plan)
         vision_route = self._should_route_to_vision(task_plan)
@@ -2294,10 +2413,19 @@ class HomeAgent:
             max_failed_rounds = max(1, int(self.config["agent"].get("max_tool_rounds", 8)))
             max_tool_iterations = max(max_failed_rounds, int(self.config["agent"].get("max_tool_iterations", max_failed_rounds * 4)))
             failed_rounds = 0
-            for round_index in range(max_tool_iterations):
-                if failed_rounds >= max_failed_rounds:
-                    break
-                round_failed = False
+        for round_index in range(max_tool_iterations):
+            if failed_rounds >= max_failed_rounds:
+                break
+            round_failed = False
+            # ---- 人类化改造：推进父子任务树进度并实时回报 ----
+            if self.task_tree is not None:
+                try:
+                    node = self.task_tree.begin_next_step()
+                    if node is not None:
+                        self._emit_activity(status, self.task_tree.progress_payload(f"进行中：{node.title}"), f"进行中：{node.title}")
+                        self._persist_task_tree(status, f"进行中：{node.title}")
+                except Exception as exc:
+                    self.log_event("task_tree_advance_failed", error=str(exc))
                 round_post_tool_instructions: list[str] = []
                 if status: status("正在思考…")
                 tuning = llm_cfg.get("home", {})
@@ -2406,13 +2534,31 @@ class HomeAgent:
                                 continue
                             answer = f"任务执行后的独立检查仍未通过：{reason[:220]}。我没有把未验证的结果报告为完成。"
                     self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
+                    if self.task_tree is not None:
+                        try:
+                            finished = self.task_tree.current_step()
+                            self.task_tree.complete_current_step()
+                            self.task_tree.complete_all()
+                            if finished is not None and self.progress_speech_enabled:
+                                self.speech_pipeline.enqueue(f"已完成：{finished.title[:24]}")
+                            self._emit_activity(status, self.task_tree.progress_payload("任务完成"), "任务完成")
+                            self._persist_task_tree(status, "任务完成")
+                        except Exception as exc:
+                            self.log_event("task_tree_complete_failed", error=str(exc))
                     self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
                     self._publish_media(generated_media, media_ready)
                     self._publish_answer(answer, answer_ready)
+                    if self.kb_enabled and self.knowledge_base is not None:
+                        try:
+                            self.knowledge_base.record_completed_task(goal=text, plan=task_plan, answer=answer, evidence=completion_evidence, success=True)
+                            self.log_event("knowledge_ingested", goal=text[:120])
+                        except Exception as exc:
+                            self.log_event("knowledge_ingest_failed", error=str(exc))
                     if not long_term_stored:
                         await self._maybe_remember_home(text, answer, session, provider, key)
                     if self.config["home"].get("auto_speak", True) and answer and not singing_performed:
-                        await self._speak_home(session, answer, status)
+                        await self._finish_speech(answer, status)
+                    await self._flush_speech()
                     return answer
                 for call in calls:
                     tool_sequence += 1
@@ -2535,8 +2681,15 @@ class HomeAgent:
             self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
             self._publish_media(generated_media, media_ready)
             self._publish_answer(answer, answer_ready)
+            if self.task_tree is not None:
+                try:
+                    self.task_tree.fail_all_remaining(last_reason[:200])
+                    self._persist_task_tree(status, f"任务失败：{last_reason[:120]}")
+                except Exception:
+                    pass
             if self.config["home"].get("auto_speak", True):
-                await self._speak_with_fresh_session(answer, status, ignore_cancel=True)
+                await self._finish_speech(answer, status)
+            await self._flush_speech()
             return answer
         limit_reason = f"达到总迭代安全上限 {max_tool_iterations} 次" if iteration_limit_reached else f"累计失败 {rounds} 轮"
         answer = f"这次任务在{limit_reason}后仍未完成，我已经停下来了。最后失败原因是：{last_reason[:180]}。没有把未验证的操作当作成功。"
@@ -2545,11 +2698,36 @@ class HomeAgent:
         self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
         self._publish_media(generated_media, media_ready)
         self._publish_answer(answer, answer_ready)
+        if self.task_tree is not None:
+            try:
+                self.task_tree.fail_all_remaining(last_reason[:200])
+                self._persist_task_tree(status, f"任务失败：{last_reason[:120]}")
+            except Exception:
+                pass
+        if self.kb_enabled and self.knowledge_base is not None:
+            try:
+                self.knowledge_base.record_completed_task(goal=text, plan=task_plan, answer=answer, evidence=completion_evidence, success=False)
+                self.log_event("knowledge_ingested_failure", goal=text[:120])
+            except Exception as exc:
+                self.log_event("knowledge_ingest_failed", error=str(exc))
         if self.config["home"].get("auto_speak", True):
-            await self._speak_with_fresh_session(answer, status, ignore_cancel=True)
+            await self._finish_speech(answer, status)
+        await self._flush_speech()
         return answer
 
     async def _run_tool(self, name: str, args: dict[str, Any], confirm=None, status=None) -> Any:
+        if name == "recall_knowledge":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return {"status": "failed", "error": "query 不能为空"}
+            limit = max(1, min(int(args.get("limit", 3) or 3), 10))
+            if not (self.kb_enabled and self.knowledge_base is not None):
+                return {"ok": True, "available": False, "results": [], "message": "知识库未启用"}
+            try:
+                hits = self.knowledge_base.search(query, k=limit)
+                return {"ok": True, "available": True, "count": len(hits), "results": hits}
+            except Exception as exc:
+                return {"status": "failed", "error": str(exc)[:500]}
         if name.startswith("code_"):
             editor = self.self_upgrade.code_editor
             self_edit = bool(getattr(self, "current_code_self_edit", False))

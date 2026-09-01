@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 940" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#424242"/>
+    </marker>
+    <marker id="arrowD" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#9E9E9E"/>
+    </marker>
+    <style>
+      .box { rx:10; ry:10; stroke-width:2; }
+      .t   { fill:#212121; font-size:15px; font-weight:600; text-anchor:middle; }
+      .s   { fill:#424242; font-size:11px; text-anchor:middle; }
+      .s2  { fill:#546E7A; font-size:10.5px; text-anchor:middle; }
+      .lbl { fill:#616161; font-size:11px; text-anchor:middle; }
+      .title { fill:#212121; font-size:20px; font-weight:700; text-anchor:middle; }
+      .foot { fill:#757575; font-size:10.5px; text-anchor:middle; }
+      .crit { fill:#B71C1C; font-size:11px; font-weight:600; text-anchor:middle; }
+    </style>
+  </defs>
+
+  <text x="540" y="30" class="title">AI Agent 系统架构 — AIAgent 实际实现（设计 / 实现对照）</text>
+
+  <!-- 05 Config bar -->
+  <rect class="box" x="50" y="48" width="980" height="64" fill="#FFF3E0" stroke="#FB8C00"/>
+  <text x="540" y="70" class="t">05 设置接口与参数系统（单一写入权威：CharacterService）</text>
+  <text x="540" y="90" class="s">实现：config.yaml ＋ HomeAgent/config.yaml · config.d/ ＋ workspace/MCP_SERVERS.yaml（按修改时间双向同步，保留未知字段）</text>
+  <text x="540" y="106" class="s2">角色工作台管理共享模型/密钥；直播控制台只维护运行参数与 BILIBILI_COOKIE；密钥仅存 .env</text>
+
+  <!-- Input adapters row -->
+  <rect class="box" x="50"  y="132" width="225" height="64" fill="#E3F2FD" stroke="#1E88E5"/>
+  <text x="162" y="158" class="t">直播 B站 WebSocket</text>
+  <text x="162" y="178" class="s2">modules/live/bilibili.py · 进房/弹幕</text>
+
+  <rect class="box" x="293" y="132" width="225" height="64" fill="#E3F2FD" stroke="#1E88E5"/>
+  <text x="405" y="158" class="t">桌面屏幕捕获</text>
+  <text x="405" y="178" class="s2">Vision MCP 截图 / 窗口枚举</text>
+
+  <rect class="box" x="536" y="132" width="225" height="64" fill="#E3F2FD" stroke="#1E88E5"/>
+  <text x="648" y="158" class="t">麦克风 / 系统音频</text>
+  <text x="648" y="178" class="s2">Sound MCP · SenseVoice ASR</text>
+
+  <rect class="box" x="779" y="132" width="251" height="64" fill="#E3F2FD" stroke="#1E88E5"/>
+  <text x="904" y="158" class="t">剪贴板图片 / 文本</text>
+  <text x="904" y="178" class="s2">Qt 输入层 · 多附件 FIFO</text>
+
+  <!-- 03 Perception -->
+  <rect class="box" x="200" y="234" width="360" height="66" fill="#E8F5E9" stroke="#43A047"/>
+  <text x="380" y="260" class="t">03 视觉识别 Vision MCP</text>
+  <text x="380" y="280" class="s2">:8765 · DOM/CDP ＋ GUI-Actor/GUI-Owl 懒加载 · 点击/输入/快捷键/滚动</text>
+
+  <rect class="box" x="580" y="234" width="360" height="66" fill="#E8F5E9" stroke="#43A047"/>
+  <text x="760" y="260" class="t">03 音频识别 Sound MCP</text>
+  <text x="760" y="280" class="s2">:8766 · SenseVoice ASR · VAD · 语言识别</text>
+
+  <!-- 01 Memory -->
+  <rect class="box" x="200" y="340" width="720" height="72" fill="#F3E5F5" stroke="#8E24AA"/>
+  <text x="560" y="364" class="t">01 记忆分级关联性系统</text>
+  <text x="560" y="384" class="s2">L0/L1 workspace/memory/*.jsonl ＋ state/live-context.json ｜ L2 LongTermMemory/memory.db (SQLite, importance≥70, tags 3–5)</text>
+  <text x="560" y="402" class="s2">L3 知识固化: workspace/CHARACTER.md · RULES · ABILITIES ｜ 关联图谱/向量召回：设计待实现 ★</text>
+
+  <!-- Cognitive row -->
+  <rect class="box" x="200" y="452" width="360" height="66" fill="#E0F7FA" stroke="#00ACC1"/>
+  <text x="380" y="478" class="t">认知 / LLM 推理</text>
+  <text x="380" y="498" class="s2">MiMo mimo-v2.5 · 语义规划器 · DeepSeek/Custom 备援</text>
+
+  <rect class="box" x="580" y="452" width="360" height="66" fill="#E0F7FA" stroke="#00ACC1"/>
+  <text x="760" y="478" class="t">02 任务排序系统（模型驱动）</text>
+  <text x="760" y="498" class="s2">语义规划 Plan 驱动 · 语音优先队列 · 工具循环预算 28/112 · Task/*.json 提醒</text>
+
+  <!-- 最高优先级规则 callout -->
+  <rect class="box" x="580" y="528" width="360" height="40" fill="#FFEBEE" stroke="#C62828" stroke-dasharray="6,3"/>
+  <text x="760" y="546" class="crit">★ 最高优先级：任务类型/流程禁止硬编码</text>
+  <text x="760" y="562" class="s2">由语义规划器决定意图/步骤/工具/完成，本地仅校验参数</text>
+
+  <!-- 04 Execution -->
+  <rect class="box" x="160" y="596" width="760" height="84" fill="#ECEFF1" stroke="#546E7A"/>
+  <text x="540" y="622" class="t">04 模拟输入系统（执行）</text>
+  <text x="540" y="642" class="s2">HomeAgent 工具循环 · Vision GUI-Actor/GUI-Owl 点击/输入 · command_executor(PowerShell/CMD)</text>
+  <text x="540" y="660" class="s2">Skill 技能 · Codex CLI · ComfyUI :8188 · CosyVoice2 :50000 · Edge :9223</text>
+  <text x="540" y="678" class="s2">权限分级 read/ui/system · 资源互斥锁 · 动作后 550ms 截图回看验证 · 失败可重试 · 不虚构成功</text>
+
+  <!-- Audio output -->
+  <rect class="box" x="932" y="596" width="98" height="84" fill="#FBE9E7" stroke="#E64A19"/>
+  <text x="981" y="622" class="t">音频输出</text>
+  <text x="981" y="642" class="s2">GPT-SoVITS</text>
+  <text x="981" y="658" class="s2">:9879 主</text>
+  <text x="981" y="674" class="s2">SAPI 降级</text>
+
+  <!-- Presentation band -->
+  <rect class="box" x="50" y="712" width="980" height="48" fill="#E8EAF6" stroke="#3949AB"/>
+  <text x="540" y="734" class="t">呈现层：HomeAgent PySide6 桌宠 ｜ 直播 Web 控制台 :9888 ｜ CharacterManager 工作台</text>
+  <text x="540" y="752" class="s2">所有常驻服务使用跨进程 InstanceLock 单实例约束（HomeAgent/角色管理器/直播/ Sound/Vision 各持锁）</text>
+
+  <!-- Config -> input (dashed) -->
+  <line x1="162" y1="112" x2="162" y2="132" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <line x1="405" y1="112" x2="405" y2="132" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <line x1="648" y1="112" x2="648" y2="132" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <line x1="904" y1="112" x2="904" y2="132" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+
+  <!-- Config -> LLM (left margin dashed) -->
+  <path d="M120,112 V485 H200" fill="none" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <text x="126" y="300" class="lbl" text-anchor="start">LLM 配置</text>
+
+  <!-- Config -> TTS (right margin dashed) -->
+  <path d="M1055,112 V596 H1030" fill="none" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <text x="1060" y="360" class="lbl" text-anchor="start">TTS 配置</text>
+
+  <!-- input -> perception -->
+  <line x1="380" y1="196" x2="380" y2="234" stroke="#424242" marker-end="url(#arrow)"/>
+  <line x1="760" y1="196" x2="760" y2="234" stroke="#424242" marker-end="url(#arrow)"/>
+
+  <!-- perception -> memory -->
+  <line x1="560" y1="300" x2="560" y2="340" stroke="#424242" marker-end="url(#arrow)"/>
+  <text x="606" y="326" class="lbl">结构化感知事件</text>
+
+  <!-- memory -> cognitive -->
+  <line x1="560" y1="412" x2="560" y2="452" stroke="#424242" marker-end="url(#arrow)"/>
+  <text x="606" y="440" class="lbl">检索上下文</text>
+
+  <!-- perception -> cognitive real-time (right dashed) -->
+  <path d="M925,300 V518" fill="none" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <text x="930" y="404" class="lbl" text-anchor="start">实时事件</text>
+
+  <!-- cognitive -> execution -->
+  <line x1="540" y1="518" x2="540" y2="596" stroke="#424242" marker-end="url(#arrow)"/>
+  <text x="586" y="566" class="lbl">Plan 动作指令</text>
+
+  <!-- execution -> audio -->
+  <line x1="920" y1="638" x2="932" y2="638" stroke="#424242" marker-end="url(#arrow)"/>
+
+  <!-- execution -> memory feedback (dashed) -->
+  <path d="M160,638 C90,638 90,408 200,386" fill="none" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <text x="86" y="520" class="lbl" text-anchor="end">执行反馈</text>
+
+  <!-- cognitive -> audio voice text (dashed) -->
+  <path d="M760,518 C870,558 895,558 925,596" fill="none" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <text x="850" y="548" class="lbl">语音文本</text>
+
+  <!-- execution -> presentation (UI update) -->
+  <line x1="540" y1="680" x2="540" y2="712" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+  <text x="586" y="702" class="lbl">UI 更新</text>
+
+  <!-- audio -> presentation -->
+  <line x1="981" y1="680" x2="981" y2="712" stroke="#9E9E9E" stroke-dasharray="5,4" marker-end="url(#arrowD)"/>
+
+  <text x="540" y="798" class="foot">设计（workspace/架构 00–07）为通用 Agent 框架目标；本图叠加 AIAgent 实际实现的模块、端口与配置。详细对照见 08_实现对照.md</text>
+  <text x="540" y="816" class="foot">数据流：输入 → 感知(结构化) → 记忆(存/取) → 认知(LLM 决策) → 任务(模型驱动排序) → 执行(操控) → 输出(语音) ↑ 执行反馈回流记忆</text>
+  <text x="540" y="834" class="foot">图例：实线=已实现主链路 · 虚线=配置/反馈/旁路 · ★=设计演进待实现（关联图谱、向量召回、网络摄像头输入、并发优先级调度）</text>
+</svg>

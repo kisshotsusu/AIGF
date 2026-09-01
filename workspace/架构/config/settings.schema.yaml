@@ -1,0 +1,103 @@
+# 配置字段约束（JSON-Schema 风格，供 ConfigManager.validate 使用）
+# 路径格式：顶层键.子键[索引].字段
+
+system:
+  type: object
+  required: [mode, data_dir]
+  properties:
+    mode:        {type: string, enum: [live, home, standalone]}
+    data_dir:    {type: string}
+    log_level:   {type: string, enum: [DEBUG, INFO, WARN, ERROR], default: INFO}
+
+input_sources:
+  type: array
+  required: [name, type]
+  item:
+    name:    {type: string}
+    type:    {type: string, enum: [network_video, desktop, webcam, microphone, system_audio, network_audio]}
+    enabled: {type: boolean, default: false}
+    params:
+      url:         {type: string, required_if_type: [network_video, network_audio]}
+      fps:         {type: number, default: 10}
+      resolution:  {type: string}
+      monitor:     {type: integer, default: 0}
+      region:      {type: array, items: integer, len: 4}
+      device_id:   {type: integer, default: 0}
+      device:      {type: string}
+      sample_rate: {type: integer, default: 16000}
+      auth:        {type: object}
+
+llm:
+  type: object
+  required: [primary]
+  properties:
+    primary:
+      type: object
+      required: [base_url, model, api_key]
+      properties:
+        provider:    {type: string, default: openai-compatible}
+        base_url:    {type: string}      # OpenAI 兼容端点
+        model:       {type: string}
+        api_key:     {type: string, pattern: '^\$\{ENV:.+\}$'}   # 必须为环境变量引用
+        temperature: {type: number, default: 0.8}
+        top_p:       {type: number, default: 0.9}
+        max_tokens:  {type: integer, default: 1024}
+        timeout_sec: {type: integer, default: 30}
+        fallback:    {type: array, items: string}
+    # 其余命名模型实例：base_url/model/api_key 同结构
+
+audio_output:
+  type: object
+  required: [provider, endpoint]
+  properties:
+    provider: {type: string, enum: [local-tts, azure, edge, elevenlabs]}
+    endpoint: {type: string}     # TTS 服务地址
+    voice:    {type: string, default: default}
+    speed:    {type: number, default: 1.0}
+    volume:   {type: number, default: 0.8}
+    device:   {type: string}
+    split_by: {type: string, enum: [sentence, paragraph, none], default: sentence}
+
+memory:
+  type: object
+  properties:
+    l1_retention_days:     {type: integer, default: 30}
+    l2_promote_importance: {type: integer, default: 60}
+    forget_half_life_days: {type: integer, default: 14}
+    vector_dim:            {type: integer, default: 768}
+    vector_backend:        {type: string, enum: [faiss, annoy, sqlite-vss], default: sqlite-vss}
+    max_edges_per_node:    {type: integer, default: 50}
+    dedupe:                {type: boolean, default: true}
+
+scheduler:
+  type: object
+  properties:
+    policy:            {type: string, enum: [priority-preemptive, edf, fifo], default: priority-preemptive}
+    max_workers:       {type: integer, default: 2}
+    p1_max_wait_sec:   {type: integer, default: 2}
+    default_timeout_sec: {type: integer, default: 30}
+    default_max_retry: {type: integer, default: 2}
+    retry_backoff_sec: {type: integer, default: 5}
+
+perception:
+  type: object
+  properties:
+    vision_fps:          {type: integer, default: 8}
+    audio_sample_rate:   {type: integer, default: 16000}
+    models:
+      detector: {type: string, default: yolov8n}
+      ocr:      {type: string, default: paddleocr}
+      vlm:      {type: string, enum: [disabled, llava, remote], default: disabled}
+    vad: {type: string, default: silero}
+    asr: {type: string, default: faster-whisper}
+    frame_cache_ttl_sec: {type: integer, default: 30}
+
+input_controller:
+  type: object
+  properties:
+    permission_tier:        {type: string, enum: [read, ui, system], default: ui}
+    require_confirm_for:    {type: array, items: string, default: [system]}
+    coordinate_space:       {type: string, enum: [normalized, pixel], default: normalized}
+    rate_limit_per_sec:     {type: integer, default: 20}
+    verify_after_action:    {type: boolean, default: true}
+    backend:                {type: string, enum: [pyautogui, pywin32, appium, adb], default: pyautogui}

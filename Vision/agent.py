@@ -37,6 +37,13 @@ MODEL_DIR = os.environ.get(
 BACKEND = os.environ.get("VISION_BACKEND", "gui_actor").strip().lower()
 if BACKEND not in ("gui_owl", "gui_actor"):
     BACKEND = "gui_actor"
+# 推理前输入降采样: 把最长边缩到该像素值 (16:9 下 1280 ≈ 720p)。
+# 实测 1080p->720p 端到端 1.70s->1.30s 且归一化坐标零损失 (坐标为 0~1 相对值,
+# 不受缩放影响)。设 0 或负值 = 关闭降采样 (原生分辨率推理)。
+try:
+    VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "1280").strip() or "0")
+except ValueError:
+    VISION_MAX_SIDE = 1280
 GUI_OWL_MODEL = os.environ.get("GUI_OWL_MODEL", "").strip()
 if not GUI_OWL_MODEL:
     _default_gui_owl = os.path.join(HERE, "models", "GUI-Owl-1.5-2B-Instruct")
@@ -62,6 +69,23 @@ _GUI_OWL_INFEASIBLE_SUFFIX = (
     "\nAdditionally, if you think the task is infeasible (e.g., the task is not related to the image), "
     'return <tool_call>\n{"name": "computer_use", "arguments": {"action": "terminate", "status": "failure"}}\n</tool_call>'
 )
+
+# 紧凑输出格式: 单行 JSON, 输出 token 35->22, 1080p 生成 1678ms->1187ms,
+# 真值精度无损 (0.21% vs 0.18%, 见 Vision/bench_format.py)。
+# 坐标解析: _parse_gui_owl_points 的正则兜底天然兼容 "[x, y]" 形式。
+_OWL_COMPACT_SYSTEM_PROMPT = (
+    "# Task\n\n"
+    "You control a computer mouse. The screen is 1000x1000 normalized.\n"
+    "Locate the UI element described by the user and respond with ONLY one line:\n"
+    '{"action": "left_click", "coordinate": [x, y]}\n'
+    "where x, y are integers in 0~1000 marking the element center.\n"
+    'If the element does not exist in the image, respond with ONLY: '
+    '{"action": "terminate", "status": "failure"}\n'
+    "No explanation, no markdown, no XML tags."
+)
+
+# GUI-Owl 输出格式选择: compact (默认, 更快) | tool_call (官方格式)
+OWL_OUTPUT_FORMAT = os.environ.get("VISION_OWL_OUTPUT_FORMAT", "compact").strip().lower()
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright  # noqa: E402
 
@@ -409,9 +433,28 @@ def _gui_actor_ground(instruction: str, img: Image.Image, topk: int):
     return [[float(point[0]), float(point[1])] for point in points]
 
 
+def _downscale_for_inference(img: Image.Image) -> Image.Image:
+    """按 VISION_MAX_SIDE 把输入图最长边降采样, 控制视觉 token 数以降低延迟。"""
+    if VISION_MAX_SIDE <= 0:
+        return img
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= VISION_MAX_SIDE:
+        return img
+    scale = VISION_MAX_SIDE / longest
+    new_w = max(32, round(w * scale))
+    new_h = max(32, round(h * scale))
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
 def _gui_owl_ground(instruction: str, img: Image.Image, topk: int):
     """GUI-Owl 后端: 生成式 <tool_call> JSON, 解析 0~1000 相对坐标。"""
     global _last_raw_output
+    img = _downscale_for_inference(img)
+    if OWL_OUTPUT_FORMAT == "compact":
+        sys_prompt = _OWL_COMPACT_SYSTEM_PROMPT
+    else:
+        sys_prompt = _GUI_OWL_SYSTEM_PROMPT + _GUI_OWL_INFEASIBLE_SUFFIX
     try:
         from qwen_vl_utils import process_vision_info
     except ImportError as exc:
@@ -422,7 +465,7 @@ def _gui_owl_ground(instruction: str, img: Image.Image, topk: int):
             "role": "system",
             "content": [{
                 "type": "text",
-                "text": _GUI_OWL_SYSTEM_PROMPT + _GUI_OWL_INFEASIBLE_SUFFIX,
+                "text": sys_prompt,
             }],
         },
         {

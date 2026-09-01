@@ -1,9 +1,8 @@
 # Vision 双后端依赖 (GUI-Actor / GUI-Owl)，统一运行于项目共享 .venv
 # Python 3.12 推荐
-torch
-torchvision
-# GUI-Actor (Qwen2-VL) 与 GUI-Owl (Qwen3-VL) 现共用 transformers>=4.57 + qwen-vl-utils>=0.0.14
-# （已验证 GUI-Actor 在 transformers 4.57 下仍正常加载，故无需分离 venv）
+# 注意: torch / torchvision 不要装在本文件 —— 由根目录 set_env.bat 统一从
+# cu128 官方源安装 (RTX 50 系 Blackwell 需要, PyPI 默认源是 CPU 版)。
+# 双后端共用 transformers 4.57.1 + qwen-vl-utils 0.0.14 (GUI-Actor 已验证兼容)
 transformers==4.57.1
 qwen-vl-utils==0.0.14
 accelerate

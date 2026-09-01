@@ -18,10 +18,10 @@ if not exist "%PY%" (
     exit /b 1
 )
 
-echo [STEP] Downloading GUI-Actor-2B (Vision, 默认识别后端) ...  (~4.5 GB, resumable)
-"%PY%" "%ROOT%\Vision\download_model.py" --model gui-actor
-REM GUI-Owl 只在需要时下载:
-REM "%PY%" "%ROOT%\Vision\download_model.py" --model gui-owl
+echo [STEP] Downloading GUI-Owl-1.5-2B (Vision, 默认识别后端 vision_mcp.backend=gui_owl) ...  (~4.5 GB, resumable)
+"%PY%" "%ROOT%\Vision\download_model.py" --model gui-owl
+REM GUI-Actor 为备用后端, 只在需要时下载:
+REM "%PY%" "%ROOT%\Vision\download_model.py" --model gui-actor
 
 echo.
 echo [STEP] Downloading SenseVoiceSmall (Sound) ...  (~1 GB, via ModelScope)

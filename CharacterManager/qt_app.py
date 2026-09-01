@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
@@ -30,9 +31,13 @@ QMainWindow, QWidget#root { background:#eef2f1; }
 QFrame#sidebar { background:#183b37; border:none; }
 QLabel#brand { color:white; font-size:20px; font-weight:700; }
 QLabel#subtitle { color:#d1e7e2; }
-QPushButton#nav { color:#e4f2ef; background:transparent; border:0; border-radius:9px; padding:11px 14px; text-align:left; }
+QPushButton#nav { color:#e4f2ef; background:transparent; border:0; border-radius:9px; padding:10px 14px; text-align:left; }
 QPushButton#nav:hover { background:#27514b; color:white; }
 QPushButton#nav:checked { background:#22a38a; color:white; font-weight:600; }
+QLabel#nav-group { color:#7fb5a9; font-size:11px; font-weight:700; letter-spacing:2px; padding:12px 14px 2px 14px; }
+QPushButton#nav-group { color:#9fd0c5; font-size:11px; font-weight:700; letter-spacing:1px; text-align:left; background:transparent; border:0; border-radius:6px; padding:11px 14px 5px 14px; }
+QPushButton#nav-group:hover { color:#d6efe9; background:#1f463f; }
+QPushButton#nav-group:checked { color:#9fd0c5; }
 QFrame#card, QGroupBox { background:#ffffff; border:1px solid #b9c9c5; border-radius:12px; }
 QGroupBox { font-weight:700; padding:18px 12px 12px 12px; margin-top:10px; }
 QGroupBox::title { subcontrol-origin:margin; left:14px; padding:0 6px; color:#173d36; }
@@ -60,49 +65,6 @@ def button(text, slot=None, primary=False, danger=False):
     return obj
 
 
-class JsonSection(QWidget):
-    """Lossless advanced editor for a configuration section."""
-    def __init__(self, service, title, description, section, home=False):
-        super().__init__(); self.service = service; self.section = section; self.home = home
-        layout = QVBoxLayout(self); layout.setContentsMargins(24, 22, 24, 22); layout.setSpacing(10)
-        layout.addWidget(page_title(title, description))
-        self.editor = QTextEdit(); self.editor.setFont(QFont("Cascadia Mono", 10)); layout.addWidget(self.editor, 1)
-        row = QHBoxLayout(); row.addStretch(); row.addWidget(button("重新载入", self.load)); row.addWidget(button("保存设置", self.save, primary=True)); layout.addLayout(row)
-        self.load()
-
-    def load(self):
-        try: self.editor.setPlainText(json.dumps(self.service.get_config_section(self.section, self.home), ensure_ascii=False, indent=2))
-        except Exception as exc: alert(self, exc)
-
-    def save(self):
-        try:
-            value = json.loads(self.editor.toPlainText() or "{}")
-            if not isinstance(value, dict): raise ValueError("配置必须是 JSON 对象")
-            self.service.save_config_section(self.section, value, self.home)
-            toast(self, "设置已安全保存")
-        except Exception as exc: alert(self, exc)
-
-
-class MultiJsonPage(QWidget):
-    def __init__(self, service, title, description, sections):
-        super().__init__(); self.service=service; self.sections=sections
-        lay=QVBoxLayout(self); lay.setContentsMargins(24,22,24,22); lay.addWidget(page_title(title,description))
-        bar=QHBoxLayout(); bar.addWidget(QLabel("配置模块")); self.selector=QComboBox(); self.selector.addItems(list(sections)); self.selector.currentTextChanged.connect(self.load); bar.addWidget(self.selector,1); bar.addWidget(button("重新载入",self.load)); lay.addLayout(bar)
-        self.editor=QTextEdit(); self.editor.setFont(QFont("Cascadia Mono",10)); lay.addWidget(self.editor,1)
-        row=QHBoxLayout(); row.addStretch(); row.addWidget(button("保存当前模块",self.save,primary=True)); lay.addLayout(row); self.load()
-    def target(self): return self.sections[self.selector.currentText()]
-    def load(self):
-        try:
-            section,home=self.target(); self.editor.setPlainText(json.dumps(self.service.get_config_section(section,home),ensure_ascii=False,indent=2))
-        except Exception as exc: alert(self,exc)
-    def save(self):
-        try:
-            value=json.loads(self.editor.toPlainText() or "{}")
-            if not isinstance(value,dict): raise ValueError("配置必须是 JSON 对象")
-            section,home=self.target(); self.service.save_config_section(section,value,home); toast(self,f"{self.selector.currentText()} 已保存")
-        except Exception as exc: alert(self,exc)
-
-
 def page_title(title, description=""):
     box = QWidget(); lay = QVBoxLayout(box); lay.setContentsMargins(0, 0, 0, 8); lay.setSpacing(3)
     label = QLabel(title); label.setStyleSheet("font-size:22px;font-weight:700;color:#193b36")
@@ -110,6 +72,20 @@ def page_title(title, description=""):
     if description:
         sub = QLabel(description); sub.setWordWrap(True); sub.setStyleSheet("color:#344d47;font-weight:500"); lay.addWidget(sub)
     return box
+
+
+def page_scaffold(page, title, description=""):
+    """统一页面骨架：标准边距(24,22,24,22) + 页头 + 垂直滚动的外层容器。
+    返回 body 的 QVBoxLayout（页面内容直接往里加）。
+    适合表单型页面；以表格/列表为主、需要纵向撑满的页面不要用（会失去 stretch 拉伸）。"""
+    outer = QVBoxLayout(page); outer.setContentsMargins(0, 0, 0, 0)
+    scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    outer.addWidget(scroll)
+    body = QWidget(); lay = QVBoxLayout(body); lay.setContentsMargins(24, 22, 24, 22); lay.setSpacing(12)
+    lay.addWidget(page_title(title, description))
+    scroll.setWidget(body)
+    return lay
 
 
 def alert(parent, exc): QMessageBox.critical(parent, "操作失败", str(exc))
@@ -122,15 +98,13 @@ class IdentityPage(QWidget):
     SPECS = [("name","角色名称"),("identity","角色身份"),("gender","性别设定"),("visual_age","视觉年龄"),("personality","核心性格"),("relationship_to_user","与用户关系"),("user_title","对用户称呼")]
     def __init__(self, service):
         super().__init__(); self.service=service; self.fields={}
-        outer=QVBoxLayout(self); outer.setContentsMargins(0,0,0,0)
-        scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame); outer.addWidget(scroll)
-        body=QWidget(); lay=QVBoxLayout(body); lay.setContentsMargins(24,22,24,22); lay.addWidget(page_title("角色身份", "家庭模式与直播模式共享的角色资料。"))
+        lay=page_scaffold(self,"角色身份","家庭模式与直播模式共享的角色资料。")
         card=QFrame(); card.setObjectName("card"); form=QFormLayout(card); form.setContentsMargins(20,18,20,18); form.setSpacing(11)
         for key,label in self.SPECS: self.fields[key]=QLineEdit(); form.addRow(label,self.fields[key])
         for key,label in (("user_name","用户姓名"),("user_aliases","用户别名（逗号分隔）"),("live_usernames","直播用户名（逗号分隔）")):
             self.fields[key]=QLineEdit(); form.addRow(label,self.fields[key])
         self.notes=QTextEdit(); self.notes.setMaximumHeight(100); form.addRow("补充说明",self.notes)
-        lay.addWidget(card); row=QHBoxLayout(); row.addStretch(); row.addWidget(button("保存身份",self.save,primary=True)); lay.addLayout(row); lay.addStretch(); scroll.setWidget(body); self.load()
+        lay.addWidget(card); row=QHBoxLayout(); row.addStretch(); row.addWidget(button("保存身份",self.save,primary=True)); lay.addLayout(row); lay.addStretch(); self.load()
     def load(self):
         d=self.service.load_identity(); char=d.get("character",{}); user=d.get("user",{})
         for key,_ in self.SPECS: self.fields[key].setText(str(char.get(key,"")))
@@ -159,23 +133,26 @@ class MemoryDialog(QDialog):
 class MemoryPage(QWidget):
     def __init__(self,service):
         super().__init__(); self.service=service; self.rows=[]
-        lay=QVBoxLayout(self); lay.setContentsMargins(24,22,24,22); lay.addWidget(page_title("长期记忆", "搜索、添加和维护家庭与直播共享的长期记忆。"))
-        rules=QGroupBox("记忆写入规则"); grid=QFormLayout(rules); self.rule={}
-        top=QWidget(); top_l=QHBoxLayout(top); top_l.setContentsMargins(0,0,0,0)
+        lay=QVBoxLayout(self); lay.setContentsMargins(24,22,24,22); lay.setSpacing(12); lay.addWidget(page_title("记忆管理", "搜索、添加和维护家庭与直播共享的对话记忆条目；HomeAgent 固化的高价值记忆请见「长期记忆库」。"))
+        rules=QGroupBox("记忆写入规则"); grid=QFormLayout(rules); grid.setHorizontalSpacing(18); grid.setVerticalSpacing(10); self.rule={}
         self.rule["mode"]=QComboBox(); self.rule["mode"].addItem("仅写入重要内容","important"); self.rule["mode"].addItem("关闭自动写入","off"); self.rule["mode"].addItem("写入全部对话","all")
-        self.rule["threshold"]=QSlider(Qt.Horizontal); self.rule["threshold"].setRange(0,100); self.threshold_text=QLabel(); self.rule["threshold"].valueChanged.connect(lambda v:self.threshold_text.setText(str(v)))
-        self.threshold_preview=QLabel(); self.threshold_preview.setMinimumWidth(118); self.threshold_preview.setStyleSheet("color:#0b6556;font-weight:700")
+        self.rule["ai"]=QCheckBox("使用 AI 判断重要度")
+        mode_row=QWidget(); ml=QHBoxLayout(mode_row); ml.setContentsMargins(0,0,0,0); ml.addWidget(self.rule["mode"],1); ml.addSpacing(16); ml.addWidget(self.rule["ai"]); grid.addRow("写入模式",mode_row)
+        self.rule["threshold"]=QSlider(Qt.Horizontal); self.rule["threshold"].setRange(0,100)
+        self.threshold_preview=QLabel(); self.threshold_preview.setMinimumWidth(150); self.threshold_preview.setAlignment(Qt.AlignRight|Qt.AlignVCenter); self.threshold_preview.setStyleSheet("color:#0b6556;font-weight:700")
         def threshold_changed(v):
-            self.threshold_text.setText(str(v)); self.threshold_preview.setText("宽松：写入较多" if v<40 else "均衡：保留重点" if v<75 else "严格：仅高价值")
+            self.threshold_preview.setText(f"{v}  ·  " + ("宽松：写入较多" if v<40 else "均衡：保留重点" if v<75 else "严格：仅高价值"))
         self.rule["threshold"].valueChanged.connect(threshold_changed)
-        self.rule["daily"]=QSpinBox(); self.rule["daily"].setRange(0,500); self.rule["minimum"]=QSpinBox(); self.rule["minimum"].setRange(1,200); self.rule["ai"]=QCheckBox("使用 AI 判断重要度")
-        for label,w in (("写入模式",self.rule["mode"]),("重要度",self.rule["threshold"]),("",self.threshold_text),("",self.threshold_preview),("",self.rule["ai"])): top_l.addWidget(QLabel(label)) if label else None; top_l.addWidget(w)
+        slider_row=QWidget(); sl=QHBoxLayout(slider_row); sl.setContentsMargins(0,0,0,0); sl.addWidget(self.rule["threshold"],1); sl.addSpacing(12); sl.addWidget(self.threshold_preview); grid.addRow("重要度阈值",slider_row)
+        self.rule["daily"]=QSpinBox(); self.rule["daily"].setRange(0,500); self.rule["minimum"]=QSpinBox(); self.rule["minimum"].setRange(1,200)
         limits=QWidget(); limits_l=QHBoxLayout(limits); limits_l.setContentsMargins(0,0,0,0); limits_l.addWidget(QLabel("每日上限")); limits_l.addWidget(self.rule["daily"]); limits_l.addSpacing(20); limits_l.addWidget(QLabel("最短消息长度")); limits_l.addWidget(self.rule["minimum"]); limits_l.addStretch()
-        grid.addRow(top); grid.addRow(limits); self.rule["always"]=QLineEdit(); self.rule["ignore"]=QLineEdit(); grid.addRow("强制记忆关键词",self.rule["always"]); grid.addRow("忽略关键词",self.rule["ignore"])
-        save_rules=button("保存写入规则",self.save_rules,primary=True); grid.addRow("",save_rules); lay.addWidget(rules)
+        grid.addRow("写入限制",limits)
+        self.rule["always"]=QLineEdit(); self.rule["ignore"]=QLineEdit(); grid.addRow("强制记忆关键词",self.rule["always"]); grid.addRow("忽略关键词",self.rule["ignore"])
+        save_rules_row=QWidget(); srl=QHBoxLayout(save_rules_row); srl.setContentsMargins(0,0,0,0); srl.addStretch(); srl.addWidget(button("保存写入规则",self.save_rules,primary=True)); grid.addRow(save_rules_row)
+        lay.addWidget(rules)
         bar=QHBoxLayout(); self.search=QLineEdit(); self.search.setPlaceholderText("搜索内容、用户或标签…"); self.search.returnPressed.connect(self.refresh); bar.addWidget(self.search,1); bar.addWidget(button("搜索",self.refresh)); bar.addWidget(button("添加记忆",self.add,primary=True)); lay.addLayout(bar)
         self.table=QTableWidget(0,6); self.table.setAlternatingRowColors(True); self.table.setHorizontalHeaderLabels(["时间","范围","类型","用户","内容","标签"]); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.verticalHeader().hide(); self.table.horizontalHeader().setSectionResizeMode(4,QHeaderView.Stretch); self.table.doubleClicked.connect(self.edit); lay.addWidget(self.table,1)
-        row=QHBoxLayout(); self.count=QLabel(); row.addWidget(self.count); row.addStretch(); row.addWidget(button("编辑",self.edit)); row.addWidget(button("删除",self.delete,danger=True)); lay.addLayout(row); self.load_rules(); self.refresh()
+        row=QHBoxLayout(); self.count=QLabel(); row.addWidget(self.count); row.addStretch(); row.addWidget(button("编辑",self.edit)); row.addWidget(button("删除",self.delete,danger=True)); lay.addLayout(row); self.load_rules(); self.refresh(); threshold_changed(self.rule["threshold"].value())
     def load_rules(self):
         c=self.service.get_config_section("memory_write"); mode=str(c.get("mode","important")); i=self.rule["mode"].findData(mode); self.rule["mode"].setCurrentIndex(max(0,i)); self.rule["threshold"].setValue(int(c.get("importance_threshold",70))); self.rule["daily"].setValue(int(c.get("max_daily_writes",20))); self.rule["minimum"].setValue(int(c.get("min_message_length",4))); self.rule["ai"].setChecked(bool(c.get("analyze_with_llm",True))); self.rule["always"].setText("，".join(c.get("always_keywords",[]))); self.rule["ignore"].setText("，".join(c.get("ignore_keywords",[])))
     def save_rules(self):
@@ -270,15 +247,17 @@ class ImagesPage(QWidget):
             except Exception as exc:alert(self,exc)
 
 
-class ModelPage(QWidget):
+class LanguageProcessingPage(QWidget):
     def __init__(self,s):
-        super().__init__(); self.s=s; self.providers={}; lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("模型 API","可视化配置供应商、模型密钥以及不同场景的生成参数。"))
-        general=QGroupBox("场景参数"); f=QFormLayout(general); self.current=QComboBox(); self.current.addItems(["deepseek","mimo","custom"]); f.addRow("当前供应商",self.current); profiles=QWidget(); pl=QHBoxLayout(profiles);pl.setContentsMargins(0,0,0,0);self.tuning={}
+        super().__init__(); self.s=s; self.providers={}; lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("语言处理（大模型 API / 本地模型）","可视化配置语言处理后端：云端大模型 API 或本地模型服务，以及不同场景的生成参数。"))
+        general=QGroupBox("场景参数"); f=QFormLayout(general); self.current=QComboBox(); self.current.addItems(["deepseek","mimo","local","custom"]); f.addRow("当前供应商",self.current); profiles=QWidget(); pl=QHBoxLayout(profiles);pl.setContentsMargins(0,0,0,0);self.tuning={}
         for key,label in (("home","家庭对话"),("live","直播回复"),("memory","记忆判断")):
             box=QGroupBox(label);bf=QFormLayout(box);temp=QDoubleSpinBox();temp.setRange(0,2);temp.setSingleStep(.05);temp.setDecimals(2);tokens=QSpinBox();tokens.setRange(1,32000);bf.addRow("温度",temp);bf.addRow("最大 Tokens",tokens);pl.addWidget(box);self.tuning[key]=(temp,tokens)
-        f.addRow(profiles);lay.addWidget(general)
+        f.addRow(profiles)
+        note=QLabel("「本地模型服务」指自托管的 OpenAI 兼容端点（如 Ollama http://localhost:11434/v1、vLLM、LM Studio 等）：Base URL 填其 /v1 地址，模型名称填本地模型名。切换大模型 API 与本地模型在此处完成。"); note.setWordWrap(True); note.setStyleSheet("color:#294a43;background:#e7f2ef;border:1px solid #b7cec8;border-radius:8px;padding:9px 11px"); f.addRow(note)
+        lay.addWidget(general)
         tabs=QTabWidget(); self.provider_tabs=tabs
-        for name,label in (("deepseek","DeepSeek"),("mimo","小米 MiMo"),("custom","自定义")):
+        for name,label in (("deepseek","DeepSeek(云端 API)"),("mimo","小米 MiMo(云端 API)"),("local","本地模型服务"),("custom","自定义")):
             w=QWidget();wf=QFormLayout(w);base=QLineEdit();model=QLineEdit();env=QLineEdit();secret=QLineEdit();secret.setEchoMode(QLineEdit.Password);secret.setPlaceholderText("留空则保留现有密钥");status=QLabel();status.setStyleSheet("font-weight:700");wf.addRow("Base URL",base);wf.addRow("模型名称",model);wf.addRow("密钥环境变量",env);wf.addRow("API Key",secret);wf.addRow("当前状态",status);tabs.addTab(w,label);self.providers[name]=(base,model,env,secret,status)
         tabs.addTab(MiMoMultimodalPage(s, embedded=True),"MiMo 多模态")
         lay.addWidget(tabs,1);row=QHBoxLayout();row.addStretch();row.addWidget(button("保存模型 API",self.save,primary=True));lay.addLayout(row);self.load()
@@ -298,23 +277,38 @@ class ModelPage(QWidget):
         except Exception as exc:alert(self,exc)
 
 
-class VoicePage(QWidget):
+class TtsPage(QWidget):
+    """语音输出（TTS）：语音合成服务地址、模型、参考音频以及自动播放 / 自动启动。"""
     def __init__(self,s):
-        super().__init__();self.s=s;lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("语音服务","可视化配置语音合成、识别、麦克风和识别后自动发送。"));tabs=QTabWidget();lay.addWidget(tabs,1)
-        t=QWidget();tf=QFormLayout(t);self.tts={};
+        super().__init__();self.s=s;lay=page_scaffold(self,"语音输出（TTS）","配置语音合成服务：地址、模型、参考音频以及自动播放与自动启动。保存后重启 HomeAgent 生效。")
+        box=QGroupBox("语音合成 TTS");f=QFormLayout(box);self.tts={}
         for key,label in (("url","TTS 地址"),("health_url","健康检查地址"),("start_command","启动命令"),("model","模型"),("reference","参考音频"),("speaker","说话人")):
-            self.tts[key]=QLineEdit();tf.addRow(label,self.tts[key])
-        self.tts_enabled=QCheckBox("启用语音合成");self.tts_auto=QCheckBox("服务未运行时自动启动");self.tts_play=QCheckBox("生成后自动播放");tf.addRow(self.tts_enabled);tf.addRow(self.tts_auto);tf.addRow(self.tts_play);tabs.addTab(t,"语音合成 TTS")
-        st=QWidget();sf=QFormLayout(st);self.stt={};self.stt_mode=QComboBox();self.stt_mode.addItems(["sound_mcp","mimo","api","local"]);sf.addRow("识别模式",self.stt_mode)
-        for key,label in (("language","识别语言"),("mcp_url","Sound MCP 地址"),("api_url","API 地址"),("model","模型"),("local_python","本地 Python"),("local_model","本地模型")):
-            self.stt[key]=QLineEdit();sf.addRow(label,self.stt[key])
-        self.stt_auto=QCheckBox("自动启动识别服务");sf.addRow(self.stt_auto);tabs.addTab(st,"语音识别 STT")
-        m=QWidget();mf=QFormLayout(m);self.current_device=QLabel();self.current_device.setWordWrap(True);self.current_device.setStyleSheet("color:#123d35;font-weight:700;background:#e7f2ef;border:1px solid #a8c5be;border-radius:7px;padding:9px");self.change_devices=button("更改设备",self.toggle_devices);self.devices=QListWidget();self.devices.setMinimumHeight(210);self.devices.setVisible(False);self.rate=QSpinBox();self.rate.setRange(8000,192000);self.channels=QSpinBox();self.channels.setRange(1,8);self.auto_send=QCheckBox("识别完成后自动发送消息");current_row=QWidget();cr=QHBoxLayout(current_row);cr.setContentsMargins(0,0,0,0);cr.addWidget(self.current_device,1);cr.addWidget(self.change_devices);mf.addRow("当前输入设备",current_row);mf.addRow("选择设备",self.devices);mf.addRow("采样率",self.rate);mf.addRow("声道数",self.channels);mf.addRow(self.auto_send);tabs.addTab(m,"麦克风与发送")
-        row=QHBoxLayout();row.addStretch();row.addWidget(button("保存语音设置",self.save,primary=True));lay.addLayout(row);self.load()
+            self.tts[key]=QLineEdit();f.addRow(label,self.tts[key])
+        self.tts_enabled=QCheckBox("启用语音合成");self.tts_auto=QCheckBox("服务未运行时自动启动");self.tts_play=QCheckBox("生成后自动播放");f.addRow(self.tts_enabled);f.addRow(self.tts_auto);f.addRow(self.tts_play)
+        lay.addWidget(box);row=QHBoxLayout();row.addStretch();row.addWidget(button("保存语音输出设置",self.save,primary=True));lay.addLayout(row);lay.addStretch();self.load()
     def load(self):
         t=self.s.get_config_section("tts");
         for k,w in self.tts.items():w.setText(str(t.get(k,"")))
         self.tts_enabled.setChecked(bool(t.get("enabled",True)));self.tts_auto.setChecked(bool(t.get("auto_start",True)));self.tts_play.setChecked(bool(t.get("play_audio",True)))
+    def save(self):
+        try:
+            t=self.s.get_config_section("tts");t.update({k:w.text().strip() for k,w in self.tts.items()});t.update(enabled=self.tts_enabled.isChecked(),auto_start=self.tts_auto.isChecked(),play_audio=self.tts_play.isChecked());self.s.save_config_section("tts",t);toast(self,"语音输出设置已保存")
+        except Exception as exc:alert(self,exc)
+
+
+class AudioProcessingPage(QWidget):
+    """音频处理（输入与识别）：语音识别模式、识别语言、本地识别模型以及麦克风输入设备。"""
+    def __init__(self,s):
+        super().__init__();self.s=s;lay=page_scaffold(self,"音频处理（输入与识别）","配置语音识别模式、识别语言、本地识别模型以及麦克风输入设备。")
+        st=QWidget();sf=QFormLayout(st);self.stt={};self.stt_mode=QComboBox();self.stt_mode.addItems(["sound_mcp","mimo","api","local"]);sf.addRow("识别模式",self.stt_mode)
+        for key,label in (("language","识别语言"),("mcp_url","Sound MCP 地址"),("api_url","API 地址"),("model","模型"),("local_python","本地 Python"),("local_model","本地模型")):
+            self.stt[key]=QLineEdit();sf.addRow(label,self.stt[key])
+        self.stt_auto=QCheckBox("自动启动识别服务");sf.addRow(self.stt_auto)
+        box=QGroupBox("语音识别 STT");box.setLayout(sf);lay.addWidget(box)
+        m=QWidget();mf=QFormLayout(m);self.current_device=QLabel();self.current_device.setWordWrap(True);self.current_device.setStyleSheet("color:#123d35;font-weight:700;background:#e7f2ef;border:1px solid #a8c5be;border-radius:7px;padding:9px");self.change_devices=button("更改设备",self.toggle_devices);self.devices=QListWidget();self.devices.setMinimumHeight(210);self.devices.setVisible(False);self.rate=QSpinBox();self.rate.setRange(8000,192000);self.channels=QSpinBox();self.channels.setRange(1,8);self.auto_send=QCheckBox("识别完成后自动发送消息");current_row=QWidget();cr=QHBoxLayout(current_row);cr.setContentsMargins(0,0,0,0);cr.addWidget(self.current_device,1);cr.addWidget(self.change_devices);mf.addRow("当前输入设备",current_row);mf.addRow("选择设备",self.devices);mf.addRow("采样率",self.rate);mf.addRow("声道数",self.channels);mf.addRow(self.auto_send)
+        mcb=QGroupBox("麦克风输入");mcb.setLayout(mf);lay.addWidget(mcb)
+        row=QHBoxLayout();row.addStretch();row.addWidget(button("保存音频处理设置",self.save,primary=True));lay.addLayout(row);self.load()
+    def load(self):
         st=self.s.get_config_section("stt",True);self.stt_mode.setCurrentText(str(st.get("mode","sound_mcp")))
         for k,w in self.stt.items():w.setText(str(st.get(k,"")))
         self.stt_auto.setChecked(bool(st.get("auto_start",True)));m=self.s.get_config_section("microphone",True);self.rate.setValue(int(m.get("sample_rate",16000)));self.channels.setValue(int(m.get("channels",1)));self.auto_send.setChecked(bool(m.get("auto_send_after_transcription",True)));self.load_devices(m)
@@ -333,15 +327,15 @@ class VoicePage(QWidget):
         visible=not self.devices.isVisible();self.devices.setVisible(visible);self.change_devices.setText("收起设备列表" if visible else "更改设备")
     def save(self):
         try:
-            t=self.s.get_config_section("tts");t.update({k:w.text().strip() for k,w in self.tts.items()});t.update(enabled=self.tts_enabled.isChecked(),auto_start=self.tts_auto.isChecked(),play_audio=self.tts_play.isChecked());self.s.save_config_section("tts",t)
             st=self.s.get_config_section("stt",True);st.update({k:w.text().strip() for k,w in self.stt.items()});st["mode"]=self.stt_mode.currentText();st["auto_start"]=self.stt_auto.isChecked();self.s.save_config_section("stt",st,True)
-            chosen=[self.devices.item(i).data(Qt.UserRole) for i in range(self.devices.count()) if self.devices.item(i).flags()&Qt.ItemIsUserCheckable and self.devices.item(i).checkState()==Qt.Checked];m=self.s.get_config_section("microphone",True);m.update(device_id=(chosen[0] if chosen else -1),device_ids=chosen,sample_rate=self.rate.value(),channels=self.channels.value(),auto_send_after_transcription=self.auto_send.isChecked());self.s.save_config_section("microphone",m,True);self.load_devices(m);self.devices.setVisible(False);self.change_devices.setText("更改设备");toast(self,"语音和自动发送设置已保存")
+            chosen=[self.devices.item(i).data(Qt.UserRole) for i in range(self.devices.count()) if self.devices.item(i).flags()&Qt.ItemIsUserCheckable and self.devices.item(i).checkState()==Qt.Checked];m=self.s.get_config_section("microphone",True);m.update(device_id=(chosen[0] if chosen else -1),device_ids=chosen,sample_rate=self.rate.value(),channels=self.channels.value(),auto_send_after_transcription=self.auto_send.isChecked());self.s.save_config_section("microphone",m,True);self.load_devices(m);self.devices.setVisible(False);self.change_devices.setText("更改设备");toast(self,"音频处理设置已保存")
         except Exception as exc:alert(self,exc)
+
 
 
 class ImageApiPage(QWidget):
     def __init__(self,s):
-        super().__init__();self.s=s;lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("图片 API","配置角色图片生成接口，密钥安全保存到项目 .env。"));box=QGroupBox("图像生成服务");f=QFormLayout(box)
+        super().__init__();self.s=s;lay=page_scaffold(self,"图片 API","配置角色图片生成接口，密钥安全保存到项目 .env。");box=QGroupBox("图像生成服务");f=QFormLayout(box)
         self.preset=QComboBox();self._preset_keys=[]
         for key,label in preset_items():self._preset_keys.append(key);self.preset.addItem(label,key)
         self.preset_note=QLabel();self.preset_note.setWordWrap(True);self.preset_note.setStyleSheet("color:#31524c;background:#edf5f3;border-radius:7px;padding:8px")
@@ -407,15 +401,11 @@ class MiMoMultimodalPage(QWidget):
 
 class ToolsPage(QWidget):
     def __init__(self,s):
-        super().__init__();self.s=s;lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("工具维护","可视化维护操作权限、Vision、软件映射、MCP 和上下文清理。"));tabs=QTabWidget();lay.addWidget(tabs,1)
+        super().__init__();self.s=s;lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("工具维护","可视化维护操作权限、软件映射、MCP 和上下文清理。视觉处理模型配置已移至「内容处理」。"));tabs=QTabWidget();lay.addWidget(tabs,1)
         control=QWidget();cf=QFormLayout(control);self.control_checks={}
         for key,label in (("enabled","启用电脑控制"),("full_access","允许完整电脑操作"),("confirm_before_action","执行操作前请求确认"),("confirm_launch_app","打开程序前请求确认")):
             w=QCheckBox(label);self.control_checks[key]=w;cf.addRow(w)
         self.apps=QTableWidget(0,2);self.apps.setHorizontalHeaderLabels(["软件名称","程序或目录路径"]);self.apps.horizontalHeader().setSectionResizeMode(1,QHeaderView.Stretch);cf.addRow("软件映射",self.apps);ar=QHBoxLayout();ar.addWidget(button("选择程序",self.choose_program));ar.addWidget(button("选择目录",self.choose_directory));ar.addWidget(button("添加空行",lambda:self.apps.insertRow(self.apps.rowCount())));ar.addWidget(button("删除选中",lambda:self.apps.removeRow(self.apps.currentRow()) if self.apps.currentRow()>=0 else None,danger=True));cf.addRow(ar);tabs.addTab(control,"电脑控制")
-        vision=QWidget();vf=QFormLayout(vision);self.vision_checks={}
-        for key,label in (("enabled","启用 Vision MCP"),("auto_start","自动启动 Vision 服务"),("gui_enabled","启用 GUI-Actor 图像识别"),("preload_model","启动时预加载模型")):
-            w=QCheckBox(label);self.vision_checks[key]=w;vf.addRow(w)
-        self.vision_host=QLineEdit();self.vision_port=QSpinBox();self.vision_port.setRange(1,65535);self.vision_timeout=QSpinBox();self.vision_timeout.setRange(10,600);vf.addRow("服务地址",self.vision_host);vf.addRow("端口",self.vision_port);vf.addRow("启动超时秒数",self.vision_timeout);note=QLabel("关闭 GUI 图像识别可减少显存占用；保存设置不会在此页面直接加载模型。");note.setWordWrap(True);note.setStyleSheet("color:#253b36;font-weight:600");vf.addRow(note);tabs.addTab(vision,"Vision")
         mcp=QWidget();ml=QVBoxLayout(mcp);self.mcp=QTableWidget(0,3);self.mcp.setHorizontalHeaderLabels(["名称","类型（http/stdio）","地址或命令"]);self.mcp.horizontalHeader().setSectionResizeMode(2,QHeaderView.Stretch);ml.addWidget(self.mcp);mr=QHBoxLayout();mr.addWidget(button("添加 MCP",lambda:self.mcp.insertRow(self.mcp.rowCount()),primary=True));mr.addWidget(button("删除选中",lambda:self.mcp.removeRow(self.mcp.currentRow()) if self.mcp.currentRow()>=0 else None,danger=True));mr.addStretch();ml.addLayout(mr);tabs.addTab(mcp,"MCP 服务")
         maint=QWidget();mf=QFormLayout(maint);self.home_clean=QCheckBox("启用家庭上下文每日压缩");self.home_time=QLineEdit();self.live_clean=QCheckBox("启用直播上下文过期清理");self.live_minutes=QSpinBox();self.live_minutes.setRange(10,1440);mf.addRow(self.home_clean);mf.addRow("家庭压缩时间",self.home_time);mf.addRow(self.live_clean);mf.addRow("直播保留分钟",self.live_minutes);tabs.addTab(maint,"上下文维护")
         row=QHBoxLayout();row.addStretch();row.addWidget(button("保存工具维护设置",self.save,primary=True));lay.addLayout(row);self.load()
@@ -435,9 +425,6 @@ class ToolsPage(QWidget):
         for k,w in self.control_checks.items():w.setChecked(bool(c.get(k,False)))
         apps=c.get("applications",{});self.apps.setRowCount(len(apps))
         for r,(n,p) in enumerate(apps.items()):self.apps.setItem(r,0,QTableWidgetItem(str(n)));self.apps.setItem(r,1,QTableWidgetItem(str(p)))
-        v=self.s.get_config_section("vision_mcp",True)
-        for k,w in self.vision_checks.items():w.setChecked(bool(v.get(k,False)))
-        self.vision_host.setText(str(v.get("host","127.0.0.1")));self.vision_port.setValue(int(v.get("port",8765)));self.vision_timeout.setValue(int(v.get("startup_timeout_seconds",120)))
         servers=self.s.load_mcp_servers();self.mcp.setRowCount(len(servers))
         for r,(name,item) in enumerate(servers.items()):
             kind="http" if item.get("url") else "stdio";target=str(item.get("url") or " ".join([str(item.get("command","")),*map(str,item.get("args",[]))]).strip())
@@ -448,9 +435,6 @@ class ToolsPage(QWidget):
             c=self.s.get_config_section("computer_control",True)
             for k,w in self.control_checks.items():c[k]=w.isChecked()
             c["applications"]={self.apps.item(r,0).text().strip():self.apps.item(r,1).text().strip() for r in range(self.apps.rowCount()) if self.apps.item(r,0) and self.apps.item(r,1) and self.apps.item(r,0).text().strip()};self.s.save_config_section("computer_control",c,True)
-            v=self.s.get_config_section("vision_mcp",True)
-            for k,w in self.vision_checks.items():v[k]=w.isChecked()
-            v.update(host=self.vision_host.text().strip(),port=self.vision_port.value(),startup_timeout_seconds=self.vision_timeout.value());self.s.save_config_section("vision_mcp",v,True)
             servers={}
             for r in range(self.mcp.rowCount()):
                 if not self.mcp.item(r,0) or not self.mcp.item(r,2):continue
@@ -536,17 +520,151 @@ class TaskTreePage(QWidget):
         return item
 
 
+class VisualModelPage(QWidget):
+    """视觉处理模型控制：切换后端（GUI-Owl / GUI-Actor）与具体模型，并配置服务参数。"""
+    MODEL_ROOT = ROOT / "Vision" / "models"
+    BACKENDS = [("gui_owl","GUI-Owl (Qwen3-VL)"),("gui_actor","GUI-Actor (Qwen2-VL)")]
+    def __init__(self,s):
+        super().__init__();self.s=s;lay=page_scaffold(self,"视觉处理模型","切换视觉处理后端与具体模型，并配置 Vision MCP 服务参数。修改后端 / 模型后需重启 HomeAgent 生效。")
+        general=QGroupBox("模型选择");f=QFormLayout(general)
+        self.backend=QComboBox();[self.backend.addItem(label,key) for key,label in self.BACKENDS];f.addRow("视觉处理后端",self.backend)
+        self.model_dir=QComboBox();self.model_dir.setEditable(True);self.refresh_models();f.addRow("模型目录 / 路径",self.model_dir)
+        self.device=QComboBox();self.device.addItems(["cuda:0","cuda:1","cpu"]);f.addRow("推理设备",self.device)
+        self.backend.currentTextChanged.connect(self.on_backend)
+        lay.addWidget(general)
+        svc=QGroupBox("服务与启用");sf=QFormLayout(svc);self.v={}
+        for key,label in (("enabled","启用 Vision MCP"),("auto_start","自动启动 Vision 服务"),("gui_enabled","启用 GUI 图像识别"),("preload_model","启动时预加载模型")):
+            self.v[key]=QCheckBox(label);sf.addRow(self.v[key])
+        self.host=QLineEdit();self.port=QSpinBox();self.port.setRange(1,65535);self.timeout=QSpinBox();self.timeout.setRange(10,600)
+        sf.addRow("服务地址",self.host);sf.addRow("端口",self.port);sf.addRow("启动超时秒数",self.timeout)
+        lay.addWidget(svc)
+        row=QHBoxLayout();row.addStretch();row.addWidget(button("刷新模型列表",self.refresh_models));row.addWidget(button("保存视觉处理设置",self.save,primary=True));lay.addLayout(row);lay.addStretch();self.load()
+    def refresh_models(self):
+        self.model_dir.clear();self.model_dir.addItem("(使用默认路径)")
+        if self.MODEL_ROOT.exists():
+            for p in sorted(self.MODEL_ROOT.iterdir()):
+                if p.is_dir():self.model_dir.addItem(str(p))
+    def on_backend(self,_=None):
+        default=str(self.MODEL_ROOT/"GUI-Actor-2B-Qwen2-VL") if self.backend.currentData()=="gui_actor" else str(self.MODEL_ROOT/"GUI-Owl-1.5-2B-Instruct")
+        idx=self.model_dir.findText(default);self.model_dir.setCurrentIndex(idx if idx>=0 else 0)
+    def load(self):
+        c=self.s.get_config_section("vision_mcp",True)
+        idx=self.backend.findData(str(c.get("backend","gui_owl")));self.backend.setCurrentIndex(max(0,idx))
+        path=str(c.get("gui_owl_model","") or "")
+        idx=self.model_dir.findText(path);self.model_dir.setCurrentIndex(idx if idx>=0 else 0)
+        dev=str(c.get("device","cuda:0"));di=self.device.findText(dev);self.device.setCurrentIndex(di if di>=0 else 0)
+        for k,w in self.v.items():w.setChecked(bool(c.get(k,True)))
+        self.host.setText(str(c.get("host","127.0.0.1")));self.port.setValue(int(c.get("port",8765)));self.timeout.setValue(int(c.get("startup_timeout_seconds",120)))
+    def save(self):
+        try:
+            c=self.s.get_config_section("vision_mcp",True)
+            c["backend"]=self.backend.currentData()
+            path=self.model_dir.currentText().strip()
+            if path and path!="(使用默认路径)":c["gui_owl_model"]=path
+            c["device"]=self.device.currentText()
+            for k,w in self.v.items():c[k]=w.isChecked()
+            c.update(host=self.host.text().strip(),port=self.port.value(),startup_timeout_seconds=self.timeout.value())
+            self.s.save_config_section("vision_mcp",c,True)
+            toast(self,"视觉处理设置已保存，重启 HomeAgent 后生效")
+        except Exception as exc:alert(self,exc)
+
+
+class InputSourcesPage(QWidget):
+    """统一的输入源页面：查看 / 添加 / 启停 / 移除已接入的输入源。"""
+    TYPE_LABELS=[("screenshot","截图"),("screen_capture","屏幕捕获"),("window_capture","窗口捕获"),("network_video","网络视频"),("microphone","麦克风"),("camera","摄像头")]
+    def __init__(self,service):
+        super().__init__();self.service=service;self.rows=[]
+        lay=QVBoxLayout(self);lay.setContentsMargins(24,22,24,22);lay.addWidget(page_title("输入源","统一管理已接入的输入源：截图、屏幕捕获、窗口捕获、网络视频等。可启用 / 停用或移除，也可新增自定义输入源。双击某行可切换启用状态。"))
+        bar=QHBoxLayout()
+        self.type_sel=QComboBox();[self.type_sel.addItem(label,key) for key,label in self.TYPE_LABELS]
+        self.name_edit=QLineEdit();self.name_edit.setPlaceholderText("输入源名称（如：B站直播流）")
+        bar.addWidget(QLabel("类型"));bar.addWidget(self.type_sel);bar.addWidget(QLabel("名称"));bar.addWidget(self.name_edit,1)
+        bar.addWidget(button("添加输入源",self.add,primary=True));bar.addWidget(button("刷新",self.refresh));lay.addLayout(bar)
+        self.table=QTableWidget(0,5);self.table.setAlternatingRowColors(True);self.table.setHorizontalHeaderLabels(["类型","名称","模块","说明","启用"]);self.table.setSelectionBehavior(QTableWidget.SelectRows);self.table.setEditTriggers(QTableWidget.NoEditTriggers);self.table.verticalHeader().hide();self.table.horizontalHeader().setSectionResizeMode(3,QHeaderView.Stretch)
+        self.table.cellDoubleClicked.connect(self.toggle_enabled)
+        lay.addWidget(self.table,1)
+        row=QHBoxLayout();self.count=QLabel();row.addWidget(self.count);row.addStretch();row.addWidget(button("移除选中",self.delete,danger=True));lay.addLayout(row);self.refresh()
+    def type_label(self,key):return dict(self.TYPE_LABELS).get(key,key)
+    def current(self):
+        r=self.table.currentRow();return self.rows[r] if 0<=r<len(self.rows) else None
+    def refresh(self):
+        try:
+            self.rows=self.service.list_input_sources();self.table.setRowCount(len(self.rows))
+            for r,x in enumerate(self.rows):
+                for c,val in enumerate((self.type_label(x.get("type","")),str(x.get("name","")),str(x.get("module","")),str(x.get("detail","")),("● 启用" if x.get("enabled") else "○ 停用"))):
+                    item=QTableWidgetItem(val);self.table.setItem(r,c,item)
+                self.table.item(r,4).setForeground(QColor("#1a7f4f" if x.get("enabled") else "#9aa0a6"))
+            self.count.setText(f"{len(self.rows)} 个输入源（双击行切换启用）")
+        except Exception as exc:alert(self,exc)
+    def add(self):
+        name=self.name_edit.text().strip();tkey=str(self.type_sel.currentData())
+        if not name:return alert(self,"请输入输入源名称")
+        row={"id":uuid.uuid4().hex[:12],"type":tkey,"name":name,"enabled":True,"module":self._module_for(tkey),"detail":""}
+        self.rows.append(row);self.service.save_input_sources(self.rows);self.name_edit.clear();self.refresh();toast(self,"输入源已添加")
+    def _module_for(self,tkey):return {"screenshot":"Vision","screen_capture":"Vision","window_capture":"Vision","network_video":"edge_browser","microphone":"Sound","camera":"Camera"}.get(tkey,"")
+    def toggle_enabled(self,row,_col):
+        if 0<=row<len(self.rows):
+            self.rows[row]["enabled"]=not self.rows[row].get("enabled",False);self.service.save_input_sources(self.rows);self.refresh()
+    def delete(self):
+        item=self.current()
+        if item and QMessageBox.question(self,"确认删除","确定移除所选输入源吗？")==QMessageBox.Yes:
+            self.rows=[x for x in self.rows if x.get("id")!=item.get("id")];self.service.save_input_sources(self.rows);self.refresh();toast(self,"输入源已移除")
+
+
+NAV_GROUPS = [
+    # (分组标题, [(页签名, 页面类), ...]) —— 声明式分组导航：新增页只需在此登记
+    ("角色设定", [("身份", IdentityPage), ("记忆", MemoryPage), ("人格规则", DocumentsPage), ("形象", ImagesPage)]),
+    ("内容处理", [("视觉处理", VisualModelPage), ("语音输出", TtsPage), ("音频处理", AudioProcessingPage), ("语言处理", LanguageProcessingPage), ("输入源", InputSourcesPage)]),
+    ("能力与运行", [("工具维护", ToolsPage), ("图片 API", ImageApiPage), ("长期记忆", LongTermMemoryPage), ("当前任务", TaskTreePage)]),
+]
+
+
+class NavGroup(QWidget):
+    """可折叠的侧栏分组：表头可点击，展开/折叠时整体显隐其下的导航按钮。"""
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self._title = title
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+        self.header = QPushButton(title)
+        self.header.setObjectName("nav-group")
+        self.header.setCheckable(True)
+        self.header.setChecked(True)
+        self.header.toggled.connect(self._on_toggled)
+        lay.addWidget(self.header)
+        self.body = QWidget(); self.body_lay = QVBoxLayout(self.body); self.body_lay.setContentsMargins(0, 2, 0, 0); self.body_lay.setSpacing(0)
+        lay.addWidget(self.body)
+        self.body.setVisible(True)  # 初始展开
+        self._update_arrow()
+
+    def add_button(self, btn):
+        self.body_lay.addWidget(btn)
+
+    def _on_toggled(self, checked):
+        self.body.setVisible(checked)
+        self._update_arrow()
+
+    def _update_arrow(self):
+        arrow = "▾" if self.header.isChecked() else "▸"
+        self.header.setText(f"{arrow}  {self._title}")
+
+
 class MainWindow(QMainWindow):
+    """分组式设置导航：单一侧栏 + 可折叠分组，所有页面平铺在一个 QStackedWidget 中。"""
     def __init__(self):
         super().__init__(); self.service=CharacterService(); self.setWindowTitle("AI 角色管理器"); self.resize(1180,780); self.setMinimumSize(940,650)
         root=QWidget(); root.setObjectName("root"); self.setCentralWidget(root); main=QHBoxLayout(root); main.setContentsMargins(0,0,0,0); main.setSpacing(0)
-        side=QFrame(); side.setObjectName("sidebar"); side.setFixedWidth(210); sl=QVBoxLayout(side); sl.setContentsMargins(17,23,17,20); brand=QLabel("角色管理器"); brand.setObjectName("brand"); sub=QLabel("Character Studio"); sub.setObjectName("subtitle"); sl.addWidget(brand);sl.addWidget(sub);sl.addSpacing(20)
-        self.stack=QStackedWidget();         pages=[IdentityPage(self.service),MemoryPage(self.service),DocumentsPage(self.service),ModelPage(self.service),VoicePage(self.service),ToolsPage(self.service),ImagesPage(self.service),ImageApiPage(self.service),LongTermMemoryPage(self.service),TaskTreePage(self.service)]
-        labels=["身份","记忆","人格规则","模型 API","语音","工具维护","形象","图片 API","长期记忆","当前任务"]; self.nav=[]
-        for i,label in enumerate(labels):
-            b=QPushButton(label);b.setObjectName("nav");b.setCheckable(True);b.clicked.connect(lambda checked,n=i:self.switch(n));sl.addWidget(b);self.nav.append(b)
-            self.stack.addWidget(pages[i])
-        sl.addStretch(); ver=QLabel("Qt UI · 服务层已分离");ver.setObjectName("subtitle");sl.addWidget(ver);main.addWidget(side);main.addWidget(self.stack,1);self.statusBar().showMessage("就绪");self.switch(0)
+        side=QFrame(); side.setObjectName("sidebar"); side.setFixedWidth(210); sl=QVBoxLayout(side); sl.setContentsMargins(17,23,17,20); brand=QLabel("角色管理器"); brand.setObjectName("brand"); sub=QLabel("Character Studio"); sub.setObjectName("subtitle"); sl.addWidget(brand);sl.addWidget(sub);sl.addSpacing(8)
+        self.stack=QStackedWidget(); self.nav=[]
+        for group,items in NAV_GROUPS:
+            nav_group = NavGroup(group)
+            for label,page_cls in items:
+                b=QPushButton(label);b.setObjectName("nav");b.setCheckable(True);b.clicked.connect(lambda checked,n=len(self.nav):self.switch(n));nav_group.add_button(b);self.nav.append(b)
+                self.stack.addWidget(page_cls(self.service))
+            sl.addWidget(nav_group)
+        sl.addStretch(); ver=QLabel("Qt UI · 分组设置架构");ver.setObjectName("subtitle");sl.addWidget(ver);main.addWidget(side);main.addWidget(self.stack,1);self.statusBar().showMessage("就绪");self.switch(0)
+        # 键盘直达：Ctrl+1..9 / Ctrl+0 依次对应侧栏第 1..10 个页面
+        for i in range(min(10, len(self.nav))):
+            seq=QShortcut(QKeySequence(f"Ctrl+{i+1}" if i<9 else "Ctrl+0"), self); seq.activated.connect(lambda n=i:self.switch(n))
     def switch(self,index):
         self.stack.setCurrentIndex(index)
         for i,b in enumerate(self.nav):b.setChecked(i==index)

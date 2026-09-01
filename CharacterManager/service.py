@@ -365,3 +365,42 @@ class CharacterService:
 
     def save_mcp_servers(self, servers: dict[str, Any]) -> None:
         self._write_yaml(MCP_CONFIG, {"mcpServers": servers})
+
+    # ------------------------------------------------------------------
+    # 输入源（统一输入页面）
+    # ------------------------------------------------------------------
+    def list_input_sources(self) -> list[dict[str, Any]]:
+        """列出已添加的输入源（截图 / 屏幕捕获 / 窗口捕获 / 网络视频 等）。
+
+        首次访问时若无配置，则写入默认输入源集合，便于用户在统一页面查看与管理。
+        """
+        with self.lock:
+            sources = self.get_config_section("input_sources", False)
+            if not isinstance(sources, list) or not sources:
+                sources = self._default_input_sources()
+                self.save_config_section("input_sources", sources, False)
+            else:
+                sources = deepcopy(sources)
+            # 兼容旧数据缺失字段
+            for item in sources:
+                item.setdefault("enabled", True)
+                item.setdefault("module", "")
+                item.setdefault("detail", "")
+            return sources
+
+    def save_input_sources(self, sources: list[dict[str, Any]]) -> None:
+        with self.lock:
+            self.save_config_section("input_sources", list(sources), False)
+
+    @staticmethod
+    def _default_input_sources() -> list[dict[str, Any]]:
+        return [
+            {"id": "screenshot", "type": "screenshot", "name": "截图", "enabled": True,
+             "module": "Vision", "detail": "单张画面捕获（window_screenshot / desktop_screenshot）"},
+            {"id": "screen_capture", "type": "screen_capture", "name": "屏幕捕获", "enabled": True,
+             "module": "Vision", "detail": "整屏实时捕获，用于连续画面理解"},
+            {"id": "window_capture", "type": "window_capture", "name": "窗口捕获", "enabled": True,
+             "module": "Vision", "detail": "按窗口标题 / 进程捕获指定窗口"},
+            {"id": "network_video", "type": "network_video", "name": "网络视频", "enabled": True,
+             "module": "edge_browser", "detail": "浏览器 / 网络视频流（edge_browser + video_understanding）"},
+        ]

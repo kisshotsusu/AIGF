@@ -2,15 +2,15 @@
 # AI直播 共享依赖清单 (供 set_env.bat 使用)
 #
 # 重要: torch / torchvision / torchaudio 不要写在本文件里!
-# 它们由 set_env.bat 单独从 PyTorch 官方 cu128 源安装,
-# 以支持 RTX 50 系 (Blackwell, sm_120)。若在这里写 torch,
-# pip 可能装回 CPU 版, 导致推理无法用 GPU。
+# 它们由 set_env.bat 单独从 PyTorch 官方 cu130 源安装,
+# 以匹配当前环境 CUDA 13.0 (cu130, 支持 RTX 50 系 Blackwell)。
+# 若在这里写 torch, pip 可能装回 CPU 版, 导致推理无法用 GPU。
 # ============================================================
 
-# --- Vision: GUI 视觉控制 (MCP: vision-gui, 默认 GUI-Actor / 可选 GUI-Owl) ---
-# GUI-Actor 依赖固定版本; GUI-Owl 需要更高版本, 见 Vision/requirements.txt 说明
-transformers==4.51.3
-qwen-vl-utils==0.0.8
+# --- Vision: GUI 视觉控制 (MCP: vision-gui, GUI-Actor / GUI-Owl 双后端共用) ---
+# 2026-09 起统一环境: 双后端共用 transformers 4.57.1 (GUI-Actor 已验证兼容) + qwen-vl-utils 0.0.14
+transformers==4.57.1
+qwen-vl-utils==0.0.14
 accelerate
 pillow
 numpy
@@ -25,3 +25,8 @@ modelscope
 sounddevice
 librosa
 soundfile
+# funasr 未声明但运行时必需的依赖: DefaultFrontend/WavFrontend 用到 pytorch_wpe,
+# 且 funasr 启动时会 import torchaudio。漏装会导致 ASR 链路 ModuleNotFoundError。
+# 注意: 必须在 set_env.bat 第 5 步 (torch 从 cu130 源装好) 之后安装,
+# 否则可能把 torch 拉成 CPU 版。
+pytorch_wpe

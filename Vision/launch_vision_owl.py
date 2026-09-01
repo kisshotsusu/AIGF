@@ -15,6 +15,7 @@ env["VISION_MCP_TRANSPORT"] = "http"
 env["VISION_MCP_HOST"] = "127.0.0.1"
 env["VISION_MCP_PORT"] = "8765"
 env["VISION_PRELOAD_MODEL"] = "1"
+env["VISION_MAX_SIDE"] = "1280"  # 输入降采样(≈720p): 1.70s->1.30s, 归一化坐标无损; 0=关闭
 env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 with open(LOG, "w", encoding="utf-8") as log:

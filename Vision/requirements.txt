@@ -1,12 +1,11 @@
-# Vision 双后端依赖 (GUI-Actor 默认 / GUI-Owl 可选)
+# Vision 双后端依赖 (GUI-Actor / GUI-Owl)，统一运行于项目共享 .venv
 # Python 3.12 推荐
 torch
 torchvision
-# GUI-Actor (默认) 依赖固定版本: microsoft/GUI-Actor 只兼容 transformers 4.51.3 + qwen-vl-utils 0.0.8
-transformers==4.51.3
-qwen-vl-utils==0.0.8
-# 可选 GUI-Owl 后端需要 transformers>=4.57 + qwen-vl-utils>=0.0.14, 与 GUI-Actor 冲突,
-# 两者不能同时装在同一环境; 用 GUI-Owl 时再升级 (python -m pip install -U "transformers>=4.57" "qwen-vl-utils>=0.0.14")
+# GUI-Actor (Qwen2-VL) 与 GUI-Owl (Qwen3-VL) 现共用 transformers>=4.57 + qwen-vl-utils>=0.0.14
+# （已验证 GUI-Actor 在 transformers 4.57 下仍正常加载，故无需分离 venv）
+transformers==4.57.1
+qwen-vl-utils==0.0.14
 accelerate
 pillow
 numpy

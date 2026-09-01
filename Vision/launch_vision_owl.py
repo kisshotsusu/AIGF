@@ -5,7 +5,7 @@ import os
 import subprocess
 
 HERE = r"E:\Doc\AIAgent\Vision"
-PY = r"E:\Doc\AIAgent\.venv-owl\Scripts\python.exe"
+PY = r"E:\Doc\AIAgent\.venv\Scripts\python.exe"
 LOG = os.path.join(HERE, "vision_mcp_owl.log")
 
 env = dict(os.environ)
@@ -17,12 +17,11 @@ env["VISION_MCP_PORT"] = "8765"
 env["VISION_PRELOAD_MODEL"] = "1"
 env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 with open(LOG, "w", encoding="utf-8") as log:
     p = subprocess.Popen(
         [PY, os.path.join(HERE, "mcp_server.py")],
         env=env,
-        creationflags=0x00000008 | 0x00000200 | CREATE_BREAKAWAY_FROM_JOB,  # DETACHED | NEW_PROCESS_GROUP | BREAKAWAY_FROM_JOB
+        creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         stdout=log,
         stderr=subprocess.STDOUT,
         close_fds=True,

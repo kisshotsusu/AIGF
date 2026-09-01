@@ -1269,12 +1269,9 @@ class HomeAgent:
                 time.sleep(1)
             return False
         backend = str(cfg.get("backend") or "gui_actor")
-        # GUI-Owl (Qwen3-VL) 需要 transformers>=4.57，与 GUI-Actor 的 4.51.3 冲突，
-        # 因此单独装在 .venv-owl 中；按后端选择对应的 python 解释器。
-        if backend == "gui_owl":
-            python = ROOT / ".venv-owl" / "Scripts" / "python.exe"
-        else:
-            python = ROOT / ".venv" / "Scripts" / "python.exe"
+        # GUI-Owl (Qwen3-VL) 与 GUI-Actor 现已统一运行于项目共享 .venv
+        # （.venv 已升级 transformers>=4.57 + qwen-vl-utils>=0.0.14），无需再区分解释器。
+        python = ROOT / ".venv" / "Scripts" / "python.exe"
         server = ROOT / "Vision" / "mcp_server.py"
         if not python.exists() or not server.exists():
             self.log_event("vision_service_missing", python=python, server=server); return False

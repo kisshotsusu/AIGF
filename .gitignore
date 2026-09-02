@@ -60,5 +60,7 @@ LongTermMemory/
 # JSON/MD 状态、浏览器账号、任务树、知识库、服务锁文件等均为运行期生成。
 HomeAgent/state/*.json
 HomeAgent/state/*.md
+HomeAgent/state/*.lock
 HomeAgent/knowledge_base/
+CharacterManager/state/
 Vision/state/

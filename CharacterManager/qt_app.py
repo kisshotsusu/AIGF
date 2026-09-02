@@ -672,7 +672,10 @@ class MainWindow(QMainWindow):
 
 def run():
     app=QApplication.instance() or QApplication(sys.argv);app.setApplicationName("AI Character Manager");app.setStyle("Fusion");app.setStyleSheet(STYLE)
-    lock_path = Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "ai-character-manager.lock"
+    # Lock under the project dir (not %TEMP%) so it is identical across privilege
+    # levels/sessions; a %TEMP% lock allows an elevated + non-elevated pair to both run.
+    lock_dir = ROOT / "CharacterManager" / "state"; lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "ai-character-manager.lock"
     lock = InstanceLock(lock_path)
     if not lock.acquire():
         QMessageBox.information(None, "角色管理器", "角色管理器已经在运行。")

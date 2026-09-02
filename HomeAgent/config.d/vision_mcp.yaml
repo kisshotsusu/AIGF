@@ -2,8 +2,10 @@ enabled: true
 server_name: vision-gui
 auto_start: true
 backend: gui_owl
-preload_model: false
+preload_model: true
 gui_enabled: true
+gui_post_action_wait_ms: 350
+vision_restart_wait_seconds: 20
 host: 127.0.0.1
 port: 8765
 url: http://127.0.0.1:8765/mcp

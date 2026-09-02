@@ -1458,10 +1458,23 @@ class _ModelServiceWorker(QThread):
         try:
             result = self.fn()          # dict[str, str]
             if isinstance(result, dict):
+                # "release"/"restore" 会把整体成败放 ok (true/false) 字段；
+                # 不要无条件当作成功，否则权限不足(needs_admin)时会谎报"已释放"。
+                ok_flag = str(result.get("ok") or "").strip().lower()
                 self.summary = " · ".join(f"{k}={v}" for k, v in result.items())
+                if ok_flag in {"true", "1", "yes", "ok"}:
+                    self.ok = True
+                elif ok_flag in {"false", "0", "no", "fail", "failed"}:
+                    self.ok = False
+                else:
+                    self.ok = True
+                needs_admin = str(result.get("needs_admin") or "").strip().lower() in {"true", "1", "yes"}
+                if needs_admin and not self.ok and self.op_kind == "release":
+                    self.summary = (f"{self.summary}\n\n⚠️ 部分模型服务以管理员权限在运行，普通权限无法强制停止。"
+                                    f"请在弹出的权限窗口点“是”，或手动以管理员身份结束这些进程后再开游戏。")
             else:
                 self.summary = str(result)
-            self.ok = True
+                self.ok = True
         except Exception as exc:        # pragma: no cover - defensive
             self.ok = False
             self.summary = f"{type(exc).__name__}: {exc}"
@@ -1608,9 +1621,27 @@ QDialog {{ background: {COLORS['window']}; }} #dialogTitle {{ font-size: 22px; f
 
 def run():
     app = QApplication.instance() or QApplication([])
-    lock_path = Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "ai-home-agent.lock"
+    # Lock file lives under the project (not %TEMP%) so it is identical across
+    # privilege levels/sessions. A %TEMP% lock differs between an elevated and a
+    # non-elevated instance, which silently allowed two Home Agents to run at once.
+    lock_dir = HOME_AGENT / "state"; lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "ai-home-agent.lock"
     lock = InstanceLock(lock_path)
     if not lock.acquire():
+        # 已有实例（或残留进程）持有单实例锁：绝不能静默退出，否则用户会以为
+        # “点了没反应/无法启动”。给出明确提示并引导排查。
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            QMessageBox.warning(
+                None, "Home Agent 已在运行",
+                "检测到已有 Home Agent 实例正在运行（或上次异常退出留下残留进程），\n"
+                "本次启动被拒绝以避免重复实例。\n\n"
+                "• 若桌面右下角能看到桌宠/托盘图标：直接使用它即可，无需重复启动。\n"
+                "• 若看不到任何界面：请先结束残留的 python/pythonw 进程后再启动。\n\n"
+                f"单实例锁文件：{lock_path}",
+            )
+        except Exception:
+            pass
         return 0
     app._home_agent_lock = lock
     font_path = Path(r"C:\Windows\Fonts\NotoSansSC.ttf")

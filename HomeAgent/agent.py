@@ -1318,19 +1318,34 @@ class HomeAgent:
     #  显存让出(给游戏) / 恢复：视觉 GUI-Owl + SenseVoice ASR + GPT-SoVITS  #
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _kill_process_tree(pid: int) -> bool:
-        """Kill a process tree on Windows via taskkill /T /F; graceful on other OS."""
-        if not pid: return False
+    def _kill_process_tree(pid: int) -> tuple[bool, str]:
+        """Kill a process tree on Windows via taskkill /T /F; graceful on other OS.
+
+        Returns (ok, reason). Critically: taskkill returns non-zero when it lacks
+        permission (e.g. the target was launched elevated / as admin). We MUST surface
+        that instead of blindly reporting success, otherwise "release GPU for game"
+        claims the VRAM is freed while the model processes are still alive.
+        """
+        if not pid: return (False, "no_pid")
         try:
             if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                               capture_output=True, timeout=15,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            else:
-                os.kill(pid, 9)
-            return True
-        except Exception:
-            return False
+                r = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                out = (r.stdout + r.stderr).decode("gbk", errors="ignore")
+                if r.returncode == 0:
+                    return (True, "killed")
+                low = out.lower()
+                if "拒绝访问" in out or "access is denied" in low or "denied" in low:
+                    # taskkill may still have killed a few descendants before hitting the
+                    # elevated root; report access-denied so the caller can escalate.
+                    return (False, "access_denied(needs_admin)")
+                return (False, f"taskkill_failed(rc={r.returncode})")
+            os.kill(pid, 9)
+            return (True, "killed")
+        except Exception as exc:  # noqa: BLE001
+            return (False, f"error:{str(exc)[:80]}")
 
     @staticmethod
     def _find_pid_by_port(port: int) -> int | None:
@@ -1359,25 +1374,30 @@ class HomeAgent:
         return None
 
     def _stop_service(self, process: subprocess.Popen | None, *, port: int,
-                      clear_attr: str, name: str) -> str:
-        """Terminate a model service: prefer the spawned Popen handle, else find PID by port."""
+                      clear_attr: str, name: str) -> tuple[str, bool]:
+        """Terminate a model service: prefer the spawned Popen handle, else find PID by port.
+
+        Returns (outcome_str, ok). ok=False means the process could NOT be confirmed
+        dead (e.g. taskkill hit "Access Denied" on an elevated process) — callers must
+        surface this instead of claiming the service was released.
+        """
         outcome = "stopped(none)"
         if process is not None and process.poll() is None:
-            ok = self._kill_process_tree(process.pid)
+            ok, reason = self._kill_process_tree(process.pid)
             try: process.wait(timeout=5)
             except Exception: pass
-            outcome = "stopped(handle)" if ok else "kill_failed(handle)"
+            outcome = "stopped(handle)" if ok else f"kill_failed(handle):{reason}"
         else:
             pid = self._find_pid_by_port(port)
             if pid:
-                ok = self._kill_process_tree(pid)
-                outcome = f"stopped(port:{port},pid:{pid})" if ok else f"kill_failed(port:{port},pid:{pid})"
+                ok, reason = self._kill_process_tree(pid)
+                outcome = f"stopped(port:{port},pid:{pid})" if ok else f"kill_failed(port:{port},pid:{pid}):{reason}"
             else:
-                outcome = "not_running"
+                ok, outcome = True, "not_running"
         try: setattr(self, clear_attr, None)
         except Exception: pass
-        self.log_event("model_service_released", service=name, port=port, outcome=outcome)
-        return outcome
+        self.log_event("model_service_released", service=name, port=port, outcome=outcome, ok=ok)
+        return outcome, ok
 
     async def _restore_tts_async(self) -> str:
         """Launch GPT-SoVITS via TTSClient.ensure_service (uses config start_command)."""
@@ -1418,20 +1438,34 @@ class HomeAgent:
             # 3) terminate model services
             # GPT-SoVITS：api_v2(GPU) 在 9880，其父 app.py 代理在 url/health 端口(9879)。
             # 先按 9879 杀整树(连带子进程 api_v2)，若还残留再按 9880 兜底杀。
+            blocked: list[str] = []
             tts_port = self._tts_service_port()
             report["gpt_sovits"] = "no_port_configured"
             if tts_port:
-                report["gpt_sovits"] = self._stop_service(
+                text, ok = self._stop_service(
                     None, port=tts_port, clear_attr="_unused", name="gpt_sovits")
+                report["gpt_sovits"] = text
+                if not ok: blocked.append(f"gpt_sovits(port {tts_port})")
             if tts_port not in (None, 9880) and self._find_pid_by_port(9880):
-                extra = self._stop_service(None, port=9880, clear_attr="_unused", name="gpt_sovits_api_v2")
-                report["gpt_sovits"] = f"{report['gpt_sovits']};api_v2={extra}"
-            report["sound_asr"] = self._stop_service(
+                extra_text, extra_ok = self._stop_service(
+                    None, port=9880, clear_attr="_unused", name="gpt_sovits_api_v2")
+                report["gpt_sovits"] = f"{report['gpt_sovits']};api_v2={extra_text}"
+                if not extra_ok: blocked.append("gpt_sovits_api_v2(port 9880)")
+            text, ok = self._stop_service(
                 self.sound_service_process, port=int(self.config.get("stt", {}).get("mcp_port", 8766)),
                 clear_attr="sound_service_process", name="sound_asr")
-            report["vision"] = self._stop_service(
+            report["sound_asr"] = text
+            if not ok: blocked.append("sound_asr")
+            text, ok = self._stop_service(
                 self.vision_service_process, port=int(self.config.get("vision_mcp", {}).get("port", 8765)),
                 clear_attr="vision_service_process", name="vision")
+            report["vision"] = text
+            if not ok: blocked.append("vision")
+            # 若任一服务因权限不足(通常是被提权启动的遗留进程)无法强杀，
+            # 显式标记 needs_admin 并把 blocked 名单带出，让 UI 如实提示而不是谎报成功。
+            report["ok"] = "false" if blocked else "true"
+            report["needs_admin"] = "true" if blocked else "false"
+            report["blocked"] = ",".join(blocked)
             self.log_event("gpu_models_released", report=report)
             return report
 

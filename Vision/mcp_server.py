@@ -185,8 +185,16 @@ def window_screenshot(title_contains: str) -> MCPImage:
 
 
 @mcp.tool()
+def window_read_targets(title_contains: str, keywords: str = "", max_items: int = 80) -> str:
+    """读取指定窗口的可点控件清单(文本+屏幕坐标)，返回 JSON；keywords 用于按文本过滤。
+    网页/原生窗口可读(UIA)，游戏/自绘全屏返回 structure_readable=false 只能靠视觉。"""
+    return str(agent.window_read_targets(title_contains, keywords=keywords, max_items=max_items))
+
+
+@mcp.tool()
 def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0) -> str:
-    """激活目标窗口，在窗口截图内识别控件并点击。"""
+    """激活目标窗口，优先按 UIA 文本精确定位控件点击；无结构/文本未命中才回退视觉截图识别。
+    返回中 via='uia_text' 表示走文本坐标点击(推荐)，'visual_fallback' 表示回退视觉。"""
     return str(agent.window_click(title_contains, instruction, topk=topk, idx=idx))
 
 
@@ -242,6 +250,79 @@ def desktop_hotkey(keys: list[str]) -> str:
 def desktop_media_stop() -> str:
     """幂等停止当前媒体播放，不切换播放状态，也不退出媒体应用。"""
     return str(agent.desktop_media_stop())
+
+
+# ---------------- 调试工具 (debug_*) ----------------
+
+@mcp.tool()
+def debug_backend_info() -> str:
+    """诊断: 返回完整后端信息(后端/模型/架构/输出格式/是否已加载/设备)与 CUDA 显存。"""
+    import agent as _a
+    info = _a.backend_info()
+    info["cuda"] = _a.cuda_memory_status()
+    info["last_raw_output"] = _a.last_raw_output()
+    return str(info)
+
+
+@mcp.tool()
+def debug_ground_raw(instruction: str, scope: str = "desktop", topk: int = 3) -> str:
+    """诊断(只读, 不点击): 对 scope 截图做 GUI-Owl grounding。
+    scope: 'desktop'=主屏 | 'window:<标题关键词>'=指定窗口。
+    返回归一化/像素坐标 + 模型原始输出, 用于排查为何点错/找不到。"""
+    import io as _io
+    from PIL import Image
+    import agent as _a
+    spec = str(scope or "desktop")
+    if spec.startswith("window:"):
+        title = spec.split(":", 1)[1]
+        img = _a.window_screenshot_pil(title)
+        source = f"window:{title}"
+    elif spec == "desktop":
+        img = _a.desktop_screenshot_pil()
+        source = "desktop"
+    else:
+        return str({"ok": False, "error": f"scope 需为 desktop 或 window:<标题>, 收到 {scope!r}"})
+    points = _a.ground_image(str(instruction), img, int(topk or 3))
+    w, h = img.size
+    result = {
+        "ok": True,
+        "scope": source,
+        "img_size": [w, h],
+        "instruction": str(instruction),
+        "points_normalized": points,
+        "points_pixel": [
+            {"normalized": [round(p[0], 4), round(p[1], 4)], "pixel": [round(p[0] * w), round(p[1] * h)]}
+            for p in points
+        ],
+        "count": len(points),
+        "raw_output": _a.last_raw_output(),
+    }
+    return str(result)
+
+
+@mcp.tool()
+def debug_self_test() -> str:
+    """诊断: 跑一组只读自检, 返回各维度状态(模型/GPU/前台/窗口UIA可读性), 不执行任何动作。"""
+    import agent as _a
+    report = {"backend": _a.backend_info(), "cuda": _a.cuda_memory_status()}
+    try:
+        fg = _a.inspect_active_target()
+        report["foreground"] = {k: fg.get(k) for k in ("title", "process_name", "is_browser", "mode", "cdp_endpoint")}
+    except Exception as exc:  # noqa: BLE001
+        report["foreground_error"] = str(exc)
+    # 列窗口并统计可读性(仅枚举, 不激活/不点击)
+    try:
+        wins = _a.list_windows()
+        report["windows"] = wins
+    except Exception as exc:  # noqa: BLE001
+        report["windows_error"] = str(exc)
+    return str(report)
+
+
+@mcp.tool()
+def debug_last_raw() -> str:
+    """诊断: 返回最近一次视觉推理的模型原始输出(便于看模型到底返回了什么)。"""
+    return str(agent.last_raw_output())
 
 
 if __name__ == "__main__":

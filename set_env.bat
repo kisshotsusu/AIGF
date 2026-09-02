@@ -37,12 +37,7 @@ if exist "%ROOT%\.venv\Scripts\python.exe" (
 set "PY=%ROOT%\.venv\Scripts\python.exe"
 set "PIP=%ROOT%\.venv\Scripts\pip.exe"
 
-REM 3) Warn if GUI-Actor source is missing (needed at runtime by Vision)
-if not exist "%ROOT%\Vision\GUI-Actor\src\gui_actor" (
-    echo [WARN] Vision\GUI-Actor source not found; the GUI-Actor backend will not work.
-    echo         If you unzipped a package, keep that folder; or run:
-    echo         git clone https://github.com/microsoft/GUI-Actor.git "%ROOT%\Vision\GUI-Actor"
-)
+REM 3) (GUI-Actor 已移除; Vision 只用 GUI-Owl, 无额外源码目录要求)
 
 REM 4) Upgrade pip
 echo [STEP] Upgrading pip ...

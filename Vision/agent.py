@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Vision 视觉控制核心 (双后端)。
+Vision 视觉控制核心。
 
-后端由环境变量 VISION_BACKEND 选择, 默认 gui_actor:
-  - gui_actor: microsoft/GUI-Actor-2B-Qwen2-VL (Qwen2-VL pointer head,
-               输出 0~1 归一化坐标, 需要 Vision/GUI-Actor 仓库)  [默认]
-  - gui_owl  : mPLUG/GUI-Owl-1.5-2B-Instruct (Qwen3-VL 原生 GUI agent,
-               输出 <tool_call> JSON + 0~1000 相对坐标)  [可选]
+后端固定为 GUI-Owl-1.5-2B-Instruct (Qwen3-VL 原生 GUI agent) —— 当前唯一支持的后端。
+
+历史: 曾默认 microsoft/GUI-Actor-2B-Qwen2-VL (Qwen2-VL pointer head, 需
+Vision/GUI-Actor 仓库)。该模型基于已被取代的 Qwen2-VL 老架构、且仅做坐标 grounding,
+2026-09 起已彻底移除: 模型目录与仓库均已删除, 运行时代码不再包含任何回退到
+gui_actor 的分支, VISION_BACKEND 只识别 gui_owl, 遇到其他值会归一化到 gui_owl 并告警。
 
 统一流程: 截图当前视口 -> ground_image() 视觉 grounding 得到归一化坐标(0~1)
         -> 映射到视口像素 -> Playwright 点击/输入/滚动 (或 Win32 桌面动作)。
@@ -30,13 +31,13 @@ from PIL import Image, ImageChops, ImageGrab, ImageStat
 
 # ---- 路径(可通过环境变量覆盖) ----
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_DIR = os.environ.get("GUI_ACTOR_REPO", os.path.join(HERE, "GUI-Actor"))
-MODEL_DIR = os.environ.get(
-    "GUI_ACTOR_MODEL", os.path.join(HERE, "models", "GUI-Actor-2B-Qwen2-VL")
-)
-BACKEND = os.environ.get("VISION_BACKEND", "gui_actor").strip().lower()
-if BACKEND not in ("gui_owl", "gui_actor"):
-    BACKEND = "gui_actor"
+BACKEND = os.environ.get("VISION_BACKEND", "gui_owl").strip().lower()
+if BACKEND != "gui_owl":
+    # GUI-Actor 已于 2026-09 移除(目录/仓库已删除), 不再支持回退到旧后端。
+    # 防御: 即便调用方仍传 gui_actor, 也归一化为 gui_owl 并告警, 避免拉起失败。
+    print(f"[agent] 警告: VISION_BACKEND={BACKEND!r} 已弃用, 强制使用 gui_owl (GUI-Owl-1.5-2B/Qwen3-VL)",
+          file=sys.stderr, flush=True)
+    BACKEND = "gui_owl"
 # 推理前输入降采样: 把最长边缩到该像素值 (16:9 下 1280 ≈ 720p)。
 # 实测 1080p->720p 端到端 1.70s->1.30s 且归一化坐标零损失 (坐标为 0~1 相对值,
 # 不受缩放影响)。设 0 或负值 = 关闭降采样 (原生分辨率推理)。
@@ -87,6 +88,22 @@ _OWL_COMPACT_SYSTEM_PROMPT = (
 # GUI-Owl 输出格式选择: compact (默认, 更快) | tool_call (官方格式)
 OWL_OUTPUT_FORMAT = os.environ.get("VISION_OWL_OUTPUT_FORMAT", "compact").strip().lower()
 
+# GUI-Owl 推理优化: torch.compile (+ 可选 CUDA Graphs)
+# 实测结论 (RTX 5070 Ti / torch 2.13 cu130, 固定图稳态 6 次中位):
+#   eager (默认)             ~539 ms/次
+#   torch.compile default    ~795 ms/次  (慢 ~47%)
+#   torch.compile reduce-overhead (CUDA Graphs) ~787 ms/次 (慢 ~46%)
+# 原因: 单次 generate() 序列逐 token 增长, shape 不断变化, CUDA Graphs 无法跨解码步复用,
+#       仅 prefill 静态; inductor 图分派开销反而盖过 kernel 融合收益。对 2B 小模型净负收益。
+# => 默认关闭; 仅在更大模型 / 静态 shape 批量场景实验性开启。
+#   GUI_OWL_TORCH_COMPILE=1 开启; =0 关闭 (默认)。
+#   GUI_OWL_COMPILE_MODE: default | reduce-overhead (后者内部用 CUDA Graphs 重放静态前向)。
+#   GUI_OWL_STATIC_SHAPE=1 把推理图 letterbox 到固定 1280x720, 让 reduce-overhead 的 CUDA Graphs
+#       有可能生效 (实验性: 黑边可能轻微影响贴边元素定位)。
+TORCH_COMPILE = os.environ.get("GUI_OWL_TORCH_COMPILE", "0").strip().lower() not in ("0", "false", "no")
+COMPILE_MODE = os.environ.get("GUI_OWL_COMPILE_MODE", "default").strip().lower()
+STATIC_SHAPE = os.environ.get("GUI_OWL_STATIC_SHAPE", "0").strip().lower() in ("1", "true", "yes")
+
 from playwright.sync_api import Error as PlaywrightError, sync_playwright  # noqa: E402
 
 # ---- 配置 ----
@@ -102,8 +119,6 @@ _model = None
 _processor = None
 _tokenizer = None
 _loaded_backend = None
-_gui_actor_inference = None
-_gui_actor_system_message = None
 _last_raw_output = ""
 _pw = None
 _browser = None
@@ -111,6 +126,9 @@ _page = None
 _owns_browser = False
 _browser_source = "none"
 _SCREENSHOT_LOCK = threading.Lock()
+# 视觉推理锁: torch generate 非线程安全, 且 _last_raw_output 是进程级共享。
+# MCP(多 session)/多线程同时调用 ground 时必须串行化, 避免并发生成崩坏或结果串扰。
+_INFERENCE_LOCK = threading.RLock()
 
 _BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "brave.exe", "opera.exe", "vivaldi.exe", "firefox.exe"}
 _CDP_ENDPOINTS = tuple(
@@ -194,15 +212,14 @@ def inspect_active_target():
 
 def backend_info() -> dict:
     """返回当前识别后端与模型信息, 供 MCP 工具/日志诊断。"""
-    if BACKEND == "gui_owl":
-        model = _gui_owl_model_path()
-    else:
-        model = MODEL_DIR
+    model = _gui_owl_model_path()
     return {
         "backend": BACKEND,
         "model": model,
+        "arch": "qwen3_vl",
         "loaded": _model is not None,
         "device": str(getattr(_model, "device", "")),
+        "owl_output_format": OWL_OUTPUT_FORMAT,
     }
 
 
@@ -218,16 +235,14 @@ def _gui_owl_model_path() -> str:
 
 
 def load_model():
-    """按 VISION_BACKEND 懒加载模型; 后端切换后自动重载。"""
+    """懒加载 GUI-Owl 模型 (仅 gui_owl 后端)。线程安全: 用锁防止并发首载双份。"""
     global _model, _processor, _tokenizer, _loaded_backend
-    if _model is not None and _loaded_backend == BACKEND:
-        return
-    _model = _processor = _tokenizer = None
-    if BACKEND == "gui_owl":
+    with _INFERENCE_LOCK:
+        if _model is not None and _loaded_backend == BACKEND:
+            return
+        _model = _processor = _tokenizer = None
         _load_gui_owl()
-    else:
-        _load_gui_actor()
-    _loaded_backend = BACKEND
+        _loaded_backend = BACKEND
 
 
 def _load_gui_owl():
@@ -255,38 +270,16 @@ def _load_gui_owl():
         device_map="auto",
         attn_implementation="sdpa",
     ).eval()
+    # 推理优化: torch.compile 编译前向 (reduce-overhead 模式内部使用 CUDA Graphs 重放
+    # 静态 shape 前向)。动态截图场景用 default+dynamic=True 最稳; 整图编译失败则优雅退回 eager。
+    if TORCH_COMPILE and _model.device.type == "cuda":
+        try:
+            _model = torch.compile(_model, mode=COMPILE_MODE, dynamic=(COMPILE_MODE != "reduce-overhead"))
+            print(f"[agent] GUI-Owl torch.compile enabled (mode={COMPILE_MODE}, "
+                  f"dynamic={COMPILE_MODE != 'reduce-overhead'})", file=sys.stderr, flush=True)
+        except Exception as exc:  # noqa: BLE001 - 编译失败不应阻断推理
+            print(f"[agent] torch.compile failed, fallback to eager: {exc!r}", file=sys.stderr, flush=True)
     print(f"[agent] GUI-Owl loaded on {_model.device}", file=sys.stderr, flush=True)
-
-
-def _load_gui_actor():
-    """加载 GUI-Actor-2B (Qwen2-VL pointer head); 需要 microsoft/GUI-Actor 仓库。"""
-    global _model, _processor, _tokenizer, _gui_actor_inference, _gui_actor_system_message
-    repo_src = os.path.join(REPO_DIR, "src")
-    if not os.path.isdir(repo_src):
-        raise RuntimeError(
-            "GUI-Actor 后端需要 microsoft/GUI-Actor 仓库, 请执行: "
-            'git clone https://github.com/microsoft/GUI-Actor.git "Vision\\GUI-Actor"'
-        )
-    sys.path.insert(0, repo_src)
-    try:
-        from transformers import AutoProcessor  # noqa: F401
-        from gui_actor.modeling import Qwen2VLForConditionalGenerationWithPointer
-        from gui_actor.inference import inference
-        from gui_actor.constants import grounding_system_message
-    except ImportError as exc:
-        raise RuntimeError(f"gui_actor 包导入失败: {exc}") from exc
-    _gui_actor_inference = inference
-    _gui_actor_system_message = grounding_system_message
-    print(f"[agent] loading GUI-Actor-2B ({MODEL_DIR}) ...", file=sys.stderr, flush=True)
-    _processor = AutoProcessor.from_pretrained(MODEL_DIR)
-    _tokenizer = _processor.tokenizer
-    _model = Qwen2VLForConditionalGenerationWithPointer.from_pretrained(
-        MODEL_DIR,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        attn_implementation="sdpa",
-    ).eval()
-    print(f"[agent] GUI-Actor loaded on {_model.device}", file=sys.stderr, flush=True)
 
 
 _USER_AGENT = (
@@ -396,55 +389,44 @@ def screenshot_pil() -> Image.Image:
 
 
 def ground_image(instruction: str, img: Image.Image, topk: int = 3):
-    """图像识别入口: 在给定图像上返回最多 topk 个归一化坐标 (0~1)。
+    """图像识别入口: 在给定图像上用 GUI-Owl 返回最多 topk 个归一化坐标 (0~1)。
 
-    根据 VISION_BACKEND 自动分流到 GUI-Owl (默认) 或 GUI-Actor,
-    上层 click/type_text/窗口/桌面动作无需区分后端。
+    上层 click/type_text/窗口/桌面动作无需关心后端细节。
+    线程安全: 整个推理在 _INFERENCE_LOCK 内串行执行(torch generate 非线程安全)。
     """
     load_model()
-    if BACKEND == "gui_owl":
+    with _INFERENCE_LOCK:
         return _gui_owl_ground(instruction, img, topk)
-    return _gui_actor_ground(instruction, img, topk)
 
 
-def _gui_actor_ground(instruction: str, img: Image.Image, topk: int):
-    """GUI-Actor 后端: pointer head 直接输出 0~1 归一化 topk 点。"""
-    conversation = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": _gui_actor_system_message}],
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img},
-                {"type": "text", "text": instruction},
-            ],
-        },
-    ]
-    # Grounding is inference-only.  Disabling autograd prevents an accidental
-    # graph from surviving in the returned prediction and growing VRAM usage.
-    with torch.inference_mode():
-        pred = _gui_actor_inference(
-            conversation, _model, _tokenizer, _processor,
-            use_placeholder=True, topk=topk,
-        )
-    points = pred.get("topk_points") or []
-    return [[float(point[0]), float(point[1])] for point in points]
+def last_raw_output() -> str:
+    """返回最近一次视觉推理的模型原始输出文本, 供调试/诊断。
+    若尚未推理过则返回空字符串。"""
+    return _last_raw_output
 
 
 def _downscale_for_inference(img: Image.Image) -> Image.Image:
-    """按 VISION_MAX_SIDE 把输入图最长边降采样, 控制视觉 token 数以降低延迟。"""
-    if VISION_MAX_SIDE <= 0:
-        return img
-    w, h = img.size
-    longest = max(w, h)
-    if longest <= VISION_MAX_SIDE:
-        return img
-    scale = VISION_MAX_SIDE / longest
-    new_w = max(32, round(w * scale))
-    new_h = max(32, round(h * scale))
-    return img.resize((new_w, new_h), Image.LANCZOS)
+    """按 VISION_MAX_SIDE 把输入图最长边降采样, 控制视觉 token 数以降低延迟。
+
+    STATIC_SHAPE=1 时额外 letterbox 到固定 1280x720, 使前向 shape 稳定,
+    让 torch.compile(mode=reduce-overhead) 的 CUDA Graphs 能稳定重放 (实验性)。
+    """
+    if VISION_MAX_SIDE > 0:
+        w, h = img.size
+        longest = max(w, h)
+        if longest > VISION_MAX_SIDE:
+            scale = VISION_MAX_SIDE / longest
+            img = img.resize((max(32, round(w * scale)), max(32, round(h * scale))), Image.LANCZOS)
+    if STATIC_SHAPE:
+        TW, TH, PAD = 1280, 720, (248, 249, 250)  # 接近白底, 减少对定位的视觉干扰
+        canvas = Image.new("RGB", (TW, TH), PAD)
+        sw, sh = img.size
+        scale = min(TW / sw, TH / sh)
+        nw, nh = max(32, round(sw * scale)), max(32, round(sh * scale))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        canvas.paste(img, ((TW - nw) // 2, (TH - nh) // 2))
+        return canvas
+    return img
 
 
 def _gui_owl_ground(instruction: str, img: Image.Image, topk: int):
@@ -492,10 +474,9 @@ def _gui_owl_ground(instruction: str, img: Image.Image, topk: int):
         generated_ids = _model.generate(
             **inputs,
             max_new_tokens=256,
-            do_sample=True,
-            temperature=0.01,
-            top_p=0.01,
-            top_k=1,
+            # 视觉 grounding 是确定性定位任务: 用贪心解码(等价的 top_k=1 写法
+            # 仍走采样分支且更慢), 结果可复现、首 token 延迟更低。
+            do_sample=False,
             repetition_penalty=1.0,
         )
     generated_ids_trimmed = [
@@ -926,6 +907,235 @@ def _capture_window_info(window: dict) -> Image.Image:
     return _grab_windows_image(hwnd=int(window["hwnd"]), bbox=(left, top, right, bottom), all_screens=True)
 
 
+_UIA_TARGET_TYPES = {"Button", "Hyperlink", "TabItem", "Edit", "MenuItem", "ListItem", "RadioButton", "CheckBox", "ComboBox", "SplitButton"}
+# UIA 读取窗口结构依赖 pywinauto(纯 Python + Windows UIAutomation COM)，非必需。
+# 缺失时所有"读窗口内容"工具回退为结构不可读(仅视觉)。
+_uia_import_error = None
+try:
+    from pywinauto import Desktop as _UiaDesktop  # noqa: E402
+except Exception as _exc:  # pragma: no cover
+    _uia_import_error = _exc
+    _UiaDesktop = None
+
+
+def _normalize_control_name(name: str) -> str:
+    """去掉控件可访问名里的装饰/图标说明，只留用于匹配的关键词。"""
+    if not name:
+        return ""
+    lowered = name.lower()
+    for token in (" 图片", " 链接", " (alt+", "按钮", "资料"):
+        lowered = lowered.replace(token, " ")
+    return " ".join(lowered.split())
+
+
+def _matches_target(name: str, target: str) -> float:
+    """判断控件可访问名与目标描述是否命中，返回 0~1 置信度(0=未命中)。
+
+    策略: 目标通常是短词/短语(如 '发动态'、'投稿'、'背包')。只要目标里的
+    核心词整体出现在控件名里即算强命中; 允许逐字包含的弱命中兜底。
+    """
+    if not name or not target:
+        return 0.0
+    norm_name = _normalize_control_name(name).lower()
+    if not norm_name:
+        return 0.0
+    # 逐字(非标点)拆目标，去掉空白与常见填充
+    import re as _re
+    tokens = [t for t in _re.split(r"[\s，,。/]+", str(target).lower()) if t]
+    if not tokens:
+        return 0.0
+    matched = sum(1 for t in tokens if t in norm_name)
+    if matched == len(tokens) and tokens:
+        return 1.0 if len(tokens) == 1 else 0.95
+    if matched:
+        return 0.5 * matched / len(tokens)
+    return 0.0
+
+
+def _uia_walk_controls(win, max_items: int = 120):
+    """深度遍历 UIA 控件树，收集可点控件(带屏幕矩形)。失败时返回 []。"""
+    if _UiaDesktop is None:
+        return []
+    collected = []
+    _seen = set()
+
+    def _rect_key(r):
+        try:
+            return (r.left // 16, r.top // 16, r.width() // 16, r.height() // 16)
+        except Exception:
+            return None
+
+    def _walk(el, depth: int = 0):
+        if depth > 22 or len(collected) >= max_items:
+            return
+        try:
+            info = el.element_info
+            ctrl_type = info.control_type or ""
+            name = (info.name or "").strip()
+        except Exception:
+            return
+        if ctrl_type in _UIA_TARGET_TYPES and name:
+            try:
+                r = el.rectangle()
+                # 跳过完全在屏幕外 / 零尺寸的伪控件
+                if r.width() <= 0 or r.height() <= 0 or r.left < -60000 or r.top < -60000:
+                    pass
+                else:
+                    key = _rect_key(r)
+                    item = {
+                        "type": ctrl_type, "name": name[:80],
+                        "left": int(r.left), "top": int(r.top),
+                        "width": int(r.width()), "height": int(r.height()),
+                        "cx": int(r.left + r.width() / 2), "cy": int(r.top + r.height() / 2),
+                    }
+                    if key is None or key not in _seen:
+                        _seen.add(key)
+                        collected.append(item)
+            except Exception:
+                pass
+        try:
+            children = el.children()
+        except Exception:
+            return
+        for child in children:
+            _walk(child, depth + 1)
+
+    try:
+        _walk(win)
+    except Exception:
+        return []
+    return collected
+
+
+_BROWSER_CHROME_NAMES = {"最小化", "最大化", "关闭", "还原", "返回", "刷新", "主页", "查看站点信息", "地址和搜索栏", "搜索标签页", "新建标签页", "标签页组", "包含隐藏的收藏夹的菜单", "其他收藏夹", "编辑此页面的收藏夹(Ctrl+D)", "设置及其他 (Alt+F)", "历史记录", "屏幕截图", "扩展", "个人 个人资料", "个人资料"}
+
+
+def _uia_walk_with_warmup(win, max_items: int = 160, warmup: bool = True):
+    """枚举控件；若结果几乎全是浏览器 chrome(工具栏) 而无页面内容，说明 Chromium
+    尚未为页面构建可访问性树，等待后重试一次以触发页面树生成。返回 (controls, was_retried)。"""
+    controls = _uia_walk_controls(win, max_items=max_items)
+    if not warmup or not controls:
+        return controls, False
+    # 统计"非 chrome"的页面控件数
+    page_like = [c for c in controls if _normalize_control_name(c["name"]) not in _BROWSER_CHROME_NAMES]
+    if len(page_like) < 4 and len(controls) <= 25:
+        time.sleep(1.0)
+        try:
+            controls2 = _uia_walk_controls(win, max_items=max_items)
+        except Exception:
+            controls2 = controls
+        if controls2:
+            controls = controls2
+            return controls, True
+    return controls, False
+
+
+def window_read_targets(title_contains: str, keywords: str = "", max_items: int = 80):
+    """读取目标窗口的"内容结构"(UIA 可点控件: 文本+屏幕矩形)，供文本精确点击。
+
+    优先于全屏截图: 原生窗口与 Chromium/Edge 网页都能枚举出按钮/链接的文本与坐标，
+    文本命中即可零漂移点击。对游戏/自绘全屏(无 UIA 结构)返回 structure_readable=False。
+    """
+    result = {
+        "title_contains": title_contains, "structure_readable": False,
+        "method": "uia", "targets": [], "count": 0, "note": "",
+    }
+    if _UiaDesktop is None:
+        result["note"] = f"pywinauto 不可用: {_uia_import_error}"
+        return result
+    window = _find_window(title_contains)
+    if not window or not window.get("hwnd"):
+        result["note"] = f"找不到窗口: {title_contains}"
+        return result
+    try:
+        activate_window(title_contains)
+    except Exception:
+        pass
+    try:
+        win = _UiaDesktop(backend="uia").window(handle=int(window["hwnd"]))
+        win.wait("exists", timeout=8)
+        # 有关键词过滤时内部遍历预算放宽到 400，避免浏览器 chrome 抢先占满预算导致页面目标漏采
+        walk_cap = 400 if keywords.strip() else max_items
+        controls, _was_warm = _uia_walk_with_warmup(win, max_items=max(walk_cap, max_items))
+    except Exception as exc:
+        # 失败多为游戏/无 UIA 提供者的自绘窗口
+        result["note"] = f"UIA 读取失败(可能为游戏/自绘全屏无控件树): {type(exc).__name__}: {exc}"
+        result["structure_readable"] = False
+        return result
+    result["note"] = ("已读取到窗口 UIA 控件树(含预热重试)，可用文本精确定位点击，无需视觉猜像素。"
+                      if _was_warm else
+                      "已读取到窗口 UIA 控件树，可用文本精确定位点击，无需视觉猜像素。")
+    needle = _normalize_control_name(keywords)
+    if needle:
+        controls = [c for c in controls if _matches_target(c["name"], needle) > 0.0]
+    # 去重 + 排序(按名称可读性优先展示 Button/Hyperlink)
+    _order = {"Button": 0, "Hyperlink": 1, "TabItem": 2, "MenuItem": 3, "Edit": 4, "ListItem": 5}
+    controls.sort(key=lambda c: (_order.get(c["type"], 9), c["top"], c["left"]))
+    result["targets"] = controls[:max_items]
+    result["count"] = len(result["targets"])
+    result["structure_readable"] = True
+    return result
+
+
+def window_text_click(title_contains: str, target: str, candidate_index: int = 0):
+    """在目标窗口 UIA 控件树里按文本精确命中 target，点其矩形中心。
+
+    返回 (ok, payload)。ok=True 表示已按文本坐标点击; ok=False 且 structure_readable=False
+    表示该窗口无结构可读(游戏等)只能视觉; ok=False 且 matched=0 表示没找到该文本控件。
+    """
+    base = {
+        "instruction": target, "window_title_contains": title_contains,
+        "method": "uia_text", "clicked": False,
+    }
+    if _UiaDesktop is None:
+        return False, {**base, "reason": f"pywinauto 不可用: {_uia_import_error}", "structure_readable": False}
+    window = _find_window(title_contains)
+    if not window or not window.get("hwnd"):
+        return False, {**base, "reason": f"找不到窗口: {title_contains}", "structure_readable": False}
+    try:
+        activate_window(title_contains)
+    except Exception:
+        pass
+    try:
+        win = _UiaDesktop(backend="uia").window(handle=int(window["hwnd"]))
+        win.wait("exists", timeout=8)
+        controls, _was_warm = _uia_walk_with_warmup(win, max_items=160)
+    except Exception as exc:
+        return False, {**base, "reason": f"UIA 读取失败(可能为游戏/自绘全屏无控件树): {type(exc).__name__}", "structure_readable": False}
+    # 对每个控件算匹配分，选最高分候选
+    needle = _normalize_control_name(target)
+    scored = []
+    for c in controls:
+        score = _matches_target(c["name"], needle)
+        if score > 0.0:
+            scored.append((score, c))
+    if not scored:
+        return False, {**base, "reason": f"控件树可读，但未找到文本命中 '{target}' 的可点元素", "structure_readable": True, "count": len(controls)}
+    scored.sort(key=lambda x: (-x[0], x[1]["cy"], x[1]["cx"]))
+    chosen = scored[min(candidate_index, len(scored) - 1)][1]
+    px, py = chosen["cx"], chosen["cy"]
+    ctypes.windll.user32.SetCursorPos(px, py)
+    ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+    ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+    img_before = None
+    try:
+        img_before = window_screenshot_pil(title_contains)
+    except Exception:
+        img_before = None
+    evidence = {}
+    if img_before is not None:
+        try:
+            evidence = _wait_and_compare_window(window, img_before, str(window.get("title", "")))
+        except Exception as exc:
+            evidence = {"execution_likely_succeeded": False, "reason": f"验证截图失败: {exc}"}
+    return True, {
+        **base, "clicked": True, "pixel": [px, py], "matched_name": chosen["name"],
+        "match_score": round(scored[0][0], 2), "count": len(controls),
+        "all_matches": [{"name": c["name"], "score": round(s, 2), "pixel": [c["cx"], c["cy"]]} for s, c in scored[:6]],
+        "structure_readable": True, **evidence,
+    }
+
+
 def _window_title_by_hwnd(hwnd: int) -> str:
     user32 = ctypes.windll.user32
     length = user32.GetWindowTextLengthW(hwnd)
@@ -998,10 +1208,37 @@ def _window_ground_points(instruction: str, img: Image.Image, topk: int):
 
 
 def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int = 0):
+    """优先用 UIA 控件树按文本精确命中点击; 无结构或文本未命中才回退视觉 grounding。
+
+    对原生窗口与 Chromium/Edge 网页，UI 按钮/链接暴露为可访问控件(文本+矩形)，
+    文本坐标点击零漂移，避免全屏视觉猜像素导致的点错/误触退出全屏。
+    游戏/自绘全屏无控件树(structure_readable=False)，自动回退视觉并给出护栏提示。
+    """
     window = _find_window(title_contains); activate_window(title_contains)
+    # 第一优先: UIA 文本定位
+    if _UiaDesktop is not None:
+        ok, res = window_text_click(title_contains, instruction, candidate_index=idx)
+        if ok:
+            res["backend"] = BACKEND; res["window"] = window
+            res["via"] = "uia_text"  # 标记走文本定位，供编排/日志识别
+            return res
+        # 未命中文本: 若该窗口其实没有结构可读(游戏等)，给出护栏提示，避免视觉乱点
+        if not res.get("structure_readable"):
+            return {
+                "clicked": False, "window": window, "reason": res.get("reason", ""),
+                "via": "uia_unavailable", "structure_readable": False,
+                "guidance": "该目标窗口没有可读的 UIA 控件树(通常是游戏或全屏自绘画面)。"
+                            "若目标是全屏游戏，切勿先按 Esc/F11 或点退出全屏; 只有确认目标确实在该全屏画面内才允许视觉点击，"
+                            "否则应切换回窗口化/桌面再操作。",
+            }
+        # 结构可读但没匹配到目标文本 → 记录原因后回退视觉，供模型换描述
+        visual_hint = res.get("reason", "")
+    else:
+        visual_hint = f"pywinauto 不可用，纯视觉定位: {_uia_import_error}"
+    # 回退: 视觉 grounding
     img = window_screenshot_pil(title_contains)
     points, used_height = _window_ground_points(instruction, img, topk)
-    if not points: return {"clicked": False, "reason": "model returned no point", "window": window, "raw_output": _last_raw_output}
+    if not points: return {"clicked": False, "reason": "model returned no point", "window": window, "raw_output": _last_raw_output, "text_match_hint": visual_hint}
     x, y = points[min(max(0, idx), len(points) - 1)]
     left, top, _, _ = window["bounds"]
     px = left + int(x * img.width); py = top + int(y * used_height)
@@ -1011,6 +1248,7 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
     evidence = _wait_and_compare_window(window, img, str(window.get("title", "")))
     return {"clicked": True, "backend": BACKEND, "pixel": [px, py], "window": window,
             "all_points": points, "grounding_region": "full" if used_height == img.height else "top",
+            "via": "visual_fallback", "text_match_hint": visual_hint,
             **evidence}
 
 

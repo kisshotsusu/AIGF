@@ -1,79 +1,59 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-r"""实验2: 静态 KV cache + torch.compile(reduce-overhead) 能否压解码调度开销
-成功标准: 解码 ms/token 相比 36ms(720p) 明显下降; 失败则回退报告
+r"""GUI-Owl torch.compile / CUDA Graphs 加速稳态基准 (走生产路径 agent.ground_image)。
+
+用固定合成图重复 grounding, 隔离 torch.compile 的稳态收益: 首次调用含编译开销, 不计入统计。
+切换方式:
+  GUI_OWL_TORCH_COMPILE=0       关闭编译 (eager 基线)
+  GUI_OWL_TORCH_COMPILE=1 GUI_OWL_COMPILE_MODE=default       (动态 shape, 推荐)
+  GUI_OWL_TORCH_COMPILE=1 GUI_OWL_COMPILE_MODE=reduce-overhead   (内部 CUDA Graphs)
+  GUI_OWL_STATIC_SHAPE=1         固定 1280x720 让 reduce-overhead 的 CUDA Graphs 生效
 """
-import os, sys, time, statistics
+import os
+import sys
+import time
+import statistics
 
 os.environ["VISION_BACKEND"] = "gui_owl"
-os.environ["VISION_MAX_SIDE"] = "1280"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import torch
+from PIL import Image, ImageDraw
 import agent
-from qwen_vl_utils import process_vision_info
 
-agent.load_model()
-proc, model = agent._processor, agent._model
-SYS = agent._OWL_COMPACT_SYSTEM_PROMPT
+W, H = 1000, 700
+img = Image.new("RGB", (W, H), "white")
+d = ImageDraw.Draw(img)
+d.rectangle([(760, 600), (900, 660)], fill="#2e7d32", outline="#333333")
+d.rectangle([(60, 60), (320, 120)], fill="#eeeeee", outline="#333333")
 
-try:
-    img = agent.desktop_screenshot_pil().convert("RGB")
-except Exception as exc:
-    from PIL import Image, ImageDraw
-    print(f"[warn] 桌面截图失败, 改用合成 1080p 图")
-    img = Image.new("RGB", (1920, 1080), (240, 240, 245))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle([380, 260, 600, 330], radius=12, fill=(200, 60, 60))
-    d.rounded_rectangle([1240, 540, 1460, 610], radius=12, fill=(60, 60, 200))
-def build(inst):
-    messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYS}]},
-        {"role": "user", "content": [{"type": "image", "image": img},
-                                     {"type": "text", "text": inst}]},
-    ]
-    text = proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    ii, vi = process_vision_info(messages)
-    return proc(text=[text], images=ii, videos=vi, padding=True,
-                return_tensors="pt").to(model.device)
+compile_on = os.environ.get("GUI_OWL_TORCH_COMPILE", "1").strip().lower() not in ("0", "false", "no")
+mode = os.environ.get("GUI_OWL_COMPILE_MODE", "default")
+static = os.environ.get("GUI_OWL_STATIC_SHAPE", "0")
+print(f"===== bench: compile={'on' if compile_on else 'off'} mode={mode} static_shape={static} =====")
+print(f"torch {torch.__version__} | cuda {torch.cuda.is_available()}")
 
-def gen(inputs):
-    t0 = time.time()
-    with torch.inference_mode():
-        out = model.generate(**inputs, max_new_tokens=64, do_sample=True,
-                             temperature=0.01, top_p=0.01, top_k=1, repetition_penalty=1.0)
-    dt = time.time() - t0
-    n = out.shape[1] - inputs.input_ids.shape[1]
-    return dt, n
-
-# ---- 基线: eager ----
-inputs = build("click the search box")
-gen(inputs); gen(inputs)
-ts = [gen(build(i)) for i in ["click the search box", "find the close button",
-                              "click the settings icon", "find the play button"]]
-eager_ms = statistics.mean(dt / max(n, 1) * 1000 for dt, n in ts)
-print(f"[eager 基线] 解码 {eager_ms:.1f}ms/token "
-      f"(生成均值 {statistics.mean(dt*1000 for dt, n in ts):.0f}ms)")
-
-# ---- 实验: static cache + compile ----
-print("[实验] 启用 static cache + torch.compile(reduce-overhead) ...")
-model.generation_config.cache_implementation = "static"
 t0 = time.time()
-try:
-    model.forward = torch.compile(model.forward, mode="reduce-overhead", fullgraph=False)
-    # 首次触发编译 (可能耗时数分钟)
-    gen(inputs)
-    compile_s = time.time() - t0
-    print(f"[实验] 编译+首次运行 {compile_s:.0f}s")
-    ts = [gen(build(i)) for i in ["click the search box", "find the close button",
-                                  "click the settings icon", "find the play button",
-                                  "click the search box"]]
-    compiled_ms = statistics.mean(dt / max(n, 1) * 1000 for dt, n in ts)
-    print(f"[实验结果] 解码 {compiled_ms:.1f}ms/token "
-          f"(生成均值 {statistics.mean(dt*1000 for dt, n in ts):.0f}ms) "
-          f"vs eager {eager_ms:.1f}ms/token -> "
-          f"{'有效, 提速 ' + format(eager_ms/compiled_ms, '.2f') + 'x' if compiled_ms < eager_ms * 0.9 else '收益不明显'}")
-except Exception as exc:
-    print(f"[实验失败] torch.compile 不可用: {type(exc).__name__}: {str(exc)[:300]}")
+agent.load_model()
+print(f"[load] {time.time()-t0:.1f}s")
+
+# warmup: 触发编译, 不计时 (用稳定出坐标的指令, 反映真实 grounding 延迟)
+_ = agent.ground_image("click the search box", img, topk=1)
+if torch.cuda.is_available():
+    print(f"[warmup done] VRAM peak={torch.cuda.max_memory_allocated()/1024**3:.2f}GB")
+
+N = 6
+times = []
+for i in range(N):
+    t = time.time()
+    pts = agent.ground_image("click the search box", img, topk=1)
+    times.append(time.time() - t)
+print(f"[per-call ms] {[round(x*1000, 1) for x in times]}")
+print(f"[median ms ] {round(statistics.median(times)*1000, 1)}")
+print(f"[first  ms ] {round(times[0]*1000, 1)}  (warmup 已排除编译开销)")
+print(f"[last   ms ] {round(times[-1]*1000, 1)}")
+print(f"[result] {pts}")
+print("===== bench done =====")

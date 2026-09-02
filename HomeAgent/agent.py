@@ -148,6 +148,13 @@ class HomeAgent:
         self.vision_service_lock = threading.Lock()
         self.sound_service_process: subprocess.Popen | None = None
         self.sound_service_lock = threading.Lock()
+        # --- 常驻 vision MCP 桥：复用到 8765 的长连接，避免每次工具调用冷启动子进程 ---
+        # bridge 子进程(venv python + mcp)持有 ClientSession，通过 stdio JSON-lines 通信。
+        # 锁均在首次 async 调用时惰性创建并绑定到共享事件循环。
+        self._vision_bridge_proc: asyncio.subprocess.Process | None = None
+        self._vision_bridge_lock: asyncio.Lock | None = None  # 创建/重建保护
+        self._vision_bridge_seq: int = 0
+        self._vision_bridge_disabled_until: float = 0.0  # bridge 连接失败后的短暂禁用到期时间戳
         self.self_upgrade = SelfUpgradeManager(ROOT, HOME_AGENT, self.config)
         self.command_executor = CommandExecutor(ROOT)
         self.mimo_multimodal = MiMoMultimodalClient(self.project.get("mimo_multimodal", {}))
@@ -689,9 +696,52 @@ class HomeAgent:
         return None, scored
 
     @staticmethod
+    def _looks_like_gui_action(text: str) -> bool:
+        """启发式：文本是否表达明确的桌面/GUI 操作意图。
+
+        仅在语义规划器不可用或调用失败时的确定性兜底路径使用，用来避免把
+        “打开网易云音乐播放”这类明显操作误判为闲聊（否则会带着 tool_choice=auto
+        空转调用 UI/视觉工具直到迭代上限）。知识问答里恰好含这些动词（如“打开思路”）
+        不算操作。
+        """
+        t = str(text).strip()
+        if not t:
+            return False
+        action_verbs = (
+            "打开", "启动", "运行", "关闭", "关掉", "退出", "播放", "暂停", "停止播放",
+            "切换", "点击", "单击", "双击", "最大化", "最小化", "截图", "录屏", "安装", "卸载",
+            "找", "查找", "搜索", "识别", "定位", "进入", "跳到", "转到",
+        )
+        if not any(v in t for v in action_verbs):
+            return False
+        # 知识问答句式不算操作意图
+        knowledge_markers = ("怎么", "如何", "为什么", "是什么", "什么意思", "区别", "教程", "解释", "原理", "概念")
+        if any(m in t for m in knowledge_markers):
+            return False
+        return True
+
+    @staticmethod
     def _analyze_task(text: str, context: str = "") -> dict[str, Any]:
-        """Return a conservative contract only when the semantic planner is unavailable."""
+        """Return a conservative contract only when the semantic planner is unavailable.
+
+        语义规划器调用失败时会回退到这里：至少把明显的 GUI/桌面操作识别为可执行任务，
+        而不是一律当成闲聊（否则工具循环会空转到迭代上限）。
+        """
         value = str(text).strip()
+        if HomeAgent._looks_like_gui_action(value):
+            return {
+                "goal": value, "is_task": True, "response_mode": "execute",
+                "execution_strategy": "tool_loop", "domain": "desktop", "actionable": True,
+                "multi_step": True, "requires_mcp": False, "site": "", "operation": "open",
+                "handler": None, "query": "", "query_is_explicit": False, "index": None,
+                "favorite_folder": "", "steps": [], "preferred_tools": ["launch_app", "ui_list_windows", "ui_analyze_window", "ui_click_window", "ui_type_active_text"],
+                "required_capabilities": ["desktop_control"], "browser_policy": "not_applicable",
+                "visual_required": True, "interaction_mode": "observe", "implementation_change": False,
+                "code_scope": "none", "requires_clarification": False, "clarification_question": "",
+                "risk_level": "low", "final_action_requires_verification": True,
+                "success_criteria": "已打开目标程序并完成用户要求的操作，且重新观察确认终态",
+                "planner": "heuristic_fallback",
+            }
         return {
             "goal": value, "is_task": False, "response_mode": "answer", "execution_strategy": "direct_answer",
             "domain": "conversation", "actionable": False, "multi_step": False, "requires_mcp": False,
@@ -869,7 +919,7 @@ class HomeAgent:
                 fallback["handler"] = None
                 fallback["requires_clarification"] = True
                 fallback["success_criteria"] = "先确认目标对象，禁止猜测后执行"
-            self.log_event("semantic_planner_fallback", error=str(exc), fallback=fallback)
+            self.log_event("semantic_planner_fallback", error=f"{type(exc).__name__}: {exc}", fallback=fallback)
             return fallback
 
     @staticmethod
@@ -1056,6 +1106,7 @@ class HomeAgent:
             "ui_list_windows": "读取可见窗口", "ui_activate_window": "激活目标窗口",
             "ui_analyze_window": "识别窗口画面", "ui_analyze_screen": "识别当前屏幕",
             "ui_click_window": "点击界面目标", "ui_double_click_window": "双击界面目标",
+            "ui_read_window": "读取窗口控件", "ui_inspect_target": "识别目标通道",
             "ui_type_active_text": "输入文字", "ui_hotkey": "执行快捷键",
             "launch_app": "启动应用", "read_text_file": "读取文件", "write_text_file": "写入文件",
             "comfy_status": "检查生成服务", "comfy_list_models": "查看生成模型",
@@ -1074,7 +1125,7 @@ class HomeAgent:
         return labels.get(name, name)
 
     _VISUAL_EVIDENCE_TOOLS = frozenset({
-        "ui_analyze_window", "ui_analyze_screen", "ui_list_windows", "process_status",
+        "ui_analyze_window", "ui_analyze_screen", "ui_list_windows", "ui_read_window", "ui_inspect_target", "process_status",
     })
     _STATE_MUTATION_TOOLS = frozenset({
         "ui_click_window", "ui_double_click_window", "ui_type_window",
@@ -1268,9 +1319,9 @@ class HomeAgent:
                 if ready(): return True
                 time.sleep(1)
             return False
-        backend = str(cfg.get("backend") or "gui_actor")
-        # GUI-Owl (Qwen3-VL) 与 GUI-Actor 现已统一运行于项目共享 .venv
-        # （.venv 已升级 transformers>=4.57 + qwen-vl-utils>=0.0.14），无需再区分解释器。
+        backend = str(cfg.get("backend") or "gui_owl")
+        # GUI-Owl (Qwen3-VL) 运行于项目共享 .venv (transformers>=4.57 + qwen-vl-utils>=0.0.14)。
+        # GUI-Actor (Qwen2-VL 老模型) 已移除。
         python = ROOT / ".venv" / "Scripts" / "python.exe"
         server = ROOT / "Vision" / "mcp_server.py"
         if not python.exists() or not server.exists():
@@ -1319,8 +1370,6 @@ class HomeAgent:
             "VISION_PRELOAD_MODEL": "1" if cfg.get("preload_model", True) else "0",
             "VISION_BACKEND": backend,
             "GUI_OWL_MODEL": str(cfg.get("gui_owl_model") or ROOT / "Vision" / "models" / "GUI-Owl-1.5-2B-Instruct"),
-            "GUI_ACTOR_MODEL": str(ROOT / "Vision" / "models" / "GUI-Actor-2B-Qwen2-VL"),
-            "GUI_ACTOR_REPO": str(ROOT / "Vision" / "GUI-Actor"),
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "BROWSER_CDP_ENDPOINTS": ",".join(str(item) for item in cfg.get(
                 "existing_browser_cdp_endpoints",
@@ -1388,9 +1437,130 @@ class HomeAgent:
             "local_tools_preferred": bool(self.config.get("agent", {}).get("prefer_local_tools", True)),
         }
 
+    @staticmethod
+    def _safe_vision_literal(raw: str, default: Any = None) -> Any:
+        """安全地把视觉工具返回的 Python 字面量文本转回对象；失败则返回兜底值。
+
+        视觉工具（desktop_read_clipboard / list_windows 等）成功时可能返回
+        非字面量文本（如「未找到剪贴板内容」），直接 ast.literal_eval 会抛
+        ValueError 并崩掉调用流程；这里统一兜底，避免单次视觉异常拖垮整轮任务。
+        """
+        try:
+            return ast.literal_eval(raw)
+        except (ValueError, SyntaxError, TypeError):
+            return raw if default is None else default
+
     async def _vision_mcp_call(self, tool_name: str, arguments: dict[str, Any] | None = None):
-        """Call persistent vision MCP through the project venv dependency bridge."""
-        url = str(self.config.get("vision_mcp", {}).get("url", "http://127.0.0.1:8765/mcp"))
+        """Call persistent vision MCP through a long-lived bridge connection.
+
+        优先复用进程内常驻的 bridge worker（持有到 Vision 8765 的 MCP 长连接），
+        消除每次工具调用冷启动一个 mcp_call.py 子进程的 ~1.6s 开销；bridge 不可用
+        时自动回退到一次性 spawn（保证稳定）。
+        """
+        cfg = self.config.get("vision_mcp", {})
+        url = str(cfg.get("url", "http://127.0.0.1:8765/mcp"))
+        call_timeout = float(cfg.get("call_timeout_seconds", 120))
+        # bridge 失联时短暂禁用(30s), 期间直接走 spawn, 避免每次调用先白试 bridge 造成双倍延迟;
+        # 到点后自动允许重建 bridge 探活。
+        if time.monotonic() >= self._vision_bridge_disabled_until:
+            try:
+                text = await self._vision_bridge_call(url, tool_name, arguments, call_timeout)
+                self._vision_bridge_disabled_until = 0.0
+                return text
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, asyncio.TimeoutError) as exc:
+                # 连接/握手/断连类故障 -> 禁用 bridge 一段时间并回退 spawn 保底。
+                self._vision_bridge_disabled_until = time.monotonic() + 30.0
+                self.log_event("vision_bridge_fallback", tool=tool_name, error=str(exc)[:200])
+                return await self._vision_mcp_call_spawn(url, tool_name, arguments, call_timeout)
+            # 其它异常属工具/业务错误, 原样抛给上层(不 spawn 重试)
+        return await self._vision_mcp_call_spawn(url, tool_name, arguments, call_timeout)
+
+    async def _vision_bridge_call(self, url: str, tool_name: str, arguments: dict[str, Any] | None,
+                                  call_timeout: float) -> str:
+        """通过常驻 bridge worker 执行一次 vision 调用；失败抛异常交给上层回退。"""
+        # 锁惰性创建并绑定到共享事件循环；极少数跨 loop 场景会在此抛错 -> 上层回退 spawn。
+        if self._vision_bridge_lock is None:
+            self._vision_bridge_lock = asyncio.Lock()
+        async with self._vision_bridge_lock:
+            proc = await self._ensure_vision_bridge(url)
+            self._vision_bridge_seq += 1
+            req_id = self._vision_bridge_seq
+            request = {"id": req_id, "tool": tool_name, "args": arguments or {}}
+            try:
+                assert proc.stdin is not None and proc.stdout is not None
+                proc.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+                await proc.stdin.drain()
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=call_timeout)
+            except asyncio.TimeoutError:
+                await self._kill_vision_bridge()
+                raise RuntimeError(
+                    f"视觉工具 {tool_name} 执行超时（>{call_timeout:.0f}s）：视觉服务可能卡滞或正在加载模型"
+                )
+            if not line:  # bridge 提前退出 -> 置空以便下次重建
+                self._vision_bridge_proc = None
+                raise ConnectionError("视觉桥接连接已断开")
+            try:
+                payload = json.loads(line.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                self._vision_bridge_proc = None
+                raise ConnectionError("视觉桥接返回异常数据")
+            if not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or f"视觉工具 {tool_name} 执行失败")
+            return str(payload.get("text", ""))
+
+    async def _ensure_vision_bridge(self, url: str) -> asyncio.subprocess.Process:
+        """返回一个可用的常驻 bridge worker 进程；必要时(首次/崩溃)创建并等待就绪。"""
+        proc = self._vision_bridge_proc
+        if proc is not None and proc.returncode is None:
+            return proc
+        python = ROOT / ".venv" / "Scripts" / "python.exe"
+        worker = ROOT / "Vision" / "mcp_bridge_worker.py"
+        if not python.exists() or not worker.exists():
+            raise ConnectionError("常驻视觉桥接脚本缺失")
+        client_env = os.environ.copy()
+        client_env.update({
+            "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+            "VISION_CALL_TIMEOUT": str(float(self.config.get("vision_mcp", {}).get("call_timeout_seconds", 120))),
+        })
+        new_proc = await asyncio.create_subprocess_exec(
+            str(python), str(worker), url,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            env=client_env,
+        )
+        # 等待 worker 完成 initialize 并发出就绪信号（读到其 stdout 的首个 ready 行）。
+        # 若 worker 初始化失败会立刻退出 -> readline 返回 b"" -> 判定失败。
+        stdout = new_proc.stdout
+        assert stdout is not None
+        ready_line = await asyncio.wait_for(stdout.readline(), timeout=30)
+        if not ready_line:
+            try:
+                await new_proc.wait()
+            except ProcessLookupError:
+                pass
+            raise ConnectionError("视觉桥接 worker 初始化失败")
+        self._vision_bridge_proc = new_proc
+        self._vision_bridge_seq = 0
+        self.log_event("vision_bridge_started", pid=new_proc.pid, url=url)
+        return new_proc
+
+    async def _kill_vision_bridge(self) -> None:
+        proc = self._vision_bridge_proc
+        self._vision_bridge_proc = None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            if proc.stdin: proc.stdin.close()
+            proc.kill()
+            await proc.wait()
+        except (ProcessLookupError, ConnectionError):
+            pass
+
+    async def _vision_mcp_call_spawn(self, url: str, tool_name: str, arguments: dict[str, Any] | None,
+                                     call_timeout: float) -> str:
+        """回退路径：一次性 spawn mcp_call.py 子进程（原实现）。"""
         python = ROOT / ".venv" / "Scripts" / "python.exe"
         helper = ROOT / "Vision" / "mcp_call.py"
         client_env = os.environ.copy()
@@ -1401,12 +1571,24 @@ class HomeAgent:
             env=client_env)
         with self.active_process_lock: self.active_process = proc
         try:
-            out, err = await proc.communicate()
-        except asyncio.CancelledError:
-            try: proc.kill()
-            except ProcessLookupError: pass
-            await proc.communicate()
-            raise
+            try:
+                # 关键健壮性：视觉服务可能在加载模型或卡死时长时间不返回；若无限等待，
+                # 整个工具循环（乃至整轮聊天）会永久挂起。加超时并在超时时杀掉桥接子进程。
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=call_timeout)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except ProcessLookupError: pass
+                try: out, err = await proc.communicate()
+                except (asyncio.CancelledError, ProcessLookupError): out, err = b"", b""
+                raise RuntimeError(
+                    f"视觉工具 {tool_name} 执行超时（>{call_timeout:.0f}s）：视觉服务可能卡滞或正在加载模型，"
+                    f"请检查 Vision 服务日志或重启 vision 服务"
+                )
+            except asyncio.CancelledError:
+                try: proc.kill()
+                except ProcessLookupError: pass
+                await proc.communicate()
+                raise
         finally:
             with self.active_process_lock:
                 if self.active_process is proc: self.active_process = None
@@ -1421,130 +1603,95 @@ class HomeAgent:
 
 
 
-    async def _run_existing_browser_favorites(self, index: int, status=None, folder_name: str = "默认收藏夹") -> dict[str, Any]:
-        """Use an already-open normal browser profile; never launch Playwright Chromium."""
-        if not await asyncio.to_thread(self.ensure_vision_service, True): return {"error": "视觉服务未就绪"}
-        allowed = {"msedge.exe", "chrome.exe", "firefox.exe", "brave.exe", "opera.exe"}
+    # ------------------------------------------------------------------ #
+    # 账号私有数据只读 getter：屏幕上看不到的事实，模型拿到后自行用视觉工具编排
+    # ------------------------------------------------------------------ #
+    async def bilibili_list_favorites(self, folder_name: str = "默认收藏夹", index: int | None = None) -> dict[str, Any]:
+        """只读 getter：返回 Bilibili 收藏夹列表，或某收藏夹第 N 个视频的 BV 号与链接。
 
-        async def windows():
-            raw = await self._vision_mcp_call("list_windows", {})
-            try: values = ast.literal_eval(raw)
-            except (ValueError, SyntaxError): values = []
-            return [item for item in values if str(item.get("process_name", "")).lower() in allowed and "ms-playwright" not in str(item.get("process_path", "")).lower()]
-
-        candidates = await windows()
-        if not candidates:
-            return {"error": "没有检测到现有浏览器窗口；为保护登录会话，未启动任何新浏览器"}
-        browser = next((item for item in candidates if any(word in str(item.get("title", "")).lower() for word in ("bilibili", "哔哩哔哩"))), candidates[0])
-        pid = int(browser.get("pid", 0)); title = str(browser.get("title", ""))
-
-        async def current_title():
-            current = await windows()
-            match = next((item for item in current if int(item.get("pid", 0)) == pid), None)
-            return str((match or browser).get("title", title))
-
-        async def current_address():
-            active_title = await current_title()
-            await self._vision_mcp_call("activate_window", {"title_contains": active_title})
-            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
-            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "c"]})
-            copied = ast.literal_eval(await self._vision_mcp_call("desktop_read_clipboard", {}))
-            await self._vision_mcp_call("desktop_hotkey", {"keys": ["esc"]})
-            return str(copied.get("text", "")).strip()
-
-        if status: status("正在读取现有浏览器中的 Bilibili 登录会话…")
-        await self._vision_mcp_call("activate_window", {"title_contains": title})
+        这是屏幕上看不到的账号数据；模型拿到结果后，用 web_navigate / ui_click_window
+        等视觉工具自行打开播放。本函数不点击、不编排任何界面（编排交给 LLM+视觉）。
+        mid 取自已保存的浏览器档案；首次需先在已登录浏览器打开一次 Bilibili 个人空间以记录。
+        """
         profile_path = HOME_AGENT / "state" / "browser-profiles.json"
-        try: profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {}
-        except (OSError, json.JSONDecodeError): profile = {}
-        stored_mid = str(profile.get("bilibili_mid", "")).strip()
-        address = await current_address(); uid_match = re.search(r"space\.bilibili\.com/(\d+)", address)
-        if not uid_match and stored_mid.isdigit(): uid_match = re.match(r"(\d+)", stored_mid)
-        if not uid_match:
-            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
-            await self._vision_mcp_call("desktop_type_active_text", {"text": "https://www.bilibili.com/", "clear": True})
-            await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]}); await asyncio.sleep(4)
-            title = await current_title()
-            if status: status("正在从已登录首页进入个人空间…")
-            avatar = ast.literal_eval(await asyncio.wait_for(self._vision_mcp_call("window_click", {"title_contains": title, "instruction": "Bilibili页面顶部已登录用户的头像或个人中心入口"}), timeout=90))
-            if not avatar.get("clicked"): return {"error": "无法从现有浏览器读取当前 Bilibili 用户空间"}
-            await asyncio.sleep(3); address = await current_address(); uid_match = re.search(r"space\.bilibili\.com/(\d+)", address)
-        if not uid_match: return {"error": "现有浏览器虽然打开了 Bilibili，但无法确认当前账户的用户空间地址"}
-        mid = uid_match.group(1)
-        profile_path.parent.mkdir(parents=True, exist_ok=True)
-        profile.update({"bilibili_mid": int(mid), "updated_at": datetime.now().isoformat(timespec="seconds")})
-        temporary = profile_path.with_suffix(".json.tmp"); temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8"); temporary.replace(profile_path)
-        if status: status(f"正在读取“{folder_name}”的准确数据顺序…")
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            profile = {}
+        mid = str(profile.get("bilibili_mid", "")).strip()
+        if not mid.isdigit():
+            return {"error": "未记录 Bilibili 用户 mid；请先让我在已登录的浏览器里打开一次 Bilibili 个人空间以自动记录"}
         headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://space.bilibili.com/{mid}/favlist"}
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
-                async with session.get(f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={mid}") as response:
-                    folders = await response.json(content_type=None)
-                folder_list = ((folders.get("data") or {}).get("list") or []) if folders.get("code") == 0 else []
-                requested = self._normalize_favorite_folder_name(folder_name)
-                default_folder, ranked_folders = self._resolve_favorite_folder(requested, folder_list)
-                if not default_folder:
-                    available = "、".join(str(item.get("title", "")).strip() for item in folder_list[:12] if str(item.get("title", "")).strip()) or "无"
-                    ranked = "、".join(f"{row['title']}({row['score']:.2f})" for row in ranked_folders[:3])
-                    raise RuntimeError(f"无法唯一匹配收藏夹“{requested}”；当前可用收藏夹：{available}；最接近：{ranked or '无'}")
-                folder_name = str(default_folder.get("title") or requested).strip()
-                page_number = (index - 1) // 20 + 1; page_index = (index - 1) % 20
-                media_id = int(default_folder["id"])
-                resource_url = f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={media_id}&pn={page_number}&ps=20&keyword=&order=mtime&type=0&tid=0&platform=web"
-                async with session.get(resource_url) as response:
-                    resources = await response.json(content_type=None)
-                medias = ((resources.get("data") or {}).get("medias") or []) if resources.get("code") == 0 else []
-                if page_index >= len(medias): raise RuntimeError(f"“{folder_name}”没有第 {index} 个视频")
-                media = medias[page_index]; bvid = str(media.get("bvid", "")).strip(); video_title = str(media.get("title", "")).strip()
-                if not re.fullmatch(r"BV[0-9A-Za-z]+", bvid): raise RuntimeError("收藏条目缺少有效 BV 号")
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
-            return {"error": f"读取默认收藏夹数据失败：{exc}"}
-        video_url = f"https://www.bilibili.com/video/{bvid}/?spm_id_from=333.1387.favlist.content.click"
-        existing_title = await current_title(); existing_address = await current_address()
-        if bvid.lower() in existing_address.lower() and video_title[:10].lower() in existing_title.lower():
-            result = {"ok": True, "answer": f"“{folder_name}”第 {index} 个视频已经在当前浏览器中打开：{video_title}。", "browser_pid": pid, "browser_process": browser.get("process_name"), "title": existing_title, "url": existing_address, "bvid": bvid, "favorite_folder": folder_name, "favorite_index": index, "order": "mtime", "used_existing_browser": True, "already_open": True}
-            self.log_event("existing_browser_favorite_completed", result=result); return result
-        if status: status(f"正在现有浏览器中打开“{folder_name}”第 {index} 个视频…")
-        previous_title = await current_title()
-        await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
-        await self._vision_mcp_call("desktop_type_active_text", {"text": video_url, "clear": True})
-        await asyncio.sleep(0.4); await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]})
+                async with session.get(f"https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={mid}") as r:
+                    folders = await r.json(content_type=None)
+            folder_list = ((folders.get("data") or {}).get("list") or []) if folders.get("code") == 0 else []
+            requested = self._normalize_favorite_folder_name(folder_name)
+            default_folder, _ranked = self._resolve_favorite_folder(requested, folder_list)
+            if not default_folder:
+                available = "、".join(str(i.get("title", "")).strip() for i in folder_list[:12] if str(i.get("title", "")).strip()) or "无"
+                return {"error": f"无法唯一匹配收藏夹“{requested}”；可用：{available}", "folders": [{"id": i.get("id"), "title": i.get("title")} for i in folder_list[:12]]}
+            media_id = int(default_folder["id"])
+            result: dict[str, Any] = {
+                "ok": True, "mid": int(mid),
+                "folder": {"id": media_id, "title": str(default_folder.get("title") or requested).strip()},
+                "folders": [{"id": i.get("id"), "title": i.get("title")} for i in folder_list],
+            }
+            if index is None:
+                return result
+            page = (index - 1) // 20 + 1; page_index = (index - 1) % 20
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), headers=headers) as session:
+                async with session.get(f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={media_id}&pn={page}&ps=20&keyword=&order=mtime&type=0&tid=0&platform=web") as r:
+                    resources = await r.json(content_type=None)
+            medias = ((resources.get("data") or {}).get("medias") or []) if resources.get("code") == 0 else []
+            if page_index >= len(medias):
+                return {"error": f"“{result['folder']['title']}”没有第 {index} 个视频", **result}
+            media = medias[page_index]
+            bvid = str(media.get("bvid", "")).strip()
+            return {**result, "index": index, "bvid": bvid, "title": str(media.get("title", "")).strip(),
+                    "url": f"https://www.bilibili.com/video/{bvid}/", "cover": str(media.get("cover", "")).strip()}
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            return {"error": f"读取 Bilibili 收藏夹失败：{exc}"}
 
-        async def verify_loaded(seconds: int):
-            deadline = time.monotonic() + seconds
-            while time.monotonic() < deadline:
-                active_title = await current_title()
-                title_changed = active_title != previous_title
-                title_matches = video_title[:10].lower() in active_title.lower() if len(video_title) >= 4 else title_changed
-                if title_changed and title_matches:
-                    active_address = await current_address()
-                    if bvid.lower() in active_address.lower(): return active_title, active_address
-                await asyncio.sleep(1)
-            return "", ""
+    async def netease_now_playing(self) -> dict[str, Any]:
+        """只读 getter：读取网易云音乐窗口标题（通常含当前在播歌曲名），作为视觉操作的辅助事实。"""
+        if not await asyncio.to_thread(self.ensure_vision_service, False):
+            return {"error": "视觉服务未就绪"}
+        raw = await self._vision_mcp_call("list_windows", {})
+        windows = self._safe_vision_literal(raw, [])
+        if not isinstance(windows, list): windows = []
+        for item in windows:
+            if not isinstance(item, dict): continue
+            if "cloudmusic" in str(item.get("process_name", "")).lower() or "网易云" in str(item.get("title", "")).lower():
+                return {"ok": True, "title": str(item.get("title", "")).strip(), "pid": int(item.get("pid", 0) or 0)}
+        return {"ok": True, "title": None, "note": "未检测到正在运行的网易云音乐窗口"}
 
-        final_title, final_address = await verify_loaded(12)
-        if not final_address:
-            # Some browsers leave a pasted URL pending in the address bar. Re-focus
-            # and commit once more before using a new tab in the same normal browser.
-            self.log_event("existing_browser_navigation_retry", bvid=bvid, strategy="commit_address_again")
-            await self._vision_mcp_call("activate_window", {"title_contains": await current_title()})
-            await self._vision_mcp_call("desktop_hotkey", {"keys": ["ctrl", "l"]})
-            await self._vision_mcp_call("desktop_type_active_text", {"text": video_url, "clear": True})
-            await asyncio.sleep(0.5); await self._vision_mcp_call("desktop_hotkey", {"keys": ["enter"]})
-            final_title, final_address = await verify_loaded(12)
-        if not final_address:
-            process_path = str(browser.get("process_path", ""))
-            if not process_path or not Path(process_path).is_file(): return {"error": f"地址栏导航未生效，且无法找到现有浏览器程序：{process_path}"}
-            self.log_event("existing_browser_navigation_retry", bvid=bvid, strategy="existing_browser_new_tab", process=process_path)
-            switch = "-new-tab" if str(browser.get("process_name")) == "firefox.exe" else "--new-tab"
-            subprocess.Popen([process_path, switch, video_url], creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            final_title, final_address = await verify_loaded(15)
-        if not final_address:
-            observed_title = await current_title(); observed_address = await current_address()
-            return {"error": f"浏览器没有真正切换到“{folder_name}”第 {index} 个视频。目标 {bvid}；当前标题：{observed_title}；当前地址：{observed_address}"}
-        result = {"ok": True, "answer": f"已经用你现有的浏览器账户打开“{folder_name}”第 {index} 个视频：{video_title}。", "browser_pid": pid, "browser_process": browser.get("process_name"), "title": final_title, "url": final_address, "bvid": bvid, "favorite_folder": folder_name, "favorite_index": index, "order": "mtime", "used_existing_browser": True}
-        self.log_event("existing_browser_favorite_completed", result=result)
-        return result
+    async def ui_learn(self, scope: str, finding: str, goal_hint: str = "") -> dict[str, Any]:
+        """把本次成功定位到的界面入口/元素位置/完整操作路径沉淀到经验知识库。
+
+        供下次同类任务直接复用（如「Bilibili 收藏夹=右上角头像→收藏」），
+        避免每次都从头试错。屏幕上看不到的账号数据不在此记录（用 getter 拿）。
+        """
+        if self.knowledge_base is None:
+            return {"ok": False, "recorded": False, "note": "知识库未启用，本次经验未记录"}
+        scope = str(scope or "").strip()
+        finding = str(finding or "").strip()
+        if not scope or not finding:
+            return {"ok": False, "recorded": False, "note": "scope 与 finding 不能为空"}
+        goal = (str(goal_hint or scope)).strip() or "UI 操作经验"
+        try:
+            self.knowledge_base.record_completed_task(
+                goal=goal,
+                plan={"domain": "ui_navigation", "steps": [f"{scope}：{finding}"]},
+                answer=finding,
+                success=True,
+            )
+            self.log_event("ui_knowledge_learned", scope=scope, finding=finding[:200], goal=goal[:120])
+            return {"ok": True, "recorded": True, "scope": scope, "finding": finding}
+        except Exception as exc:
+            self.log_event("ui_knowledge_learn_failed", error=str(exc))
+            return {"ok": False, "recorded": False, "note": f"记录失败：{exc}"}
 
     async def _natural_visual_failure(self, request: str, reason: str) -> str:
         """Generate only failure wording through the character LLM; keep it short for TTS."""
@@ -1599,7 +1746,7 @@ class HomeAgent:
         working_directory = project_path(str(cfg.get("working_directory", ".")))
         if not working_directory.is_dir():
             return {"error": f"Codex 工作目录不存在：{working_directory}"}
-        gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", False))
+        gui_enabled = bool(self.config.get("vision_mcp", {}).get("gui_enabled", True))
         plan = task_plan or self._analyze_task(task)
         self_code_task = bool(plan.get("domain") == "code" and plan.get("code_scope") == "self")
         code_task = bool(plan.get("domain") == "code")
@@ -1908,7 +2055,7 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "code_replace_text", "description": "在已读取文件中精确替换原文，适合小范围修改，找不到原文会失败。", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["path", "old", "new"]}}},
                 {"type": "function", "function": {"name": "code_validate_project", "description": "扫描当前代码变更并执行文件语法检查、git diff --check 静态检查和项目自动测试，返回变更、验证和测试结果。", "parameters": {"type": "object", "properties": {}}}},
             ]
-        if self.config.get("vision_mcp", {}).get("enabled", False):
+        if self.config.get("vision_mcp", {}).get("enabled", True):
             tools += [
                 {"type": "function", "function": {"name": "media_stop", "description": "向当前 Windows 媒体会话发送幂等停止播放命令，并返回系统操作结果。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "process_status", "description": "只读查询指定 Windows 进程是否正在运行。进程不存在也返回 ok=true、running=false，避免把查询命令的退出码误当成工具失败。", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "进程映像名，例如 cloudmusic.exe"}}, "required": ["name"]}}},
@@ -1917,7 +2064,8 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "ui_list_windows", "description": "读取当前可见窗口标题和进程，用于找到并验证目标程序以及媒体播放标题。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}}}},
                 {"type": "function", "function": {"name": "ui_activate_window", "description": "激活一个已经打开的窗口，不启动新浏览器。优先传 ui_list_windows 返回的 title；工具也兼容 hwnd、process_name 和 process_path。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string", "description": "优先使用窗口真实 title，也可使用 hwnd、进程名或完整进程路径"}}, "required": ["title_contains"]}}},
                 {"type": "function", "function": {"name": "ui_type_window", "description": "在指定原生窗口中按语义定位输入框并输入文字。原生程序必须优先使用本工具，避免焦点转移后把文字输入其他窗口。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "text": {"type": "string"}}, "required": ["title_contains", "target", "text"]}}},
-                {"type": "function", "function": {"name": "ui_click_window", "description": "在指定原生窗口中定位并单击目标。目标描述必须包含当前任务对象，不能用它代替播放指定搜索结果。失败重试时可用candidate_index切换视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
+                {"type": "function", "function": {"name": "ui_click_window", "description": "在指定窗口中定位并单击目标(文字/按钮)。优先按控件树文本精确定位(via=uia_text)，未命中才回退视觉截图。命中即零漂移，比全屏视觉点按稳得多。返回 via 字段可判断用了哪种方式。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string", "description": "目标按钮/链接的文字描述，例如『发布动态』『投稿』。能用看到的控件文字就用精确文字，越短越易命中"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
+                {"type": "function", "function": {"name": "ui_read_window", "description": "读取指定窗口当前可点的控件清单(文本+屏幕坐标)，可直接用于判断『哪个按钮在哪个位置』。网页与原生窗口返回 structure_readable=true；若为游戏/自绘全屏返回 structure_readable=false(无控件树只能靠视觉)。keywords 可按文字过滤只看候选目标。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "keywords": {"type": "string", "description": "可选，按文字过滤控件，例如『发布』『投稿』『动态』"}, "max_items": {"type": "integer", "minimum": 10, "maximum": 200}}, "required": ["title_contains"]}}},
                 {"type": "function", "function": {"name": "ui_double_click_window", "description": "在指定原生窗口中定位并双击目标，适合选择并播放搜索结果行。必须明确描述目标标题，禁止描述底部全局播放按钮。若标题未变化，用candidate_index 1或2重试其他视觉候选点。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
                 {"type": "function", "function": {"name": "ui_analyze_window", "description": "使用 MiMo 图像理解读取指定窗口当前画面并返回文字观察。搜索提交后、选择结果前以及最终验证时调用。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "question": {"type": "string"}}, "required": ["title_contains", "question"]}}},
                 {"type": "function", "function": {"name": "ui_hotkey", "description": "向当前活动窗口发送指定按键组合并返回操作结果。", "parameters": {"type": "object", "properties": {"keys": {"type": "array", "items": {"type": "string"}, "minItems": 1}}, "required": ["keys"]}}},
@@ -1928,6 +2076,9 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "web_click_text", "description": "按网页DOM中的可见文字点击结果或按钮。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "exact": {"type": "boolean"}}, "required": ["text"]}}},
                 {"type": "function", "function": {"name": "web_play_media", "description": "调用当前网页中第一个可播放的 audio 或 video 元素并返回操作结果。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "web_get_url", "description": "读取当前网页地址，用于验证导航和结果选择。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "bilibili_list_favorites", "description": "只读查询：返回你 Bilibili 账号的收藏夹列表，或某收藏夹第 N 个视频的 BV 号与播放链接（屏幕上看不到的账号数据）。模型拿到数据后用 web_navigate/ui_click_window 等视觉工具自行打开播放，本工具不点击任何界面。需要先打开过一次已登录 Bilibili 个人空间以记录 mid。", "parameters": {"type": "object", "properties": {"folder_name": {"type": "string", "description": "收藏夹名称，默认“默认收藏夹”"}, "index": {"type": "integer", "description": "可选；传入则额外返回该收藏夹第 N 个视频的 bvid 与 url"}}}}},
+                {"type": "function", "function": {"name": "netease_now_playing", "description": "只读查询：读取网易云音乐窗口标题（通常含当前在播歌曲名），作为视觉操作的辅助事实。不控制播放，模型据此用视觉工具点击播放/切歌。", "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {"name": "ui_learn", "description": "把本次成功定位到的界面入口、元素位置或完整操作路径沉淀到经验知识库，供下次同类任务直接复用，避免从头试错。例如成功在 Bilibili 找到收藏夹后，调用本工具记录『收藏夹入口=右上角头像→收藏，默认收藏夹第 3 个视频位于列表第 3 行』。scope 填应用/网站名，finding 填具体发现，goal_hint 填任务目标关键词便于检索。", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "作用域，如『Bilibili 网页』『网易云桌面端』"}, "finding": {"type": "string", "description": "具体 UI 发现，如『收藏夹入口在右上角头像菜单→收藏』"}, "goal_hint": {"type": "string", "description": "关联的任务目标关键词，便于检索，如『找收藏夹』『打开网易云』"}}, "required": ["scope", "finding"]}}},
             ]
         if self._codex_config().get("enabled", False):
             tools += [
@@ -2341,7 +2492,11 @@ class HomeAgent:
             return answer
         web_route = self._should_route_to_web(task_plan)
         vision_route = self._should_route_to_vision(task_plan)
-        self.log_event("route_selected", route="llm_tool_loop", web_route=web_route, vision_route=vision_route)
+        # 非操作类计划（闲聊/知识问答/direct_answer）不进入“带工具”的循环：
+        # 一旦挂上 tool_choice=auto，模型会空转调用 UI/视觉工具直到迭代上限
+        # （见日志 tool_round_limit_reached）。这类计划直接生成回答即可。
+        route = "direct_answer" if (not task_plan.get("actionable") and not code_task) else "llm_tool_loop"
+        self.log_event("route_selected", route=route, web_route=web_route, vision_route=vision_route)
         provider, key = self._provider(); llm_cfg = self.project["llm"]
         operation_contract = ""
         if task_plan.get("actionable"):
@@ -2355,6 +2510,21 @@ class HomeAgent:
                  "所有工具证据都带 task_submitted_at、tool_submitted_at、tool_completed_at 和 tool_sequence；判断状态时必须让较新的同对象证据覆盖旧证据。"
                  "Vision 的 vision_request_submitted_at/screenshot_captured_at 表示画面所属时刻，分析完成较晚时不得把旧画面当成当前状态。"
             )
+        if task_plan.get("actionable"):
+            operation_contract += (
+                "\n\n【网页/桌面操作铁律（视觉智能编排 + 自我纠错 + 自我学习，禁止写死流程）】\n"
+                "你负责根据截图自主完成“确认目标是否已存在→打开/复用→识别元素→点击/输入/播放→验证→学习”的整个闭环，本地代码不再硬编码流程。\n"
+                "（0）动手前先确认：用 ui_list_windows 看目标（如 bilibili、网易云）是否已经开在屏幕上。已在就 ui_activate_window 直接复用；不在才 web_navigate 直接输网址，或先 recall_knowledge 找历史已知入口，再不济用浏览器搜索该网站名称。不要一上来就猜 URL。\n"
+                "（1）永远复用用户已经打开的浏览器/软件窗口，绝不启动新浏览器或新进程来替代；找不到元素就换描述、换 candidate_index 或重新截图。\n"
+                "（2）每一步操作后靠 ui_analyze_screen/ui_analyze_window 看截图验证，不要靠读取剪贴板或地址栏文本判断成败。\n"
+                "（3）账号私有数据（Bilibili 收藏夹顺序、当前在播歌曲等）屏幕上看不到，先用只读 getter（bilibili_list_favorites / netease_now_playing）拿到事实，再据此用视觉工具导航；禁止凭空猜 URL 或曲名。\n"
+                "（4）容错重试：单步点错/未命中，先 ui_analyze_screen 重新确认当前界面，再换元素描述、换 candidate_index、换窗口或换搜索词重试；最多允许 4 次单步重试，且每次必须换不同策略，不要连续点同一处。总失败预算内不要过早放弃，也不要无脑硬点。\n"
+                "（5）自我学习：成功定位到关键 UI 元素（如『Bilibili 收藏夹=右上角头像→收藏』）或走通整条路径后，调用 ui_learn 把这条界面经验写入知识库（scope 填应用名、finding 填具体入口/位置、goal_hint 填任务关键词）。下次同类任务先 recall_knowledge 复用，不必从头试错。\n"
+                "（6）优先读结构、少用全屏猜点：网页/桌面原生窗口有控件树(DOM/UIA)，先把要点的按钮文字当 ui_click_window 的 target 或先用 ui_read_window 看目标窗口有哪些可点文字与坐标，命中即精确点击；只有在窗口 structure_readable=false(游戏/自绘全屏)时才靠 ui_analyze_screen/ui_analyze_window 视觉猜坐标。避免在可读结构的窗口上做全屏视觉点按导致点错或误触退出全屏。\n"
+                "（7）游戏/全屏护栏：若目标是全屏游戏画面，先判断该画面是否确实含要点的东西；绝不为了看画面先按 Esc/F11/退出全屏。需要鼠标能精确点对游戏内元素时仍可视觉点击，但每步都要截图验证，点错(如点到返回/全屏切换)就说明视觉未命中，改文字/换区域/切回窗口化再试，不要连续盲点。\n"
+            )
+            if prior_experience:
+                operation_contract += prior_experience + "\n（优先复用以上已验证经验中的界面入口与操作路径，必要时用 ui_learn 补充修正。）"
         if task_plan.get("actionable") and any(
             name in str(task_plan.get("preferred_tools") or [])
             for name in ("comfy_generate_image", "comfy_edit_image", "comfy_generate_video")
@@ -2407,260 +2577,263 @@ class HomeAgent:
             code_inspection_iterations = 0
             completion_check_failures = 0
             local_code_verified = False
-            max_failed_rounds = max(1, int(self.config["agent"].get("max_tool_rounds", 8)))
+            max_failed_rounds = max(1, int(self.config["agent"].get("max_tool_rounds", 12)))
             max_tool_iterations = max(max_failed_rounds, int(self.config["agent"].get("max_tool_iterations", max_failed_rounds * 4)))
             failed_rounds = 0
-        for round_index in range(max_tool_iterations):
-            if failed_rounds >= max_failed_rounds:
-                break
-            round_failed = False
-            # ---- 人类化改造：推进父子任务树进度并实时回报 ----
-            if self.task_tree is not None:
-                try:
-                    node = self.task_tree.begin_next_step()
-                    if node is not None:
-                        self._emit_activity(status, self.task_tree.progress_payload(f"进行中：{node.title}"), f"进行中：{node.title}")
-                        self._persist_task_tree(status, f"进行中：{node.title}")
-                except Exception as exc:
-                    self.log_event("task_tree_advance_failed", error=str(exc))
-                round_post_tool_instructions: list[str] = []
-                if status: status("正在思考…")
-                tuning = llm_cfg.get("home", {})
-                max_tokens = int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600)))
-                if getattr(self, "current_code_task", False):
-                    # 代码任务上下文大、工具结果长，600 token 输出必被截断成
-                    # finish_reason=length，导致反复拒绝重试；代码任务放大输出预算。
-                    max_tokens = max(max_tokens, int(self.config.get("agent", {}).get("code_max_tokens", 4096)))
-                payload = {"model": provider["model"], "messages": messages, "tools": self._tools(scoped=True), "tool_choice": "auto", "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
-                self._set_token_limit(payload, provider, max_tokens)
-                async with session.post(url, json=payload, headers=self._provider_headers(provider, key)) as response:
-                    raw = await response.text()
-                    if response.status >= 400: raise RuntimeError(f"LLM HTTP {response.status}: {raw[:600]}")
-                    response_data = json.loads(raw)
-                    response_choice = response_data["choices"][0]
-                    finish_reason = response_choice.get("finish_reason")
-                    choice = response_choice["message"]
-                if self._is_incomplete_model_response(finish_reason):
-                    failed_rounds += 1
-                    self.log_event("incomplete_model_response_rejected", finish_reason=finish_reason, round=round_index)
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            f"上一次响应因 finish_reason={finish_reason} 未完整生成，未执行其中任何工具。"
-                            "请缩短说明；若需要工具，只生成参数完整的结构化 tool_calls。"
-                        ),
-                    })
-                    continue
-                messages.append(choice)
-                calls = choice.get("tool_calls") or []
-                if not calls:
-                    answer = (choice.get("content") or "").strip()
-                    if self._contains_unexecuted_tool_markup(answer):
+            for round_index in range(max_tool_iterations):
+                if failed_rounds >= max_failed_rounds:
+                    break
+                round_failed = False
+                # ---- 人类化改造：推进父子任务树进度并实时回报 ----
+                if self.task_tree is not None:
+                    try:
+                        node = self.task_tree.begin_next_step()
+                        if node is not None:
+                            self._emit_activity(status, self.task_tree.progress_payload(f"进行中：{node.title}"), f"进行中：{node.title}")
+                            self._persist_task_tree(status, f"进行中：{node.title}")
+                    except Exception as exc:
+                        self.log_event("task_tree_advance_failed", error=str(exc))
+                    round_post_tool_instructions: list[str] = []
+                    if status: status("正在思考…")
+                    tuning = llm_cfg.get("home", {})
+                    max_tokens = int(tuning.get("max_tokens", llm_cfg.get("max_tokens", 600)))
+                    if getattr(self, "current_code_task", False):
+                        # 代码任务上下文大、工具结果长，600 token 输出必被截断成
+                        # finish_reason=length，导致反复拒绝重试；代码任务放大输出预算。
+                        max_tokens = max(max_tokens, int(self.config.get("agent", {}).get("code_max_tokens", 4096)))
+                    payload = {"model": provider["model"], "messages": messages, "temperature": tuning.get("temperature", llm_cfg.get("temperature", .7))}
+                    if task_plan.get("actionable"):
+                        payload["tools"] = self._tools(scoped=True)
+                        payload["tool_choice"] = "auto"
+                    self._set_token_limit(payload, provider, max_tokens)
+                    async with session.post(url, json=payload, headers=self._provider_headers(provider, key)) as response:
+                        raw = await response.text()
+                        if response.status >= 400: raise RuntimeError(f"LLM HTTP {response.status}: {raw[:600]}")
+                        response_data = json.loads(raw)
+                        response_choice = response_data["choices"][0]
+                        finish_reason = response_choice.get("finish_reason")
+                        choice = response_choice["message"]
+                    if self._is_incomplete_model_response(finish_reason):
                         failed_rounds += 1
-                        self.log_event("unexecuted_tool_markup_rejected", answer=answer, round=round_index)
+                        self.log_event("incomplete_model_response_rejected", finish_reason=finish_reason, round=round_index)
                         messages.append({
                             "role": "system",
                             "content": (
-                                "你刚才把工具调用写进了普通文本，因此它没有执行。禁止输出 <tool_call>、<function=> 或 "
-                                "<parameter=> 标签；请通过 API 的结构化 tool_calls 字段调用当前可用工具。"
+                                f"上一次响应因 finish_reason={finish_reason} 未完整生成，未执行其中任何工具。"
+                                "请缩短说明；若需要工具，只生成参数完整的结构化 tool_calls。"
                             ),
                         })
                         continue
-                    if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True) and not local_code_verified:
-                        failed_rounds += 1
-                        self.log_event("unverified_local_code_answer_rejected", answer=answer, round=round_index)
-                        messages.append({"role": "system", "content": "代码任务还没有通过本地验证。可继续调用 code_* 工具并运行 code_validate_project，或直接调用 Codex 完成编辑与测试；没有真实变更和 ok=true 的验证证据不得回答完成。"})
-                        continue
-                    if task_plan.get("actionable") and round_index == 0:
-                        failed_rounds += 1
-                        self.log_event("premature_answer_rejected", answer=answer, task_plan=task_plan)
-                        messages.append({"role": "system", "content": "这是需要实际执行的操作任务，但你尚未调用任何工具。不要只描述步骤或声称完成；立即选择合适工具执行，并在获得终态证据后回答。"})
-                        continue
-                    if created_task_result:
-                        task = created_task_result["task"]
-                        # 精确时间、任务 ID 和队列长度仅供内部状态同步，不能进入普通回复或 TTS。
-                        answer = f"好啦主人，{task['title']}已经设置好了。"
-                    if task_plan.get("actionable"):
-                        max_visual_age = float(
-                            self.config.get("mimo_multimodal", {}).get(
-                                "completion_visual_max_age_seconds", 45,
-                            )
-                        )
-                        verification_evidence, discarded_evidence = self._fresh_completion_evidence(
-                            completion_evidence,
-                            max_visual_age_seconds=max_visual_age,
-                        )
-                        if discarded_evidence:
-                            self.log_event(
-                                "stale_visual_evidence_discarded",
-                                discarded=[
-                                    {"tool": item["tool"], "reason": item["reason"]}
-                                    for item in discarded_evidence
-                                ],
-                            )
-                        try:
-                            verification = await self.mimo_multimodal.verify_completion(
-                                session, text, task_plan, answer, verification_evidence,
-                            )
-                        except Exception as exc:
-                            verification = {"passed": not bool(self.mimo_multimodal.config.get("fail_closed", True)), "reason": f"MiMo 完成检查不可用：{exc}", "next_action": "检查 MiMo 配置和网络后，继续收集本地终态证据"}
-                        self.log_event(
-                            "mimo_completion_check",
-                            result=verification,
-                            evidence_count=len(verification_evidence),
-                            discarded_evidence_count=len(discarded_evidence),
-                            round=round_index,
-                        )
-                        self._emit_activity(status, {
-                            "type": "verification",
-                            "title": "完成验证" + (" · 通过" if verification.get("passed") else " · 未通过"),
-                            "detail": self._activity_text(
-                                verification.get("reason")
-                                or ("已取得足够的完成证据" if verification.get("passed") else verification.get("next_action")),
-                                110,
-                            ),
-                            "state": "success" if verification.get("passed") else "failed",
-                        }, "完成检查已通过" if verification.get("passed") else "完成检查未通过")
-                        if not verification.get("passed"):
-                            completion_check_failures += 1
+                    messages.append(choice)
+                    calls = choice.get("tool_calls") or []
+                    if not calls:
+                        answer = (choice.get("content") or "").strip()
+                        if self._contains_unexecuted_tool_markup(answer):
                             failed_rounds += 1
-                            reason = str(verification.get("reason") or "完成证据不足")
-                            if status: status(f"完成检查未通过：{reason[:100]}；正在继续修正…")
-                            if completion_check_failures <= int(self.mimo_multimodal.config.get("completion_max_retries", 2)):
-                                messages.append({"role": "user", "content": f"独立完成检查未通过：{reason}\n建议下一步：{verification.get('next_action') or '重新观察并取得可验证的终态证据'}。请继续调用本地工具修正，不要重复口头声明。"})
-                                continue
-                            answer = f"任务执行后的独立检查仍未通过：{reason[:220]}。我没有把未验证的结果报告为完成。"
-                    self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
-                    if self.task_tree is not None:
+                            self.log_event("unexecuted_tool_markup_rejected", answer=answer, round=round_index)
+                            messages.append({
+                                "role": "system",
+                                "content": (
+                                    "你刚才把工具调用写进了普通文本，因此它没有执行。禁止输出 <tool_call>、<function=> 或 "
+                                    "<parameter=> 标签；请通过 API 的结构化 tool_calls 字段调用当前可用工具。"
+                                ),
+                            })
+                            continue
+                        if code_task and self.config.get("agent", {}).get("prefer_local_code_tools", True) and not local_code_verified:
+                            failed_rounds += 1
+                            self.log_event("unverified_local_code_answer_rejected", answer=answer, round=round_index)
+                            messages.append({"role": "system", "content": "代码任务还没有通过本地验证。可继续调用 code_* 工具并运行 code_validate_project，或直接调用 Codex 完成编辑与测试；没有真实变更和 ok=true 的验证证据不得回答完成。"})
+                            continue
+                        if task_plan.get("actionable") and round_index == 0:
+                            failed_rounds += 1
+                            self.log_event("premature_answer_rejected", answer=answer, task_plan=task_plan)
+                            messages.append({"role": "system", "content": "这是需要实际执行的操作任务，但你尚未调用任何工具。不要只描述步骤或声称完成；立即选择合适工具执行，并在获得终态证据后回答。"})
+                            continue
+                        if created_task_result:
+                            task = created_task_result["task"]
+                            # 精确时间、任务 ID 和队列长度仅供内部状态同步，不能进入普通回复或 TTS。
+                            answer = f"好啦主人，{task['title']}已经设置好了。"
+                        if task_plan.get("actionable"):
+                            max_visual_age = float(
+                                self.config.get("mimo_multimodal", {}).get(
+                                    "completion_visual_max_age_seconds", 45,
+                                )
+                            )
+                            verification_evidence, discarded_evidence = self._fresh_completion_evidence(
+                                completion_evidence,
+                                max_visual_age_seconds=max_visual_age,
+                            )
+                            if discarded_evidence:
+                                self.log_event(
+                                    "stale_visual_evidence_discarded",
+                                    discarded=[
+                                        {"tool": item["tool"], "reason": item["reason"]}
+                                        for item in discarded_evidence
+                                    ],
+                                )
+                            try:
+                                verification = await self.mimo_multimodal.verify_completion(
+                                    session, text, task_plan, answer, verification_evidence,
+                                )
+                            except Exception as exc:
+                                verification = {"passed": not bool(self.mimo_multimodal.config.get("fail_closed", True)), "reason": f"MiMo 完成检查不可用：{exc}", "next_action": "检查 MiMo 配置和网络后，继续收集本地终态证据"}
+                            self.log_event(
+                                "mimo_completion_check",
+                                result=verification,
+                                evidence_count=len(verification_evidence),
+                                discarded_evidence_count=len(discarded_evidence),
+                                round=round_index,
+                            )
+                            self._emit_activity(status, {
+                                "type": "verification",
+                                "title": "完成验证" + (" · 通过" if verification.get("passed") else " · 未通过"),
+                                "detail": self._activity_text(
+                                    verification.get("reason")
+                                    or ("已取得足够的完成证据" if verification.get("passed") else verification.get("next_action")),
+                                    110,
+                                ),
+                                "state": "success" if verification.get("passed") else "failed",
+                            }, "完成检查已通过" if verification.get("passed") else "完成检查未通过")
+                            if not verification.get("passed"):
+                                completion_check_failures += 1
+                                failed_rounds += 1
+                                reason = str(verification.get("reason") or "完成证据不足")
+                                if status: status(f"完成检查未通过：{reason[:100]}；正在继续修正…")
+                                if completion_check_failures <= int(self.mimo_multimodal.config.get("completion_max_retries", 2)):
+                                    messages.append({"role": "user", "content": f"独立完成检查未通过：{reason}\n建议下一步：{verification.get('next_action') or '重新观察并取得可验证的终态证据'}。请继续调用本地工具修正，不要重复口头声明。"})
+                                    continue
+                                answer = f"任务执行后的独立检查仍未通过：{reason[:220]}。我没有把未验证的结果报告为完成。"
+                        self.log_event("assistant_answer", answer=answer, tool_round_complete=True)
+                        if self.task_tree is not None:
+                            try:
+                                finished = self.task_tree.current_step()
+                                self.task_tree.complete_current_step()
+                                self.task_tree.complete_all()
+                                if finished is not None and self.progress_speech_enabled:
+                                    self.speech_pipeline.enqueue(f"已完成：{finished.title[:24]}")
+                                self._emit_activity(status, self.task_tree.progress_payload("任务完成"), "任务完成")
+                                self._persist_task_tree(status, "任务完成")
+                            except Exception as exc:
+                                self.log_event("task_tree_complete_failed", error=str(exc))
+                        self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
+                        self._publish_media(generated_media, media_ready)
+                        self._publish_answer(answer, answer_ready)
+                        if self.kb_enabled and self.knowledge_base is not None:
+                            try:
+                                self.knowledge_base.record_completed_task(goal=text, plan=task_plan, answer=answer, evidence=completion_evidence, success=True)
+                                self.log_event("knowledge_ingested", goal=text[:120])
+                            except Exception as exc:
+                                self.log_event("knowledge_ingest_failed", error=str(exc))
+                        if not long_term_stored:
+                            await self._maybe_remember_home(text, answer, session, provider, key)
+                        if self.config["home"].get("auto_speak", True) and answer and not singing_performed:
+                            await self._finish_speech(answer, status)
+                        await self._flush_speech()
+                        return answer
+                    for call in calls:
+                        tool_sequence += 1
+                        name = call["function"]["name"]
+                        post_tool_instruction = ""
                         try:
-                            finished = self.task_tree.current_step()
-                            self.task_tree.complete_current_step()
-                            self.task_tree.complete_all()
-                            if finished is not None and self.progress_speech_enabled:
-                                self.speech_pipeline.enqueue(f"已完成：{finished.title[:24]}")
-                            self._emit_activity(status, self.task_tree.progress_payload("任务完成"), "任务完成")
-                            self._persist_task_tree(status, "任务完成")
-                        except Exception as exc:
-                            self.log_event("task_tree_complete_failed", error=str(exc))
-                    self.history.append({"role": "assistant", "content": answer}); self.history = self.history[-max_context:]
-                    self._publish_media(generated_media, media_ready)
-                    self._publish_answer(answer, answer_ready)
-                    if self.kb_enabled and self.knowledge_base is not None:
+                            args = self._parse_tool_arguments(call["function"].get("arguments"))
+                        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                            round_failed = True
+                            failure_reason = f"工具参数不是合法 JSON 对象：{exc}"
+                            result = {"status": "failed", "tool": name, "error": failure_reason, "executed": False}
+                            completion_evidence.append({"tool": name, "result": result})
+                            tool_failures.append({"tool": name, "reason": failure_reason[:500]})
+                            self.log_event("tool_arguments_rejected", tool=name, error=failure_reason, round=round_index)
+                            if status: status(f"没有执行工具 {name}：参数不完整；正在要求模型重新生成…")
+                            messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
+                            continue
+                        display_name = self._tool_display_name(name)
+                        self._emit_activity(status, {
+                            "type": "tool_start", "title": display_name,
+                            "detail": self._tool_activity_arguments(name, args), "tool": name, "state": "running",
+                        }, f"正在执行：{display_name}")
+                        tool_submitted_at = _iso_now()
+                        tool_started = time.monotonic()
+                        self.log_event("tool_started", tool=name, arguments=args, sequence=tool_sequence, task_submitted_at=self.current_task_submitted_at, tool_submitted_at=tool_submitted_at)
                         try:
-                            self.knowledge_base.record_completed_task(goal=text, plan=task_plan, answer=answer, evidence=completion_evidence, success=True)
-                            self.log_event("knowledge_ingested", goal=text[:120])
+                            result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
                         except Exception as exc:
-                            self.log_event("knowledge_ingest_failed", error=str(exc))
-                    if not long_term_stored:
-                        await self._maybe_remember_home(text, answer, session, provider, key)
-                    if self.config["home"].get("auto_speak", True) and answer and not singing_performed:
-                        await self._finish_speech(answer, status)
-                    await self._flush_speech()
-                    return answer
-                for call in calls:
-                    tool_sequence += 1
-                    name = call["function"]["name"]
-                    post_tool_instruction = ""
-                    try:
-                        args = self._parse_tool_arguments(call["function"].get("arguments"))
-                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                        round_failed = True
-                        failure_reason = f"工具参数不是合法 JSON 对象：{exc}"
-                        result = {"status": "failed", "tool": name, "error": failure_reason, "executed": False}
+                            result = {
+                                "status": "failed", "tool": name,
+                                "error": f"工具执行异常：{str(exc)[:500]}", "executed": False,
+                            }
+                        if isinstance(result, dict):
+                            result.setdefault("task_submitted_at", self.current_task_submitted_at)
+                            result.setdefault("tool_submitted_at", tool_submitted_at)
+                            result.setdefault("tool_completed_at", _iso_now())
+                            result.setdefault("tool_elapsed_ms", int((time.monotonic() - tool_started) * 1000))
+                            result.setdefault("tool_sequence", tool_sequence)
+                            if isinstance(result.get("media"), list):
+                                for item in result["media"]:
+                                    if isinstance(item, dict) and item.get("path") and item.get("kind") in {"image", "video", "audio"}:
+                                        entry = {"path": str(item["path"]), "kind": str(item["kind"]), "caption": str(item.get("caption") or "")}
+                                        if entry not in generated_media:
+                                            generated_media.append(entry)
                         completion_evidence.append({"tool": name, "result": result})
-                        tool_failures.append({"tool": name, "reason": failure_reason[:500]})
-                        self.log_event("tool_arguments_rejected", tool=name, error=failure_reason, round=round_index)
-                        if status: status(f"没有执行工具 {name}：参数不完整；正在要求模型重新生成…")
+                        if isinstance(result, dict) and result.get("status") == "failed":
+                            round_failed = True
+                            failure_reason = str(result.get("error") or result.get("reason") or "未知原因")
+                            tool_failures.append({"tool": name, "reason": failure_reason[:500]})
+                            if status: status(f"步骤失败：{name}：{failure_reason[:120]}；正在判断重试方案…")
+                        elif isinstance(result, dict) and result.get("status") == "uncertain":
+                            round_failed = True
+                            uncertain_reason = str(result.get("warning") or "操作后画面没有明显变化")
+                            tool_failures.append({"tool": name, "reason": uncertain_reason[:500]})
+                            if status: status(f"操作尚未确认：{uncertain_reason[:120]}；正在重新识别或更换操作方式…")
+                        elif isinstance(result, dict) and result.get("status") == "stale":
+                            stale_reason = str(result.get("stale_reason") or "识别完成时画面已经变化")
+                            self.log_event("stale_vision_result_discarded", tool=name, reason=stale_reason)
+                            if status: status(f"识别结果已过期：{stale_reason[:100]}；正在重新读取…")
+                        if name == "create_scheduled_task" and isinstance(result, dict) and result.get("ok"):
+                            created_task_result = result
+                        if name == "sing_song" and isinstance(result, dict) and result.get("ok"):
+                            singing_performed = True
+                        if name == "long_term_memory" and str(args.get("action", "")) == "store" and isinstance(result, dict) and result.get("ok"):
+                            long_term_stored = True
+                        if name == "code_validate_project" and isinstance(result, dict) and result.get("ok") is True:
+                            local_code_verified = True
+                            if self.current_code_self_edit:
+                                self.current_code_verified = True
+                        if name == "codex_cli_task" and isinstance(result, dict) and result.get("ok") is True:
+                            validation = result.get("validation")
+                            tests = result.get("tests")
+                            local_code_verified = bool(
+                                isinstance(validation, dict)
+                                and validation.get("ok") is True
+                                and (tests is None or (isinstance(tests, dict) and tests.get("ok") is True))
+                            )
+                            if local_code_verified and self.current_code_self_edit:
+                                self.current_code_verified = True
+                        if code_task:
+                            if name in {"code_write_file", "code_replace_text"} and isinstance(result, dict) and result.get("ok"):
+                                code_inspection_iterations = 0
+                            elif name in {"code_list_files", "code_read_file", "code_search_text"}:
+                                code_inspection_iterations += 1
+                                if code_inspection_iterations == 8:
+                                    post_tool_instruction = "已经连续8次只读检查而没有编辑。请使用搜索结果的行号调用 code_read_file(start_line=行号附近)，随后立即 code_replace_text/code_write_file；禁止再次读取文件开头。"
+                                elif code_inspection_iterations >= 12:
+                                    round_failed = True
+                                    failure_reason = "本地代码工具连续12次只读检查且没有产生编辑，已停止无进展循环"
+                                    tool_failures.append({"tool": name, "reason": failure_reason})
+                                    post_tool_instruction = failure_reason + "。必须立即编辑并验证，或结束本地路径交给后备执行器。"
+                        self.log_event("tool_completed", tool=name, result=result)
+                        result_state = str(result.get("status") or "success") if isinstance(result, dict) else "success"
+                        self._emit_activity(status, {
+                            "type": "tool_failed" if result_state in {"failed", "uncertain"} else "tool_complete",
+                            "title": f"{display_name} · {'失败' if result_state == 'failed' else '待确认' if result_state == 'uncertain' else '完成'}",
+                            "detail": self._tool_activity_result(name, result), "tool": name, "state": result_state,
+                        }, f"已完成：{display_name}")
                         messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
-                        continue
-                    display_name = self._tool_display_name(name)
-                    self._emit_activity(status, {
-                        "type": "tool_start", "title": display_name,
-                        "detail": self._tool_activity_arguments(name, args), "tool": name, "state": "running",
-                    }, f"正在执行：{display_name}")
-                    tool_submitted_at = _iso_now()
-                    tool_started = time.monotonic()
-                    self.log_event("tool_started", tool=name, arguments=args, sequence=tool_sequence, task_submitted_at=self.current_task_submitted_at, tool_submitted_at=tool_submitted_at)
-                    try:
-                        result = self._normalize_tool_result(name, await self._run_tool(name, args, confirm, status))
-                    except Exception as exc:
-                        result = {
-                            "status": "failed", "tool": name,
-                            "error": f"工具执行异常：{str(exc)[:500]}", "executed": False,
-                        }
-                    if isinstance(result, dict):
-                        result.setdefault("task_submitted_at", self.current_task_submitted_at)
-                        result.setdefault("tool_submitted_at", tool_submitted_at)
-                        result.setdefault("tool_completed_at", _iso_now())
-                        result.setdefault("tool_elapsed_ms", int((time.monotonic() - tool_started) * 1000))
-                        result.setdefault("tool_sequence", tool_sequence)
-                        if isinstance(result.get("media"), list):
-                            for item in result["media"]:
-                                if isinstance(item, dict) and item.get("path") and item.get("kind") in {"image", "video", "audio"}:
-                                    entry = {"path": str(item["path"]), "kind": str(item["kind"]), "caption": str(item.get("caption") or "")}
-                                    if entry not in generated_media:
-                                        generated_media.append(entry)
-                    completion_evidence.append({"tool": name, "result": result})
-                    if isinstance(result, dict) and result.get("status") == "failed":
-                        round_failed = True
-                        failure_reason = str(result.get("error") or result.get("reason") or "未知原因")
-                        tool_failures.append({"tool": name, "reason": failure_reason[:500]})
-                        if status: status(f"步骤失败：{name}：{failure_reason[:120]}；正在判断重试方案…")
-                    elif isinstance(result, dict) and result.get("status") == "uncertain":
-                        round_failed = True
-                        uncertain_reason = str(result.get("warning") or "操作后画面没有明显变化")
-                        tool_failures.append({"tool": name, "reason": uncertain_reason[:500]})
-                        if status: status(f"操作尚未确认：{uncertain_reason[:120]}；正在重新识别或更换操作方式…")
-                    elif isinstance(result, dict) and result.get("status") == "stale":
-                        stale_reason = str(result.get("stale_reason") or "识别完成时画面已经变化")
-                        self.log_event("stale_vision_result_discarded", tool=name, reason=stale_reason)
-                        if status: status(f"识别结果已过期：{stale_reason[:100]}；正在重新读取…")
-                    if name == "create_scheduled_task" and isinstance(result, dict) and result.get("ok"):
-                        created_task_result = result
-                    if name == "sing_song" and isinstance(result, dict) and result.get("ok"):
-                        singing_performed = True
-                    if name == "long_term_memory" and str(args.get("action", "")) == "store" and isinstance(result, dict) and result.get("ok"):
-                        long_term_stored = True
-                    if name == "code_validate_project" and isinstance(result, dict) and result.get("ok") is True:
-                        local_code_verified = True
-                        if self.current_code_self_edit:
-                            self.current_code_verified = True
-                    if name == "codex_cli_task" and isinstance(result, dict) and result.get("ok") is True:
-                        validation = result.get("validation")
-                        tests = result.get("tests")
-                        local_code_verified = bool(
-                            isinstance(validation, dict)
-                            and validation.get("ok") is True
-                            and (tests is None or (isinstance(tests, dict) and tests.get("ok") is True))
-                        )
-                        if local_code_verified and self.current_code_self_edit:
-                            self.current_code_verified = True
-                    if code_task:
-                        if name in {"code_write_file", "code_replace_text"} and isinstance(result, dict) and result.get("ok"):
-                            code_inspection_iterations = 0
-                        elif name in {"code_list_files", "code_read_file", "code_search_text"}:
-                            code_inspection_iterations += 1
-                            if code_inspection_iterations == 8:
-                                post_tool_instruction = "已经连续8次只读检查而没有编辑。请使用搜索结果的行号调用 code_read_file(start_line=行号附近)，随后立即 code_replace_text/code_write_file；禁止再次读取文件开头。"
-                            elif code_inspection_iterations >= 12:
-                                round_failed = True
-                                failure_reason = "本地代码工具连续12次只读检查且没有产生编辑，已停止无进展循环"
-                                tool_failures.append({"tool": name, "reason": failure_reason})
-                                post_tool_instruction = failure_reason + "。必须立即编辑并验证，或结束本地路径交给后备执行器。"
-                    self.log_event("tool_completed", tool=name, result=result)
-                    result_state = str(result.get("status") or "success") if isinstance(result, dict) else "success"
-                    self._emit_activity(status, {
-                        "type": "tool_failed" if result_state in {"failed", "uncertain"} else "tool_complete",
-                        "title": f"{display_name} · {'失败' if result_state == 'failed' else '待确认' if result_state == 'uncertain' else '完成'}",
-                        "detail": self._tool_activity_result(name, result), "tool": name, "state": result_state,
-                    }, f"已完成：{display_name}")
-                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, ensure_ascii=False)})
-                    if post_tool_instruction:
-                        round_post_tool_instructions.append(post_tool_instruction)
-                for instruction in round_post_tool_instructions:
-                    messages.append({"role": "system", "content": instruction})
-                if round_failed:
-                    failed_rounds += 1
+                        if post_tool_instruction:
+                            round_post_tool_instructions.append(post_tool_instruction)
+                    for instruction in round_post_tool_instructions:
+                        messages.append({"role": "system", "content": instruction})
+                    if round_failed:
+                        failed_rounds += 1
         failure_summary = "；".join(f"{row['tool']}：{row['reason']}" for row in tool_failures[-6:])
         rounds = failed_rounds
         iteration_limit_reached = round_index + 1 >= max_tool_iterations and failed_rounds < max_failed_rounds
@@ -2846,13 +3019,18 @@ class HomeAgent:
             if str(args.get("voice", "")).strip(): command += ["--voice", str(args["voice"])]
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             proc = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=creationflags)
-            out, err = await proc.communicate()
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except ProcessLookupError: pass
+                return {"ok": False, "error": "MiMo 唱歌脚本执行超时（>180s）"}
             output = out.decode("utf-8", "replace").strip(); error = err.decode("utf-8", "replace").strip()
             try: result = json.loads(output.splitlines()[-1])
             except (json.JSONDecodeError, IndexError): result = {"ok": False, "error": error or output[-1000:] or "唱歌脚本没有返回结果"}
             return result
         if name == "ui_analyze_window":
-            if not self.config.get("vision_mcp", {}).get("enabled", False):
+            if not self.config.get("vision_mcp", {}).get("enabled", True):
                 return {"error": "窗口分析服务未启用"}
             title = str(args.get("title_contains", "")).strip()
             question = str(args.get("question", "")).strip()
@@ -2869,12 +3047,18 @@ class HomeAgent:
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, env=analysis_env,
             )
-            out, err = await proc.communicate()
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except ProcessLookupError: pass
+                return {"ok": False, "error": "窗口分析脚本执行超时（>120s）"}
             try: result = json.loads(out.decode("utf-8", "replace").splitlines()[-1])
             except (json.JSONDecodeError, IndexError): result = {"ok": False, "error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
             return result
         vision_tool_map = {
             "ui_inspect_target": ("inspect_active_target", lambda a: {}),
+            "ui_read_window": ("window_read_targets", lambda a: {"title_contains": str(a.get("title_contains", "")), "keywords": str(a.get("keywords", "")), "max_items": max(10, min(200, int(a.get("max_items", 80))))}),
             "ui_list_windows": ("list_windows", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
             "ui_activate_window": ("activate_window", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
             "ui_type_window": ("window_type_text", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "text": str(a.get("text", ""))}),
@@ -2922,6 +3106,19 @@ class HomeAgent:
                 return result
             except Exception as exc:
                 return {"error": str(exc), "executed_tool": tool_name}
+        if name == "bilibili_list_favorites":
+            return await self.bilibili_list_favorites(
+                str(args.get("folder_name", "默认收藏夹")),
+                int(args["index"]) if args.get("index") else None,
+            )
+        if name == "netease_now_playing":
+            return await self.netease_now_playing()
+        if name == "ui_learn":
+            return await self.ui_learn(
+                str(args.get("scope", "")),
+                str(args.get("finding", "")),
+                str(args.get("goal_hint", "")),
+            )
         if name == "codex_cli_task":
             return await self._run_codex_task(
                 str(args.get("task", "")), task_plan=getattr(self, "current_task_plan", None)
@@ -2956,7 +3153,12 @@ class HomeAgent:
             if args.get("reference"): cmd += ["--reference", str(args["reference"])]
             if args.get("set_primary"): cmd.append("--set-primary")
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            out, err = await proc.communicate()
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except ProcessLookupError: pass
+                return {"error": "角色图像生成脚本执行超时（>300s）"}
             if proc.returncode: return {"error": err.decode("utf-8", "replace")[-800:] or out.decode("utf-8", "replace")[-800:]}
             try: return json.loads(out.decode("utf-8").splitlines()[-1])
             except Exception: return {"output": out.decode("utf-8", "replace")[-1000:]}

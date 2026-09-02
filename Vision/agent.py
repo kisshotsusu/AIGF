@@ -126,6 +126,11 @@ _page = None
 _owns_browser = False
 _browser_source = "none"
 _SCREENSHOT_LOCK = threading.Lock()
+# 置顶 (HWND_TOPMOST) 状态: 记录当前被钉在最上层的窗口, 供显式置顶/解除。
+_ACTIVE_PIN_HWND = None
+# 每次桌面/窗口操作前是否强制把目标窗口抬到最上层, 保证点击像素命中目标而非被遮挡误触。
+# 默认开启; 置顶只在"操作瞬间"生效, 不长期占用最上层(避免打扰用户)。
+_RAISE_ON_OPERATE = os.environ.get("GUI_RAISE_ON_OPERATE", "1").strip().lower() not in ("0", "false", "no")
 # 视觉推理锁: torch generate 非线程安全, 且 _last_raw_output 是进程级共享。
 # MCP(多 session)/多线程同时调用 ground 时必须串行化, 避免并发生成崩坏或结果串扰。
 _INFERENCE_LOCK = threading.RLock()
@@ -884,12 +889,105 @@ def _find_window(title_contains: str):
     raise RuntimeError(f"window not found: {reference}; available titles: {available}")
 
 
+def _raise_window_above(window: dict) -> bool:
+    """把窗口可靠地抬到其它窗口之上、并争取拿到前台焦点。
+
+    Windows 会拦截非前台进程的 SetForegroundWindow(焦点窃取保护), 仅靠它常常抬不动被遮挡的窗口,
+    导致后续按屏幕坐标的点击落到上面那层 → 误操作。这里用 "闪现置顶(HWND_TOPMOST 亮一下再撤)"
+    强制把窗口调到 Z 序最前, 即使 SetForegroundWindow 被拒也能确保它可见在最上层。
+    返回是否成功拿到前台。
+    """
+    user32 = ctypes.windll.user32
+    hwnd = int(window["hwnd"])
+    SWP_NOSIZE = 0x0001; SWP_NOMOVE = 0x0002; SWP_SHOWWINDOW = 0x0040; SWP_NOACTIVATE = 0x0010
+    HWND_TOPMOST = -1; HWND_NOTOPMOST = -2
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        # 闪现置顶: TOPMOST 提升到最前, 再撤掉避免长期置顶占用。
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        user32.BringWindowToTop(hwnd)
+    except Exception:
+        pass
+    # 尽量拿前台; 拿不到也已在最上层, 点击坐标已可命中。
+    try:
+        user32.SetForegroundWindow(hwnd)
+        user32.SetActiveWindow(hwnd)
+    except Exception:
+        pass
+    time.sleep(0.35)
+    try:
+        return int(user32.GetForegroundWindow()) == hwnd
+    except Exception:
+        return False
+
+
+def _set_topmost(hwnd: int, enable: bool) -> bool:
+    """设置/解除窗口的持久置顶状态(HWND_TOPMOST)。返回操作是否成功。"""
+    user32 = ctypes.windll.user32
+    SWP_NOSIZE = 0x0001; SWP_NOMOVE = 0x0002; SWP_SHOWWINDOW = 0x0040; SWP_NOACTIVATE = 0x0010
+    flag = -1 if enable else -2  # HWND_TOPMOST / HWND_NOTOPMOST
+    try:
+        ok = bool(user32.SetWindowPos(hwnd, flag, 0, 0, 0, 0,
+                                      SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE))
+    except Exception:
+        ok = False
+    return ok
+
+
+def pin_window_topmost(title_contains: str, pin: bool = True) -> dict:
+    """把指定窗口显式置顶(始终显示在最上层)或解除置顶。
+
+    适合多步骤连续操作同一窗口(避免每步都要重新激活/反复确认窗口在最前,
+    直接削减中间检查步骤); 操作结束后应传 pin=False 解除, 避免长期遮挡用户。
+    返回当前置顶的窗口信息与置顶状态。
+    """
+    global _ACTIVE_PIN_HWND
+    window = _find_window(title_contains); hwnd = int(window["hwnd"])
+    if pin:
+        if _ACTIVE_PIN_HWND and _ACTIVE_PIN_HWND != hwnd:
+            _set_topmost(_ACTIVE_PIN_HWND, False)  # 先解除上一个, 避免多个窗口同时置顶打架
+        _set_topmost(hwnd, True)
+        _ACTIVE_PIN_HWND = hwnd
+    else:
+        if _ACTIVE_PIN_HWND == hwnd or title_contains:
+            _set_topmost(hwnd, False)
+            if _ACTIVE_PIN_HWND == hwnd:
+                _ACTIVE_PIN_HWND = None
+    return {"pinned": bool(pin), "topmost": _ACTIVE_PIN_HWND is not None,
+            "window": window, "next_action": None if pin else "已解除置顶, 窗口恢复普通层级"}
+
+
+def unpin_topmost() -> dict:
+    """解除当前所有置顶窗口, 让桌面恢复普通层级。"""
+    global _ACTIVE_PIN_HWND
+    if _ACTIVE_PIN_HWND:
+        _set_topmost(_ACTIVE_PIN_HWND, False)
+        _ACTIVE_PIN_HWND = None
+        return {"ok": True, "unpinned": True, "message": "已解除置顶"}
+    return {"ok": True, "unpinned": False, "message": "当前没有置顶窗口"}
+
+
 def activate_window(title_contains: str):
-    window = _find_window(title_contains); hwnd = window["hwnd"]
-    ctypes.windll.user32.ShowWindow(hwnd, 9)
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
-    time.sleep(0.4)
-    return {"activated": True, **window}
+    window = _find_window(title_contains)
+    got_fg = _raise_window_above(window)
+    return {"activated": True, "foreground": bool(got_fg), "note": None if got_fg else "已抬到最上层但未拿到前台焦点(仍可安全点击)", **window}
+
+
+def _ensure_raise_on_operate(window: dict) -> None:
+    """桌面/窗口操作落点前, 若配置开启, 再抬一次目标窗口确保它在最前不被遮挡。
+
+    截图与点击之间若有别的窗口弹出抢焦点, 会让后续屏幕坐标点击落到错误窗口(误操作)。
+    在真正发鼠标事件前补一次抬升, 命中率更高、事后也无需额外截图核对层级。
+    """
+    if _RAISE_ON_OPERATE and window and window.get("hwnd"):
+        try:
+            _raise_window_above(window)
+        except Exception:
+            pass
 
 
 def window_screenshot_pil(title_contains: str) -> Image.Image:
@@ -1114,6 +1212,7 @@ def window_text_click(title_contains: str, target: str, candidate_index: int = 0
     scored.sort(key=lambda x: (-x[0], x[1]["cy"], x[1]["cx"]))
     chosen = scored[min(candidate_index, len(scored) - 1)][1]
     px, py = chosen["cx"], chosen["cy"]
+    _ensure_raise_on_operate(window)  # 文本精确点击前也抬升, 杜绝被遮挡落错窗
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
@@ -1242,6 +1341,7 @@ def window_click(title_contains: str, instruction: str, topk: int = 3, idx: int 
     x, y = points[min(max(0, idx), len(points) - 1)]
     left, top, _, _ = window["bounds"]
     px = left + int(x * img.width); py = top + int(y * used_height)
+    _ensure_raise_on_operate(window)  # 点击前保证窗口在最前, 避免被遮挡点错
     ctypes.windll.user32.SetCursorPos(px, py)
     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
@@ -1261,6 +1361,7 @@ def window_double_click(title_contains: str, instruction: str, topk: int = 3, id
     x, y = points[min(max(0, idx), len(points) - 1)]
     left, top, _, _ = window["bounds"]
     px = left + int(x * img.width); py = top + int(y * used_height)
+    _ensure_raise_on_operate(window)  # 双击前保证窗口在最前, 避免双击落到上层窗口
     ctypes.windll.user32.SetCursorPos(px, py)
     for _ in range(2):
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)

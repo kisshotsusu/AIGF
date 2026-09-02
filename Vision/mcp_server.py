@@ -173,8 +173,24 @@ def list_windows(title_contains: str = "") -> str:
 
 @mcp.tool()
 def activate_window(title_contains: str) -> str:
-    """按标题关键词找到目标窗口，将其恢复并切换到前台。"""
+    """按标题关键词找到目标窗口，将其恢复、抬到最上层并切换到前台。"""
     return str(agent.activate_window(title_contains))
+
+
+@mcp.tool()
+def pin_window_topmost(title_contains: str, pin: bool = True) -> str:
+    """把指定窗口显式置顶(始终显示在最上层)或解除置顶。
+
+    适合多步连续操作同一窗口时先置顶一次: 该窗口持续在最前、不被其它窗口遮挡,
+    后续点击/输入无需每步重新激活核对, 减少中间检查; 任务结束后传 pin=False 解除。
+    """
+    return str(agent.pin_window_topmost(title_contains, pin))
+
+
+@mcp.tool()
+def unpin_topmost() -> str:
+    """解除当前所有置顶窗口, 让桌面恢复普通窗口层级。"""
+    return str(agent.unpin_topmost())
 
 
 @mcp.tool()

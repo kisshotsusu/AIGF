@@ -837,7 +837,7 @@ class HomeAgent:
                 "preferred_tools(工具名字符串数组), required_capabilities(能力字符串数组), steps(字符串数组；执行动作后必须包含重新观察并验证终态), "
                 "needs_clarification, clarification_question, final_action_requires_verification(是否要求播放/提交等终态), "
                 "success_criteria, confidence(0到1), reasoning_short。工具可从ui_analyze_screen/ui_inspect_target/web_read/web_fill/web_click_text/"
-                "ui_list_windows/ui_activate_window/ui_analyze_window/ui_click_window/ui_double_click_window/ui_type_window/ui_hotkey/ui_type_active_text/"
+                "ui_list_windows/ui_activate_window/ui_pin_topmost/ui_unpin_topmost/ui_analyze_window/ui_click_window/ui_double_click_window/ui_type_window/ui_hotkey/ui_type_active_text/"
                 "launch_app/media_stop/clear_live_context/list_character_images/analyze_image/comfy_status/comfy_list_models/"
                 "comfy_generate_image/comfy_edit_image/comfy_generate_video/qwen_analyze_video/video_cut_segments/"
                 "video_concat_segments/video_add_subtitles/video_generate_voiceover/edge_status/edge_open_url/"
@@ -1104,6 +1104,7 @@ class HomeAgent:
     def _tool_display_name(name: str) -> str:
         labels = {
             "ui_list_windows": "读取可见窗口", "ui_activate_window": "激活目标窗口",
+            "ui_pin_topmost": "置顶目标窗口", "ui_unpin_topmost": "解除窗口置顶",
             "ui_analyze_window": "识别窗口画面", "ui_analyze_screen": "识别当前屏幕",
             "ui_click_window": "点击界面目标", "ui_double_click_window": "双击界面目标",
             "ui_read_window": "读取窗口控件", "ui_inspect_target": "识别目标通道",
@@ -1131,7 +1132,7 @@ class HomeAgent:
         "ui_click_window", "ui_double_click_window", "ui_type_window",
         "ui_type_active_text", "ui_hotkey", "media_stop", "launch_app",
         "terminate_process", "web_navigate", "web_fill", "web_click_text",
-        "web_play_media",
+        "web_play_media", "ui_pin_topmost", "ui_unpin_topmost",
     })
 
     @staticmethod
@@ -2081,6 +2082,8 @@ class HomeAgent:
                 {"type": "function", "function": {"name": "ui_inspect_target", "description": "返回当前活动目标以及可用的 DOM、窗口视觉和桌面视觉通道。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "ui_list_windows", "description": "读取当前可见窗口标题和进程，用于找到并验证目标程序以及媒体播放标题。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}}}}},
                 {"type": "function", "function": {"name": "ui_activate_window", "description": "激活一个已经打开的窗口，不启动新浏览器。优先传 ui_list_windows 返回的 title；工具也兼容 hwnd、process_name 和 process_path。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string", "description": "优先使用窗口真实 title，也可使用 hwnd、进程名或完整进程路径"}}, "required": ["title_contains"]}}},
+                {"type": "function", "function": {"name": "ui_pin_topmost", "description": "把指定窗口显式置顶(始终显示在最上层)。适合要对同一个窗口连续执行多步点击/输入前调用一次：窗口被钉在最前不被遮挡，后续操作无需每步重新激活或截图核对层级，直接减少中间检查步骤。任务对该窗口操作完后记得调 ui_unpin_topmost 解除，避免长期遮挡用户。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string", "description": "要置顶的窗口标题关键词"}, "pin": {"type": "boolean", "description": "true=置顶；false=解除该窗口置顶"}}, "required": ["title_contains"]}}},
+                {"type": "function", "function": {"name": "ui_unpin_topmost", "description": "解除当前所有被置顶的窗口，让桌面恢复普通窗口层级。窗口连续操作结束后调用，避免目标窗口长期遮挡其它应用。", "parameters": {"type": "object", "properties": {}}}},
                 {"type": "function", "function": {"name": "ui_type_window", "description": "在指定原生窗口中按语义定位输入框并输入文字。原生程序必须优先使用本工具，避免焦点转移后把文字输入其他窗口。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string"}, "text": {"type": "string"}}, "required": ["title_contains", "target", "text"]}}},
                 {"type": "function", "function": {"name": "ui_click_window", "description": "在指定窗口中定位并单击目标(文字/按钮)。优先按控件树文本精确定位(via=uia_text)，未命中才回退视觉截图。命中即零漂移，比全屏视觉点按稳得多。返回 via 字段可判断用了哪种方式。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "target": {"type": "string", "description": "目标按钮/链接的文字描述，例如『发布动态』『投稿』。能用看到的控件文字就用精确文字，越短越易命中"}, "candidate_index": {"type": "integer", "minimum": 0, "maximum": 2}}, "required": ["title_contains", "target"]}}},
                 {"type": "function", "function": {"name": "ui_read_window", "description": "读取指定窗口当前可点的控件清单(文本+屏幕坐标)，可直接用于判断『哪个按钮在哪个位置』。网页与原生窗口返回 structure_readable=true；若为游戏/自绘全屏返回 structure_readable=false(无控件树只能靠视觉)。keywords 可按文字过滤只看候选目标。", "parameters": {"type": "object", "properties": {"title_contains": {"type": "string"}, "keywords": {"type": "string", "description": "可选，按文字过滤控件，例如『发布』『投稿』『动态』"}, "max_items": {"type": "integer", "minimum": 10, "maximum": 200}}, "required": ["title_contains"]}}},
@@ -2534,7 +2537,7 @@ class HomeAgent:
                 "你负责根据截图自主完成“确认目标是否已存在→打开/复用→识别元素→点击/输入/播放→验证→学习”的整个闭环，本地代码不再硬编码流程。\n"
                 "（0）动手前先确认：用 ui_list_windows 看目标（如 bilibili、网易云）是否已经开在屏幕上。已在就 ui_activate_window 直接复用；不在才 web_navigate 直接输网址，或先 recall_knowledge 找历史已知入口，再不济用浏览器搜索该网站名称。不要一上来就猜 URL。\n"
                 "（1）永远复用用户已经打开的浏览器/软件窗口，绝不启动新浏览器或新进程来替代；找不到元素就换描述、换 candidate_index 或重新截图。\n"
-                "（2）每一步操作后靠 ui_analyze_screen/ui_analyze_window 看截图验证，不要靠读取剪贴板或地址栏文本判断成败。\n"
+                "（2）每一步操作后靠 ui_analyze_screen/ui_analyze_window 看截图验证，不要靠读取剪贴板或地址栏文本判断成败。对同一个窗口要连续做多步点击/输入时，先 ui_pin_topmost 把它钉在最上层一次：此后该窗口一直最前、不被遮挡，中间无需反复 ui_list_windows/ui_activate_window 重新定位或截图核对层级，能显著减少检查步数与误点风险；做完这批操作再 ui_unpin_topmost 解除。\n"
                 "（3）账号私有数据（Bilibili 收藏夹顺序、当前在播歌曲等）屏幕上看不到，先用只读 getter（bilibili_list_favorites / netease_now_playing）拿到事实，再据此用视觉工具导航；禁止凭空猜 URL 或曲名。\n"
                 "（4）容错重试：单步点错/未命中，先 ui_analyze_screen 重新确认当前界面，再换元素描述、换 candidate_index、换窗口或换搜索词重试；最多允许 4 次单步重试，且每次必须换不同策略，不要连续点同一处。总失败预算内不要过早放弃，也不要无脑硬点。\n"
                 "（5）自我学习：成功定位到关键 UI 元素（如『Bilibili 收藏夹=右上角头像→收藏』）或走通整条路径后，调用 ui_learn 把这条界面经验写入知识库（scope 填应用名、finding 填具体入口/位置、goal_hint 填任务关键词）。下次同类任务先 recall_knowledge 复用，不必从头试错。\n"
@@ -3079,6 +3082,8 @@ class HomeAgent:
             "ui_read_window": ("window_read_targets", lambda a: {"title_contains": str(a.get("title_contains", "")), "keywords": str(a.get("keywords", "")), "max_items": max(10, min(200, int(a.get("max_items", 80))))}),
             "ui_list_windows": ("list_windows", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
             "ui_activate_window": ("activate_window", lambda a: {"title_contains": str(a.get("title_contains", ""))}),
+            "ui_pin_topmost": ("pin_window_topmost", lambda a: {"title_contains": str(a.get("title_contains", "")), "pin": bool(a.get("pin", True))}),
+            "ui_unpin_topmost": ("unpin_topmost", lambda a: {}),
             "ui_type_window": ("window_type_text", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "text": str(a.get("text", ""))}),
             "ui_click_window": ("window_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "topk": 3, "idx": max(0, min(2, int(a.get("candidate_index", 0))))}),
             "ui_double_click_window": ("window_double_click", lambda a: {"title_contains": str(a.get("title_contains", "")), "instruction": str(a.get("target", "")), "topk": 3, "idx": max(0, min(2, int(a.get("candidate_index", 0))))}),

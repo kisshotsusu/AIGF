@@ -1443,6 +1443,30 @@ class CareMessagePopup(QFrame):
         self.hide_timer.start(max(3, int(duration_seconds)) * 1000)
 
 
+class _ModelServiceWorker(QThread):
+    """Run the blocking GPU release/restore off the GUI thread; marshal result back via signal."""
+    op_done = Signal(bool, str)   # ok, summary
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+        self.op_kind = ""
+        self.ok = False
+        self.summary = ""
+
+    def run(self):
+        try:
+            result = self.fn()          # dict[str, str]
+            if isinstance(result, dict):
+                self.summary = " · ".join(f"{k}={v}" for k, v in result.items())
+            else:
+                self.summary = str(result)
+            self.ok = True
+        except Exception as exc:        # pragma: no cover - defensive
+            self.ok = False
+            self.summary = f"{type(exc).__name__}: {exc}"
+
+
 class DesktopPetWindow(QWidget):
     """Transparent always-on-top launcher that restores the original desktop-pet workflow."""
     def __init__(self, chat: HomeAgentWindow):
@@ -1456,13 +1480,64 @@ class DesktopPetWindow(QWidget):
         if image_path.exists(): self.image.setPixmap(QPixmap(str(image_path)).scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else: self.image.setText("◉‿◉"); self.image.setStyleSheet("font-size:42px;color:#16766F;background:#E7F4F1;border-radius:70px;")
         self.menu = QMenu(self)
-        self.menu.addAction("打开对话", self.toggle_chat); self.menu.addAction("停止当前任务", chat.stop_task); self.menu.addSeparator(); self.menu.addAction("日志与上下文", chat.open_inspector); self.menu.addAction("设置", chat.open_settings); self.menu.addSeparator(); self.menu.addAction("退出 Home Agent", self.quit_agent)
+        self.menu.addAction("打开对话", self.toggle_chat); self.menu.addAction("停止当前任务", chat.stop_task); self.menu.addSeparator(); self.menu.addAction("日志与上下文", chat.open_inspector); self.menu.addAction("设置", chat.open_settings); self.menu.addSeparator(); self.menu.addAction("释放显存给游戏", self._release_gpu_models); self.menu.addAction("恢复 AI 模型", self._restore_ai_services); self.menu.addSeparator(); self.menu.addAction("退出 Home Agent", self.quit_agent)
+        self._model_op_thread = None
         self.care_popup = CareMessagePopup()
         self.restore_position()
 
     def show_care_message(self, message: str):
         duration = int(self.chat.agent.config.get("screen_care", {}).get("popup_duration_seconds", 12))
         self.care_popup.show_message(message, self, duration)
+
+    def _run_model_op(self, fn, op_kind: str, confirm_title: str, confirm_msg: str, busy_label: str) -> None:
+        """Run a blocking agent model-service operation on a background QThread."""
+        if self._model_op_thread is not None and self._model_op_thread.isRunning():
+            QMessageBox.information(self, "正在进行", "上一个模型操作尚未完成，请稍候。")
+            return
+        if confirm_title and QMessageBox.question(self, confirm_title, confirm_msg,
+                                                  QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        worker = _ModelServiceWorker(fn, self)
+        worker.op_kind = op_kind
+        self._model_op_thread = worker
+        worker.op_done.connect(self._on_model_op_done)
+        self.show_care_message(busy_label)
+        worker.start()
+
+    def _release_gpu_models(self) -> None:
+        self._run_model_op(
+            lambda: self.chat.agent.release_gpu_models(),
+            "release",
+            "释放显存给游戏？",
+            "将停止 视觉(GUI-Owl) + 语音识别(SenseVoice) + 语音合成(GPT-SoVITS)，\n"
+            "为游戏让出显存。释放后如需恢复请点“恢复 AI 模型”。\n\n确定释放吗？",
+            "正在释放模型并让出显存…",
+        )
+
+    def _restore_ai_services(self) -> None:
+        # ASR 阻塞拉起；Vision 预载 / GPT-SoVITS 较慢，置后台以快速返回，结果走信号与日志。
+        self._run_model_op(
+            lambda: self.chat.agent.restore_ai_services(wait_sound=True, wait_vision=False, wait_tts=False),
+            "restore",
+            "",
+            "",
+            "正在恢复 AI 模型（视觉与语音后台加载，稍后可用）…",
+        )
+
+    def _on_model_op_done(self, ok: bool, summary: str) -> None:
+        self._model_op_thread = None
+        kind = getattr(self.sender(), "op_kind", "") if self.sender() else ""
+        if kind == "release":
+            head = "✅ 显存已释放，可以开游戏了" if ok else "❌ 释放失败"
+        elif kind == "restore":
+            head = "✅ 恢复已启动（视觉/语音后台加载中）" if ok else "❌ 恢复失败"
+        else:
+            head = "模型操作完成"
+        self.show_care_message(f"{head}\n{summary}")
+        try:
+            self.chat.agent.log_event("model_op_done", op=kind, ok=ok, summary=summary[:400])
+        except Exception:
+            pass
 
     def restore_position(self):
         cfg = self.chat.agent.config.get("desktop_pet", {}); screen = QApplication.primaryScreen().availableGeometry()

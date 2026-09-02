@@ -149,6 +149,10 @@ class HomeAgent:
         self.vision_service_lock = threading.Lock()
         self.sound_service_process: subprocess.Popen | None = None
         self.sound_service_lock = threading.Lock()
+        # --- GPU 显存让出给游戏：置位后 ensure_*/TTS 不再自动拉起模型服务，
+        #     由托盘"恢复 AI 模型"清位并显式重启。避免释放后任务里一调用又冷启动占回显存。 ---
+        self._gpu_released = False
+        self._gpu_release_lock = threading.Lock()
         # --- 常驻 vision MCP 桥：复用到 8765 的长连接，避免每次工具调用冷启动子进程 ---
         # bridge 子进程(venv python + mcp)持有 ClientSession，通过 stdio JSON-lines 通信。
         # 锁均在首次 async 调用时惰性创建并绑定到共享事件循环。
@@ -1258,11 +1262,13 @@ class HomeAgent:
         return str(finish_reason or "").strip().lower() in {"length", "content_filter", "repetition_truncation"}
 
     def ensure_vision_service(self, wait_until_ready: bool = False) -> bool:
+        if self._gpu_released: return False  # 已为游戏让出显存，禁止自动拉起视觉模型
         with self.vision_service_lock:
             return self._ensure_vision_service_unlocked(wait_until_ready)
 
     def ensure_sound_service(self, wait_until_ready: bool = False) -> bool:
         """Keep the local SenseVoice HTTP MCP alive; model loading remains lazy."""
+        if self._gpu_released: return False  # 已为游戏让出显存，禁止自动拉起语音识别模型
         cfg = self.config.get("stt", {})
         if cfg.get("mode") != "sound_mcp" or not cfg.get("auto_start", True): return False
         host = str(cfg.get("mcp_host", "127.0.0.1")); port = int(cfg.get("mcp_port", 8766))
@@ -1298,6 +1304,174 @@ class HomeAgent:
                 if self.sound_service_process.poll() is not None: return False
                 time.sleep(0.5)
             return False
+
+    # ------------------------------------------------------------------ #
+    #  显存让出(给游戏) / 恢复：视觉 GUI-Owl + SenseVoice ASR + GPT-SoVITS  #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _kill_process_tree(pid: int) -> bool:
+        """Kill a process tree on Windows via taskkill /T /F; graceful on other OS."""
+        if not pid: return False
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                os.kill(pid, 9)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _find_pid_by_port(port: int) -> int | None:
+        """Return the PID listening on a TCP port (Windows netstat or Linux ss/lsof)."""
+        try:
+            if os.name == "nt":
+                # netstat 在中文系统用本地代码页(GBK)输出，需按字节取并容错解码，勿用 text=True。
+                raw = subprocess.run(["netstat", "-ano"], capture_output=True, timeout=10).stdout
+                out = raw.decode("gbk", errors="ignore")
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[0] in {"TCP", "UDP"}:
+                        try:
+                            local = parts[1].rsplit(":", 1)[-1]
+                            if local == str(port): return int(parts[-1])
+                        except ValueError:
+                            continue
+            else:
+                out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10).stdout
+                for line in out.splitlines():
+                    if f":{port} " in line or f":{port}\t" in line:
+                        m = re.search(r"pid=(\d+)", line)
+                        if m: return int(m.group(1))
+        except Exception:
+            pass
+        return None
+
+    def _stop_service(self, process: subprocess.Popen | None, *, port: int,
+                      clear_attr: str, name: str) -> str:
+        """Terminate a model service: prefer the spawned Popen handle, else find PID by port."""
+        outcome = "stopped(none)"
+        if process is not None and process.poll() is None:
+            ok = self._kill_process_tree(process.pid)
+            try: process.wait(timeout=5)
+            except Exception: pass
+            outcome = "stopped(handle)" if ok else "kill_failed(handle)"
+        else:
+            pid = self._find_pid_by_port(port)
+            if pid:
+                ok = self._kill_process_tree(pid)
+                outcome = f"stopped(port:{port},pid:{pid})" if ok else f"kill_failed(port:{port},pid:{pid})"
+            else:
+                outcome = "not_running"
+        try: setattr(self, clear_attr, None)
+        except Exception: pass
+        self.log_event("model_service_released", service=name, port=port, outcome=outcome)
+        return outcome
+
+    async def _restore_tts_async(self) -> str:
+        """Launch GPT-SoVITS via TTSClient.ensure_service (uses config start_command)."""
+        if self._gpu_released: return "blocked(gpu_released)"
+        try:
+            async with aiohttp.ClientSession() as session:
+                client = TTSClient(session, self.project["tts"], ROOT / "audio")
+                options = await client.ensure_service()
+                if options is None: return "not_configured_or_down"
+                self.log_event("model_service_restored", service="gpt_sovits", ok=True)
+                return "started(gpt_sovits)"
+        except Exception as exc:
+            self.log_event("model_service_restore_failed", service="gpt_sovits", error=str(exc)[:300])
+            return f"failed({str(exc)[:120]})"
+
+    def gpu_models_released(self) -> bool:
+        return bool(self._gpu_released)
+
+    def release_gpu_models(self) -> dict[str, str]:
+        """Release GPU memory for games: stop Vision GUI-Owl, SenseVoice ASR, GPT-SoVITS TTS."""
+        with self._gpu_release_lock:
+            self._gpu_released = True
+            report: dict[str, str] = {}
+            # 1) stop local speech pipeline so nothing re-queues GPU TTS
+            try:
+                if getattr(self, "speech_pipeline", None) is not None:
+                    self.speech_pipeline.stop()
+                report["speech_pipeline"] = "stopped"
+            except Exception as exc:
+                report["speech_pipeline"] = f"error:{str(exc)[:80]}"
+            # 2) drop the vision MCP bridge child (keeps a live socket to 8765)
+            try:
+                if getattr(self, "_kill_vision_bridge", None) is not None:
+                    self._vision_bridge_proc = None
+                report["vision_bridge"] = "cleared"
+            except Exception:
+                report["vision_bridge"] = "clear_failed"
+            # 3) terminate model services
+            # GPT-SoVITS：api_v2(GPU) 在 9880，其父 app.py 代理在 url/health 端口(9879)。
+            # 先按 9879 杀整树(连带子进程 api_v2)，若还残留再按 9880 兜底杀。
+            tts_port = self._tts_service_port()
+            report["gpt_sovits"] = "no_port_configured"
+            if tts_port:
+                report["gpt_sovits"] = self._stop_service(
+                    None, port=tts_port, clear_attr="_unused", name="gpt_sovits")
+            if tts_port not in (None, 9880) and self._find_pid_by_port(9880):
+                extra = self._stop_service(None, port=9880, clear_attr="_unused", name="gpt_sovits_api_v2")
+                report["gpt_sovits"] = f"{report['gpt_sovits']};api_v2={extra}"
+            report["sound_asr"] = self._stop_service(
+                self.sound_service_process, port=int(self.config.get("stt", {}).get("mcp_port", 8766)),
+                clear_attr="sound_service_process", name="sound_asr")
+            report["vision"] = self._stop_service(
+                self.vision_service_process, port=int(self.config.get("vision_mcp", {}).get("port", 8765)),
+                clear_attr="vision_service_process", name="vision")
+            self.log_event("gpu_models_released", report=report)
+            return report
+
+    def _tts_service_port(self) -> int | None:
+        """Return the GPT-SoVITS listen port (9879), from url or health_url in tts config."""
+        tts = self.project.get("tts", {})
+        for key in ("url", "health_url"):
+            raw = str(tts.get(key) or "")
+            m = re.search(r":(\d{2,5})", raw)
+            if m: return int(m.group(1))
+        return None
+
+    def restore_ai_services(self, *, wait_vision: bool = True,
+                            wait_sound: bool = True, wait_tts: bool = True) -> dict[str, str]:
+        """Reload released models: SenseVoice ASR, Vision GUI-Owl, GPT-SoVITS TTS (in background for slow ones)."""
+        with self._gpu_release_lock:
+            self._gpu_released = False
+        report: dict[str, str] = {}
+        # Vision 与 GPT-SoVITS 加载较慢且都吃显存，改为后台线程逐个拉起，方法立即返回；
+        # 结果通过 log_event 上报。ASR 快，直接同步确保。
+        if wait_sound:
+            ok = self.ensure_sound_service(True)
+            report["sound_asr"] = "started" if ok else ("skipped_not_enabled" if not self.config.get("stt", {}).get("auto_start", True) else "start_failed")
+        else:
+            threading.Thread(target=lambda: self.ensure_sound_service(True), daemon=True,
+                             name="restore-sound").start()
+            report["sound_asr"] = "starting_bg"
+        # 后台拉起 vision（model preload 慢，勿阻塞托盘线程太久）
+        if wait_vision:
+            ok = self.ensure_vision_service(True)
+            report["vision"] = "started" if ok else "start_failed_or_disabled"
+        else:
+            threading.Thread(target=lambda: self.ensure_vision_service(True), daemon=True,
+                             name="restore-vision").start()
+            report["vision"] = "starting_bg"
+        # GPT-SoVITS 走 asyncio 拉取
+        if wait_tts:
+            try:
+                result = asyncio.run(self._restore_tts_async())
+                report["gpt_sovits"] = result
+            except Exception as exc:
+                report["gpt_sovits"] = f"failed({str(exc)[:120]})"
+        else:
+            threading.Thread(
+                target=lambda: asyncio.run(self._restore_tts_async()), daemon=True,
+                name="restore-tts").start()
+            report["gpt_sovits"] = "starting_bg"
+        self.log_event("ai_services_restored", report=report)
+        return report
 
     async def _sound_mcp_transcribe(self, wav_path: Path) -> str:
         if not await asyncio.to_thread(self.ensure_sound_service, True):
@@ -2180,6 +2354,16 @@ class HomeAgent:
         if not self._answer_is_speakable(text):
             self.log_event("home_tts_skipped_unsafe_content", reason="tool_markup_or_code", chars=len(str(text or "")))
             return []
+        # 已为游戏让出显存：不再拉起 GPT-SoVITS，直接走系统语音(SAPI)播报，避免占用显存。
+        if self._gpu_released:
+            await asyncio.to_thread(self.tts_execution_lock.acquire)
+            try:
+                if status: status("AI 模型已释放给游戏，使用系统语音播报…")
+                spoken = await asyncio.to_thread(self._windows_sapi_speak, text)
+                self.log_event("home_tts_released_mode", ok=spoken)
+                return []
+            finally:
+                self.tts_execution_lock.release()
         await asyncio.to_thread(self.tts_execution_lock.acquire)
         try:
             try:

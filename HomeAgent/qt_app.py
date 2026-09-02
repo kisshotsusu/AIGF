@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import sys
@@ -38,6 +39,74 @@ COLORS = {
     "muted": "#718083", "accent": "#16766F", "accent_hover": "#115F59",
     "soft": "#E7F4F1", "line": "#DFE7E7", "danger": "#C54D48",
 }
+
+
+# ---------------------------------------------------------------------------
+# Process-wide persistent asyncio event loop.
+#
+# Every chat must run on ONE long-lived event loop that is never closed, so any
+# aiohttp session / connector created inside the agent (LLM, TTS, vision bridge,
+# embedding clients, etc.) is always bound to a live loop. The old code created a
+# fresh `asyncio.new_event_loop()` and closed it after every single turn, which
+# made any persistent aiohttp session leak into the next turn -> the classic
+# "Session is closed" RuntimeError. See also HomeAgent/app.py.
+# ---------------------------------------------------------------------------
+_shared_loop: asyncio.AbstractEventLoop | None = None
+_shared_loop_lock = threading.Lock()
+
+
+def get_shared_loop() -> asyncio.AbstractEventLoop:
+    """Return the single process-wide asyncio event loop, starting its daemon
+    thread on first use. The loop is intentionally never closed."""
+    global _shared_loop
+    if _shared_loop is not None and not _shared_loop.is_closed():
+        return _shared_loop
+    with _shared_loop_lock:
+        if _shared_loop is not None and not _shared_loop.is_closed():
+            return _shared_loop
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(_shared_loop_exception_handler)
+        thread = threading.Thread(
+            target=_run_loop_forever, args=(loop,), name="homeagent-asyncio-loop", daemon=True
+        )
+        thread.start()
+        # Wait until the loop is actually running before handing it out.
+        start = threading.Event()
+        loop.call_soon_threadsafe(start.set)
+        start.wait(timeout=10.0)
+        _shared_loop = loop
+        return loop
+
+
+def _run_loop_forever(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_forever()
+    finally:
+        # Never allow pending callbacks/sessions to be torn down mid-task.
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
+
+def _shared_loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Log (instead of silently dropping) otherwise-unhandled loop exceptions so
+    a background failure never silently kills a task without a trace."""
+    exc = context.get("exception")
+    tb = ""
+    if exc is not None:
+        import traceback as _tb
+        tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
+    msg = f"[asyncio-loop] {context.get('message', 'unhandled')} {tb}"
+    print(msg, flush=True)
+    try:
+        import logging
+        logging.getLogger("homeagent").error(msg)
+    except Exception:
+        pass
 
 
 class WakeWordListener(QThread):
@@ -310,7 +379,7 @@ class ChatWorker(QThread):
         self.image_paths = [item["path"] for item in self.attachments if item.get("kind") == "image"]
         self.file_paths = [item["path"] for item in self.attachments if item.get("kind") == "file"]
         self.cleanup_paths = [item["path"] for item in self.attachments if item.get("owned")]
-        self.loop = None; self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.activity_events = []; self.plan_steps = []; self.reasoning_summary = ""; self.success_criteria = ""; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False
+        self.task = None; self.clock = None; self.report_tasks = set(); self.started_at = 0.0; self.current_step = ""; self.completed_steps = []; self.activity_events = []; self.plan_steps = []; self.reasoning_summary = ""; self.success_criteria = ""; self.last_report_at = 0.0; self.report_count = 0; self.answer_emitted = False; self._cancelled = False
 
     def publish_answer(self, answer: str) -> None:
         """Show the final text as soon as it exists; TTS may continue afterwards."""
@@ -370,54 +439,93 @@ class ChatWorker(QThread):
         cfg = self.agent.config.get("progress_reporting", {})
         threshold = max(15, int(cfg.get("long_task_seconds", 60))); cooldown = max(30, int(cfg.get("tts_cooldown_seconds", 90))); limit = max(0, int(cfg.get("max_reports_per_task", 3)))
         reportable = not any(word in value for word in ("语音", "播放", "录音", "识别"))
-        if cfg.get("enabled", True) and reportable and elapsed >= threshold and self.report_count < limit and time.monotonic() - self.last_report_at >= cooldown and self.loop:
+        if cfg.get("enabled", True) and reportable and elapsed >= threshold and self.report_count < limit and time.monotonic() - self.last_report_at >= cooldown:
             self.last_report_at = time.monotonic(); self.report_count += 1
-            report = self.loop.create_task(self.agent.speak_progress_report(self.prompt, list(self.completed_steps), self.current_step, elapsed)); self.report_tasks.add(report); report.add_done_callback(self.report_tasks.discard)
+            report = asyncio.ensure_future(self.agent.speak_progress_report(self.prompt, list(self.completed_steps), self.current_step, elapsed)); self.report_tasks.add(report); report.add_done_callback(self.report_tasks.discard)
 
     report_status.supports_structured_status = True
 
     def run(self):
-        self.loop = asyncio.new_event_loop(); self.started_at = time.monotonic()
+        # Run on the process-wide persistent loop (never closed per turn), so
+        # aiohttp sessions created by the agent are not invalidated between turns.
+        self.started_at = time.monotonic()
+        loop = get_shared_loop()
         try:
-            asyncio.set_event_loop(self.loop)
-            # begin_task fingerprints the repository for self-upgrade tracking.
-            # It can take noticeable time on a large workspace, so it must run
-            # inside this worker rather than ChatWorker.__init__ on the Qt thread.
-            self.agent.begin_task(
-                self.prompt,
-                resumed=self.prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"),
-            )
-            prompt = self.prompt
-            if self.file_paths:
-                listing = "\n".join(f"- {path}" for path in self.file_paths)
-                prompt += f"\n\n[用户本轮手动附加了以下本地文件。请按任务需要使用 read_text_file 或代码读取工具读取，不要忽略附件：\n{listing}\n]"
-            self.task = self.loop.create_task(self.agent.chat(prompt, self.report_status, self.confirm, self.publish_answer, image_path=self.image_paths, media_ready=self.publish_media))
-            self.clock = self.loop.create_task(self.progress_clock())
-            answer = self.loop.run_until_complete(self.task)
+            # Submit the chat to the shared loop and block this worker thread
+            # until it finishes. The loop itself is never closed between turns,
+            # which eliminates the cross-loop "Session is closed" failure.
+            fut = asyncio.run_coroutine_threadsafe(self._coro(), loop)
+            answer = fut.result()  # re-raises the chat exception here, if any
             self.agent.finalize_task_recovery(answer)
             self.publish_answer(answer)
         except asyncio.CancelledError:
+            # 用户点“停止”时 _coro/agent.chat 被取消，fut.result() 在底层并发
+            # future 上抛的是 concurrent.futures.CancelledError（见下）。这里兜住
+            # asyncio 版本，统一按“正常停止”处理，不当作执行失败。
+            self.agent.self_upgrade.clear()
+            self.bridge.answer.emit("当前任务已停止。")
+        except concurrent.futures.CancelledError:
+            # asyncio.run_coroutine_threadsafe 的 Future 在协程被取消时抛的是
+            # concurrent.futures.CancelledError（继承 Exception，但并非
+            # asyncio.CancelledError，因此上面的 except 捕获不到，若不加这条会落入
+            # except Exception 被误报成 chat_error 并触发 self_upgrade.fail）。
+            # 任务被主动停止是正常流程，必须干净收尾，绝不记录错误。
+            self.agent.self_upgrade.clear()
+            self.agent.cancel_event.clear()
             self.bridge.answer.emit("当前任务已停止。")
         except Exception as exc:
-            self.agent.log_event("chat_error", error=str(exc), prompt=self.prompt)
+            import traceback as _tb
+            tb = _tb.format_exc()[-3000:]
+            self.agent.log_event("chat_error", error=str(exc), traceback=tb, prompt=self.prompt)
             self.agent.self_upgrade.fail(str(exc))
-            self.bridge.error.emit(str(exc))
+            self.bridge.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
-            if self.clock:
-                self.clock.cancel(); self.loop.run_until_complete(self.drain_tasks([self.clock]))
-            if self.report_tasks:
-                for report in self.report_tasks: report.cancel()
-                self.loop.run_until_complete(self.drain_tasks(list(self.report_tasks))); self.report_tasks.clear()
-            self.task = None; self.clock = None; self.loop.close()
             for cleanup_path in self.cleanup_paths:
                 try: Path(cleanup_path).unlink(missing_ok=True)
                 except OSError: pass
+            self.task = None
             self.bridge.finished.emit()
+
+    async def _coro(self):
+        """Body of the chat, running on the shared persistent loop."""
+        # begin_task fingerprints the repository for self-upgrade tracking.
+        # It can take noticeable time on a large workspace, so it must run
+        # inside this worker rather than ChatWorker.__init__ on the Qt thread.
+        self.agent.begin_task(
+            self.prompt,
+            resumed=self.prompt.startswith("这是重启或异常退出后自动恢复的未完成任务"),
+        )
+        prompt = self.prompt
+        if self.file_paths:
+            listing = "\n".join(f"- {path}" for path in self.file_paths)
+            prompt += f"\n\n[用户本轮手动附加了以下本地文件。请按任务需要使用 read_text_file 或代码读取工具读取，不要忽略附件：\n{listing}\n]"
+        self.clock = asyncio.ensure_future(self.progress_clock())
+        self.task = asyncio.ensure_future(
+            self.agent.chat(prompt, self.report_status, self.confirm, self.publish_answer,
+                            image_path=self.image_paths, media_ready=self.publish_media)
+        )
+        try:
+            answer = await self.task
+        finally:
+            if self.clock is not None:
+                self.clock.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.clock), timeout=3)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                self.clock = None
+            self.task = None
+        return answer
 
     def cancel_task(self):
         self.agent.stop_current_task()
-        if self.loop and self.task and not self.task.done():
-            self.loop.call_soon_threadsafe(self.task.cancel)
+        self._cancelled = True
+        if self.task is not None and not self.task.done():
+            loop = get_shared_loop()
+            try:
+                loop.call_soon_threadsafe(self.task.cancel)
+            except Exception:
+                pass
 
 
 class AutostartGreetingWorker(QThread):

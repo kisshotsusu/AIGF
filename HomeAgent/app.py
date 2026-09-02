@@ -248,8 +248,13 @@ class DesktopPet:
         self.set_status("正在停止…")
 
     def _chat_worker(self, text, image_path=None):
-        loop = asyncio.new_event_loop()
-        self.chat_loop = loop
+        # 复用同一个持久事件循环：每次聊天都 new_event_loop()+close() 会让绑定在旧
+        # 循环上的 aiohttp 会话（LLM/TTS/视觉桥接等）在下一轮被复用时抛
+        # "Session is closed"。改为跨轮复用单一有效循环，从根本上消除该跨循环故障。
+        loop = self.chat_loop
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            self.chat_loop = loop
         answer_published = threading.Event()
         def publish_answer(answer):
             if answer_published.is_set(): return
@@ -271,7 +276,8 @@ class DesktopPet:
             self.root.after(0, lambda: self._append("assistant", self.agent.character_name, "当前任务已停止。"))
             self.set_status("已停止")
         except Exception as exc:
-            self.agent.log_event("chat_error", error=str(exc))
+            import traceback as _tb
+            self.agent.log_event("chat_error", error=str(exc), traceback=_tb.format_exc()[-2000:])
             self.agent.self_upgrade.fail(str(exc))
             self.root.after(0, lambda e=str(exc): self._append("error", "错误", e))
             self.set_status("发生错误")
@@ -280,8 +286,7 @@ class DesktopPet:
                 try: Path(image_path).unlink(missing_ok=True)
                 except OSError: pass
             self.chat_task = None
-            self.chat_loop = None
-            loop.close()
+            # 注意：此处不再关闭事件循环（见上方说明），仅结束本次聊天 UI 状态。
             self.root.after(0, self._finish_chat)
 
     def _finish_chat(self):

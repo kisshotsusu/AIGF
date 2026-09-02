@@ -115,6 +115,23 @@ class KnowledgeBase(ABC):
         tags = [domain] if domain else []
         tags += steps[:8]
         approach = "；".join(steps)
+        # 规划器回退(rule)时 plan.steps 可能为空 -> approach 会是空串, 沉淀出"没有做法"的废条目,
+        # 检索命中后既浪费上下文又无法指导复用。这里用真实执行证据兜底生成工具链做法。
+        if not approach.strip() and evidence:
+            used_tools = [
+                str(item.get("tool") or "")
+                for item in evidence
+                if isinstance(item, dict) and str(item.get("tool") or "").strip()
+                and str((item.get("result") or {}).get("status") or "success") not in {"failed", "cancelled"}
+            ]
+            # 去掉相邻重复, 保留"何时用了什么工具"的节奏
+            chain: list[str] = []
+            for tool in used_tools:
+                if not chain or chain[-1] != tool:
+                    chain.append(tool)
+            if chain:
+                approach = f"执行工具链: {' → '.join(chain)}"
+                tags += chain[:6]
         # 失败证据里挑一个原因作为 outcome 补充
         if not success and evidence:
             for item in reversed(evidence):

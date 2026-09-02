@@ -915,11 +915,15 @@ def _raise_window_above(window: dict) -> bool:
     try:
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        # 闪现置顶: TOPMOST 提升到最前, 再撤掉避免长期置顶占用。
+        # 被 pin_window_topmost 持久置顶的窗口要保持 TOPMOST, 否则下面的"闪现置顶"把它撤成
+        # NOTOPMOST 会悄悄让持久置顶失效(窗口回到普通层级, 之后被其它窗口遮挡)。
+        persist_topmost = _ACTIVE_PIN_HWND == hwnd
         user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        if not persist_topmost:
+            # 普通窗口: 闪现置顶后立即撤掉, 避免长期置顶占用。
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
         user32.BringWindowToTop(hwnd)
     except Exception:
         pass

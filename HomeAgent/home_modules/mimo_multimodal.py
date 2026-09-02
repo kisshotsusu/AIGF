@@ -198,13 +198,20 @@ class MiMoMultimodalClient:
             auth_header=auth_header,
         )
 
-    async def analyze_image_auto(self, session: aiohttp.ClientSession, image_path: Path, prompt: str) -> dict[str, Any]:
+    async def analyze_image_auto(self, session: aiohttp.ClientSession, image_path: Path, prompt: str,
+                                 allow_deepseek: bool | None = None) -> dict[str, Any]:
         """自动选择可用的图像分析服务（优先 DeepSeek 视觉代理，其次 MiMo）。
 
-        返回结果附带实际使用的 provider；全部服务失败时抛出带各服务原因的 RuntimeError。
+        allow_deepseek: None=沿用配置 deepseek_image_enabled；False=跳过 DeepSeek 两段代理，
+        直接走 MiMo 单段（更快，适合对延迟敏感的屏幕/窗口实时观察）；
+        True=即使配置关闭也尝试 DeepSeek 代理。返回结果附带实际使用的 provider。
         """
+        use_deepseek = (
+            bool(self.config.get("deepseek_image_enabled"))
+            if allow_deepseek is None else bool(allow_deepseek)
+        )
         failures: list[str] = []
-        if self.config.get("deepseek_image_enabled"):
+        if use_deepseek:
             try:
                 return await self.analyze_image_with_deepseek(session, image_path, prompt)
             except Exception as exc:

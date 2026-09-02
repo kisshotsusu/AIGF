@@ -208,15 +208,23 @@ class HierarchicalTaskManager:
                 self.set_status(child.id, TaskStatus.FAILED, error=reason)
 
     def complete_all(self) -> None:
-        """任务整体成功时，把残留的 pending/running 一并标为 completed。"""
+        """任务整体成功时，把残留的 pending/running 一并标为 completed。
+
+        根节点自身也必须在成功/失败时落定状态：当规划器没有产出可拆解 steps
+        （回退方案 steps 为空）时，任务树只有根节点，若根节点始终停留 RUNNING，
+        progress_payload 的 progress_ratio() 永远返回 0.0，UI 会一直显示
+        “运行中 0%”，即使任务实际已成功/失败。
+        """
         for child in self.root.children:
             if child.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
                 self.set_status(child.id, TaskStatus.COMPLETED)
+        self.set_status(self.root.id, TaskStatus.COMPLETED)
 
     def fail_all_remaining(self, reason: str = "") -> None:
         for child in self.root.children:
             if child.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
                 self.set_status(child.id, TaskStatus.FAILED, error=reason)
+        self.set_status(self.root.id, TaskStatus.FAILED, error=reason)
 
     # ------------------------------------------------------------------ #
     # 进度计算

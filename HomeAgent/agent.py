@@ -869,7 +869,7 @@ class HomeAgent:
                 "edge_open_chatgpt/edge_eval_js/edge_screenshot/read_text_file/write_text_file/code_tools中选择，不要发明工具。\n"
                 f"最近上下文：{context[-1200:]}\n当前请求：{text}"
             )
-            timeout_seconds = max(3, min(20, int(cfg.get("timeout_seconds", 10))))
+            timeout_seconds = max(3, min(60, int(cfg.get("timeout_seconds", 45))))
             timeout = aiohttp.ClientTimeout(total=timeout_seconds)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 payload = {"model": provider["model"], "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
@@ -2561,6 +2561,13 @@ class HomeAgent:
                 screenshot = Path(handle.name)
             image = await asyncio.to_thread(_grab_screen_with_retry, all_screens=False)
             screenshot_captured_at = _iso_now()
+            # 全屏截图(4K/多屏)PNG 经 base64 上传云端很慢, 是屏幕分析耗时主因之一:
+            # 上传前等比降采样, 显著降低往返延迟, 对 UI 识别精度影响极小。
+            max_edge = int(self.mimo_multimodal.config.get("screen_max_width", 1600) or 0)
+            if max_edge > 0 and max(image.width, image.height) > max_edge:
+                preview = image.copy()
+                preview.thumbnail((max_edge, max_edge))
+                image = preview
             try:
                 await asyncio.to_thread(image.save, screenshot, "PNG")
             finally:
@@ -2573,7 +2580,12 @@ class HomeAgent:
             
             timeout = aiohttp.ClientTimeout(total=int(self.mimo_multimodal.config.get("timeout_seconds", 60)))
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                result = await self.mimo_multimodal.analyze_image_auto(session, screenshot, prompt)
+                # 默认直连 MiMo 单段推理：DeepSeek 视觉代理是"视觉转述→再推理"两段云调用,
+                # 实测单次全屏分析约 41s; 直连 MiMo 与窗口分析(analyze_window.py)同链路, 快得多。
+                result = await self.mimo_multimodal.analyze_image_auto(
+                    session, screenshot, prompt,
+                    allow_deepseek=bool(self.mimo_multimodal.config.get("screen_use_deepseek", False)),
+                )
                 answer = re.sub(r"\s+", " ", str(result.get("text") or "")).strip().strip('\'"\'"')
                 
                 if not answer:
@@ -2653,7 +2665,14 @@ class HomeAgent:
         prior_experience = ""
         if self.kb_enabled and self.kb_inject_into_plan and self.knowledge_base is not None:
             try:
-                hits = self.knowledge_base.search(text, k=3)
+                hits = self.knowledge_base.search(text, k=5)
+                # 只召回成功经验，避免把失败/错乱目标（如被故障文本污染的“且相宜”）
+                # 当成“历史相关经验”注入规划提示词，导致简单问答被误判成桌面任务
+                hits = [
+                    h for h in hits
+                    if h.get("success") and str(h.get("goal") or "").strip()
+                    and len(str(h.get("approach") or "").strip()) >= 4
+                ][:3]
                 if hits:
                     prior_experience = "\n[历史相关经验] " + "；".join(
                         f"目标：{h.get('goal', '')[:80]}；做法：{h.get('approach', '')[:120]}" for h in hits

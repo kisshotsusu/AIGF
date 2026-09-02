@@ -49,15 +49,12 @@ Use the deterministic script for search-and-play tasks:
 
 The script emits JSON progress events and ends with `completed` only after the selected page and requested playback state are verified.
 
-For a request such as “打开收藏夹 二次元好看 的第三个视频”, keep semantic planning in the model but execute the fragile account operation through `bilibili_open_favorite_video(favorite_folder="二次元好看", index=3)` when that tool is available. Pass the planned folder and index without re-parsing them locally. Require all of these fields before reporting success:
+For a request such as “打开收藏夹 二次元好看 的第三个视频”, keep semantic planning in the model and let it drive the operation:
 
-- `ok=true`
-- `used_existing_browser=true`
-- `favorite_index` equals the requested index
-- a valid `bvid`
-- the final URL contains that `bvid`
+- 当视觉/GUI 路径可用时：调用只读 getter `bilibili_list_favorites(folder_name="二次元好看", index=3)` 拿到真实收藏夹顺序与 `bvid`/`url`，随后用 `web_navigate` 或 `ui_click_window` 在用户已打开的浏览器中打开，并用 `ui_analyze_screen` 截图验证。
+- 当 GUI 已关闭（本技能的回退模式）且 `bilibili_list_favorites` 可用时，同样先取 getter 再交脚本；否则停在“需要已打开的 Bilibili 浏览器”并请用户操作。
 
-This executor reads Bilibili's real favorite-folder order and navigates the user's already-open browser. Do not replace it with visual guesses such as opening the avatar, dynamic feed, or an assumed `/account/favorite` URL.
+报告成功前必须确认：`ok=true`、有效的 `bvid`、最终 URL 含该 `bvid`。不要凭视觉瞎猜（如点头像、动态页或假设的 `/account/favorite` URL）；收藏夹真实顺序只来自 getter 或脚本，禁止本地硬编码。
 
 ## Guardrails
 

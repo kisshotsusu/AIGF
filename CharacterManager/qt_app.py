@@ -521,9 +521,9 @@ class TaskTreePage(QWidget):
 
 
 class VisualModelPage(QWidget):
-    """视觉处理模型控制：切换后端（GUI-Owl / GUI-Actor）与具体模型，并配置服务参数。"""
+    """视觉处理模型控制：GUI-Owl 为唯一后端，选择具体模型并配置服务参数。"""
     MODEL_ROOT = ROOT / "Vision" / "models"
-    BACKENDS = [("gui_owl","GUI-Owl (Qwen3-VL)"),("gui_actor","GUI-Actor (Qwen2-VL)")]
+    BACKENDS = [("gui_owl","GUI-Owl (Qwen3-VL)")]
     def __init__(self,s):
         super().__init__();self.s=s;lay=page_scaffold(self,"视觉处理模型","切换视觉处理后端与具体模型，并配置 Vision MCP 服务参数。修改后端 / 模型后需重启 HomeAgent 生效。")
         general=QGroupBox("模型选择");f=QFormLayout(general)
@@ -545,7 +545,7 @@ class VisualModelPage(QWidget):
             for p in sorted(self.MODEL_ROOT.iterdir()):
                 if p.is_dir():self.model_dir.addItem(str(p))
     def on_backend(self,_=None):
-        default=str(self.MODEL_ROOT/"GUI-Actor-2B-Qwen2-VL") if self.backend.currentData()=="gui_actor" else str(self.MODEL_ROOT/"GUI-Owl-1.5-2B-Instruct")
+        default=str(self.MODEL_ROOT/"GUI-Owl-1.5-2B-Instruct")
         idx=self.model_dir.findText(default);self.model_dir.setCurrentIndex(idx if idx>=0 else 0)
     def load(self):
         c=self.s.get_config_section("vision_mcp",True)

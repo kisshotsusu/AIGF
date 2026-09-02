@@ -2,7 +2,7 @@
 setlocal
 
 echo ============================================================
-echo   Download Model Weights  (GUI-Actor-2B + SenseVoiceSmall)
+echo   Download Model Weights  (GUI-Owl-1.5-2B + SenseVoiceSmall)
 echo ============================================================
 
 REM Resolve the folder this bat lives in (handles CJK paths via %~dp0)
@@ -18,10 +18,8 @@ if not exist "%PY%" (
     exit /b 1
 )
 
-echo [STEP] Downloading GUI-Owl-1.5-2B (Vision, 默认识别后端 vision_mcp.backend=gui_owl) ...  (~4.5 GB, resumable)
+echo [STEP] Downloading GUI-Owl-1.5-2B (Vision, 唯一识别后端 vision_mcp.backend=gui_owl) ...  (~4.5 GB, resumable)
 "%PY%" "%ROOT%\Vision\download_model.py" --model gui-owl
-REM GUI-Actor 为备用后端, 只在需要时下载:
-REM "%PY%" "%ROOT%\Vision\download_model.py" --model gui-actor
 
 echo.
 echo [STEP] Downloading SenseVoiceSmall (Sound) ...  (~1 GB, via ModelScope)

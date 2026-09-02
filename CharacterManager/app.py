@@ -627,7 +627,7 @@ class CharacterManager:
         self.gui_vision_enabled = tk.BooleanVar(value=home.get("vision_mcp", {}).get("gui_enabled", False))
         vision_card = ttk.Frame(tab, style="Card.TFrame", padding=14); vision_card.pack(fill="x", pady=(0, 12))
         ttk.Label(vision_card, text="图像 GUI 识别", style="Card.TLabel", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
-        ttk.Checkbutton(vision_card, text="启用 GUI-Actor 图像识别（会占用显存）", variable=self.gui_vision_enabled).pack(side="left", padx=20)
+        ttk.Checkbutton(vision_card, text="启用 GUI-Owl 图像识别（会占用显存）", variable=self.gui_vision_enabled).pack(side="left", padx=20)
         ttk.Label(vision_card, text="关闭时网页使用 DOM/文本 Agent；保存后立即释放视觉模型显存", style="Card.TLabel", foreground=self.colors["muted"]).pack(side="left")
         top = ttk.Frame(tab); top.pack(fill="both", expand=True)
         software = ttk.Frame(top, style="Card.TFrame", padding=14); software.pack(side="left", fill="both", expand=True, padx=(0, 7))

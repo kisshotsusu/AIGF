@@ -185,13 +185,13 @@ workspace:
   character_profile_file: CHARACTER.md
   daily_memory: true
 
-# Vision GUI MCP 服务（GUI-Owl / GUI-Actor 视觉控制后端）
+# Vision GUI MCP 服务（GUI-Owl 视觉控制后端）
 # HomeAgent 按此段自动拉起 Vision/mcp_server.py 并注册 ui_* 视觉工具。
-# GUI-Owl 模型已就绪（Vision/models/GUI-Owl-1.5-2B-Instruct），默认 backend=gui_owl。
+# GUI-Owl 模型已就绪（Vision/models/GUI-Owl-1.5-2B-Instruct），唯一后端 backend=gui_owl。
 vision_mcp:
   enabled: true                       # 启用 Vision MCP 服务与 ui_* 工具
   auto_start: true                    # HomeAgent 启动时自动拉起 Vision MCP
-  backend: gui_owl                    # 识别后端: gui_owl (Qwen3-VL) | gui_actor (Qwen2-VL)
+  backend: gui_owl                    # 识别后端: 仅 gui_owl (Qwen3-VL)
   gui_enabled: true                   # 允许代理下发 GUI 点击/输入等视觉操作指令
   url: http://127.0.0.1:8765/mcp
   host: 127.0.0.1
@@ -199,7 +199,7 @@ vision_mcp:
   preload_model: true                # 服务启动即加载模型，避免首次调用卡顿
   startup_timeout_seconds: 120
   task_timeout_seconds: 180
-  # gui_owl_model / gui_actor_model 留空时由代码按 ROOT/Vision/models/... 解析
+  # gui_owl_model 留空时由代码按 ROOT/Vision/models/... 解析
   existing_browser_cdp_endpoints:
   - http://127.0.0.1:9222
   - http://127.0.0.1:9223

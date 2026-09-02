@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
@@ -217,12 +218,32 @@ class MiMoMultimodalClient:
             except Exception as exc:
                 failures.append(f"DeepSeek: {exc}")
         if self.config.get("image_enabled"):
-            try:
-                result = await self.analyze_image(session, image_path, prompt)
-                result["provider"] = "mimo"
-                return result
-            except Exception as exc:
-                failures.append(f"MiMo: {exc}")
+            retries = max(0, int(self.config.get("image_retries", 1)))
+            last: Exception | None = None
+            for attempt in range(retries + 1):
+                try:
+                    result = await self.analyze_image(session, image_path, prompt)
+                    result["provider"] = "mimo"
+                    if attempt:
+                        result["retried"] = True
+                    return result
+                except Exception as exc:
+                    last = exc
+                    # 空响应/HTTP 5xx/连接类瞬态故障值得立刻重试一次; 本地参数错误无需重试。
+                    text = str(exc).lower()
+                    transient = (
+                        "empty response" in text or "length" in text
+                        or "http 5" in text or "http 429" in text
+                        or "connection" in text or "timed out" in text or "timeout" in text
+                        or "reset" in text or "server" in text
+                    )
+                    if attempt < retries and transient:
+                        await asyncio.sleep(0.6 * (attempt + 1))
+                        continue
+                    failures.append(f"MiMo: {exc}")
+                    break
+            if last is not None and not failures:
+                failures.append(f"MiMo: {last}")
         detail = "；".join(failures) if failures else "未启用任何图像分析服务"
         raise RuntimeError(f"没有可用的图像分析服务：{detail}")
 

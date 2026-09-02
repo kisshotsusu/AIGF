@@ -147,6 +147,9 @@ class HomeAgent:
         self.active_process_lock = threading.Lock()
         self.vision_service_process: subprocess.Popen | None = None
         self.vision_service_lock = threading.Lock()
+        # 视觉服务熔断：若刚尝试过拉起但进程很快退出(模型/显存启动失败)，短窗口内
+        # 快速失败而不是让每个后续工具调用都干等满 startup_timeout_seconds(默认120s)。
+        self._vision_restart_failed_at: float = 0.0
         self.sound_service_process: subprocess.Popen | None = None
         self.sound_service_lock = threading.Lock()
         # --- GPU 显存让出给游戏：置位后 ensure_*/TTS 不再自动拉起模型服务，
@@ -1263,6 +1266,12 @@ class HomeAgent:
 
     def ensure_vision_service(self, wait_until_ready: bool = False) -> bool:
         if self._gpu_released: return False  # 已为游戏让出显存，禁止自动拉起视觉模型
+        if wait_until_ready and self._vision_restart_failed_at:
+            # 刚尝试过重启但失败(进程秒退)，短窗口内别再为每个工具干等，直接快速失败交给上层换策略。
+            cooldown = float(self.config.get("vision_mcp", {}).get("vision_restart_wait_seconds", 20) or 20)
+            if time.monotonic() - self._vision_restart_failed_at < cooldown:
+                return False
+            self._vision_restart_failed_at = 0.0
         with self.vision_service_lock:
             return self._ensure_vision_service_unlocked(wait_until_ready)
 
@@ -1584,6 +1593,8 @@ class HomeAgent:
             "VISION_PRELOAD_MODEL": "1" if cfg.get("preload_model", True) else "0",
             "VISION_BACKEND": backend,
             "GUI_OWL_MODEL": str(cfg.get("gui_owl_model") or ROOT / "Vision" / "models" / "GUI-Owl-1.5-2B-Instruct"),
+            # 把 config.yaml 里的操作后等待毫秒透传给 Vision 后端，便于统一调优，无需改环境变量。
+            "GUI_POST_ACTION_WAIT_MS": str(max(100, int(cfg.get("gui_post_action_wait_ms", 350) or 350))),
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "BROWSER_CDP_ENDPOINTS": ",".join(str(item) for item in cfg.get(
                 "existing_browser_cdp_endpoints",
@@ -1615,7 +1626,11 @@ class HomeAgent:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if ready(): return True
-                if self.vision_service_process.poll() is not None: return False
+                if self.vision_service_process.poll() is not None:
+                    # 进程启动后很快退出(模型/显存/端口冲突等)：记下失败时间，触发熔断快速失败。
+                    self._vision_restart_failed_at = time.monotonic()
+                    self.log_event("vision_service_restart_failed", pid=self.vision_service_process.pid)
+                    return False
                 time.sleep(1)
             return False
         finally:
@@ -2760,10 +2775,16 @@ class HomeAgent:
                 "\n\n【网页/桌面操作铁律（视觉智能编排 + 自我纠错 + 自我学习，禁止写死流程）】\n"
                 "你负责根据截图自主完成“确认目标是否已存在→打开/复用→识别元素→点击/输入/播放→验证→学习”的整个闭环，本地代码不再硬编码流程。\n"
                 "（0）动手前先确认：用 ui_list_windows 看目标（如 bilibili、网易云）是否已经开在屏幕上。已在就 ui_activate_window 直接复用；不在才 web_navigate 直接输网址，或先 recall_knowledge 找历史已知入口，再不济用浏览器搜索该网站名称。不要一上来就猜 URL。\n"
+                "（0a）桌面应用“进程在但窗口找不到”处理：先用 process_status 查目标进程(如 cloudmusic.exe)是否在运行；若进程在但 ui_list_windows(含 title_contains 变体)始终找不到其主窗口，说明它处于后台/托盘/最小化状态(主窗口未创建，如网易云后台驻留)。此时优先用 run_shell 调窗口显隐 API(如 powershell 对进程主句柄 ShowWindow/SetForegroundWindow)把它调到前台，或对单实例应用再次执行其启动命令让已有实例把窗口带出；若多次尝试仍无窗口且重启被拒(拒绝访问=权限不足或受保护进程)，必须停止“反复 kill→重启→再找”空转，改用 netease_now_playing/bilibili 只读 getter 或 run_shell 读取其真实状态，并把“应用在后台但界面未显示、需用户手动点开或授权”作为明确结论告知用户，转而处理可完成的部分或请用户协助，绝不靠无限重启消耗轮次预算。\n"
                 "（1）永远复用用户已经打开的浏览器/软件窗口，绝不启动新浏览器或新进程来替代；找不到元素就换描述、换 candidate_index 或重新截图。\n"
-                "（2）每一步操作后靠 ui_analyze_screen/ui_analyze_window 看截图验证，不要靠读取剪贴板或地址栏文本判断成败。对同一个窗口要连续做多步点击/输入时，先 ui_pin_topmost 把它钉在最上层一次：此后该窗口一直最前、不被遮挡，中间无需反复 ui_list_windows/ui_activate_window 重新定位或截图核对层级，能显著减少检查步数与误点风险；做完这批操作再 ui_unpin_topmost 解除。\n"
+                "（2）验证分“廉价”与“昂贵”两种，按场景选择，禁止对每一步都做昂贵的截图大模型分析："
+                "ui_click_window/ui_type_window/ui_double_click_window 走 UIA 文本命中时，工具自己已做“操作后重截图+像素比对”并返回 state_changed/post_action_verified——"
+                "只要返回 post_action_verified=true(或 via=uia_text 且 clicked=true)，就把它当作已达成，不必再单独调 ui_analyze_window 复核一次画面；"
+                "接着要点的下一个目标直接再 ui_click_window/ui_read_window 即可。只有当 (a) 某工具返回 uncertain/未观察到变化，或 (b) 需要读屏幕上的新内容/文字/选项，或 (c) 目标是游戏/自绘全屏(无控件树)时，才调一次 ui_analyze_screen/ui_analyze_window 看画面。"
+                "这样单次“点击→验证”从约 40 秒(截图大模型分析)降到约 1~3 秒(UIA 直接命中)，一个多步任务能省下数分钟。"
+                "对同一个窗口要连续做多步点击/输入时，先 ui_pin_topmost 把它钉在最上层一次：此后该窗口一直最前、不被遮挡，中间无需反复 ui_list_windows/ui_activate_window 重新定位或截图核对层级；做完这批操作再 ui_unpin_topmost 解除。\n"
                 "（3）账号私有数据（Bilibili 收藏夹顺序、当前在播歌曲等）屏幕上看不到，先用只读 getter（bilibili_list_favorites / netease_now_playing）拿到事实，再据此用视觉工具导航；禁止凭空猜 URL 或曲名。\n"
-                "（4）容错重试：单步点错/未命中，先 ui_analyze_screen 重新确认当前界面，再换元素描述、换 candidate_index、换窗口或换搜索词重试；最多允许 4 次单步重试，且每次必须换不同策略，不要连续点同一处。总失败预算内不要过早放弃，也不要无脑硬点。\n"
+                "（4）容错重试：单步点错/未命中(工具返回 uncertain、structure_readable=false 仍点不到、或换候选仍未命中)，先 ui_analyze_screen/ui_analyze_window 重新确认当前界面，再换元素描述、换 candidate_index、换窗口或换搜索词重试；最多允许 4 次单步重试，且每次必须换不同策略，不要连续点同一处。总失败预算内不要过早放弃，也不要无脑硬点。\n"
                 "（5）自我学习：成功定位到关键 UI 元素（如『Bilibili 收藏夹=右上角头像→收藏』）或走通整条路径后，调用 ui_learn 把这条界面经验写入知识库（scope 填应用名、finding 填具体入口/位置、goal_hint 填任务关键词）。下次同类任务先 recall_knowledge 复用，不必从头试错。\n"
                 "（6）优先读结构、少用全屏猜点：网页/桌面原生窗口有控件树(DOM/UIA)，先把要点的按钮文字当 ui_click_window 的 target 或先用 ui_read_window 看目标窗口有哪些可点文字与坐标，命中即精确点击；只有在窗口 structure_readable=false(游戏/自绘全屏)时才靠 ui_analyze_screen/ui_analyze_window 视觉猜坐标。避免在可读结构的窗口上做全屏视觉点按导致点错或误触退出全屏。\n"
                 "（7）游戏/全屏护栏：若目标是全屏游戏画面，先判断该画面是否确实含要点的东西；绝不为了看画面先按 Esc/F11/退出全屏。需要鼠标能精确点对游戏内元素时仍可视觉点击，但每步都要截图验证，点错(如点到返回/全屏切换)就说明视觉未命中，改文字/换区域/切回窗口化再试，不要连续盲点。\n"
@@ -3347,8 +3368,19 @@ class HomeAgent:
                 }
                 if isinstance(observation, dict) and "state_changed" in observation:
                     changed = bool(observation.get("state_changed"))
-                    result.update({"post_action_verified": changed, "status": "success" if changed else "uncertain"})
-                    if not changed:
+                    # 精确文本命中的点击/输入(via=uia_text)点了真实控件中心，本身就具备高确定性；
+                    # 其“操作后像素无变化”往往是点了个不改变画面的按钮/勾选项/状态开关，不代表没点中。
+                    # 此时不要误判为 uncertain 去触发无谓重试；只有当工具没报 clicked/typed、或走了视觉回退
+                    # (via=visual_fallback，靠像素 diff 猜命中) 时，才需要把“无画面变化”视为待确认。
+                    via = str(observation.get("via") or "")
+                    landed = bool(observation.get("clicked") or observation.get("typed")
+                                  or observation.get("double_clicked"))
+                    deterministic_hit = bool(landed and via == "uia_text")
+                    if deterministic_hit:
+                        result.update({"post_action_verified": changed, "status": "success"})
+                    else:
+                        result.update({"post_action_verified": changed, "status": "success" if changed else "uncertain"})
+                    if not changed and not deterministic_hit:
                         result["warning"] = "操作已发送，但等待后重新截图未观察到明显状态变化"
                 return result
             except Exception as exc:

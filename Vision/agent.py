@@ -870,12 +870,109 @@ def list_windows(title_contains: str = ""):
     return results
 
 
+def _enum_hidden_main_windows(process_path: str = "", process_name: str = "", hwnd: int = 0):
+    """枚举一个进程名下“真实存在但被隐藏/不可见”的顶层主窗体窗口。
+
+    桌面应用（如网易云、部分 Electron/CEF 壳）常会“关闭即驻留后台/托盘”：进程健康运行、
+    主窗口也真实存在（甚至带当前内容标题），但 WS_VISIBLE 位被清掉，导致 list_windows(只列
+    IsWindowVisible) 永久看不见它。此类窗口不能靠 IsWindowVisible 判定“应用没开”，否则 agent
+    会误判未启动→反复 kill/重启(常因权限被拒)→空转烧预算。
+
+    这里按进程映像定位其真正的 UI 主窗体：过滤掉 IME/消息钩子/媒体SMTC/迷你类等辅助窗，
+    只保留“有正常屏幕尺寸、是应用主窗体类(带 Chrome/Orpheus 或普通顶层框)或有非空标题”的候选，
+    返回带 hidden=True 标记的窗口字典（兼容 _find_window/activate 的字段结构）。
+    """
+    user32 = ctypes.windll.user32
+    pid_targets: set[int] = set()
+
+    def _pid_of(hwnd_candidate: int) -> int:
+        p = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd_candidate), ctypes.byref(p))
+        return int(p.value)
+
+    # 需要先解析 hwnd/进程名→PID；进程映像名用 tasklist 或 OpenProcess 逐窗核对较繁，
+    # 这里统一用“进程路径 basename”/hwnd 过滤，避免跨进程误伤。
+    match_basename = ""
+    if process_name:
+        match_basename = os.path.basename(os.path.normcase(os.path.normpath(str(process_name))))
+    if process_path:
+        match_basename = os.path.basename(os.path.normcase(os.path.normpath(str(process_path))))
+
+    results = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def callback(hwnd_candidate, _):
+        pid = _pid_of(int(hwnd_candidate))
+        if hwnd:
+            if int(hwnd_candidate) != int(hwnd):
+                return True
+        else:
+            # 只在没有 hwnd 精确值时按进程过滤
+            if pid not in pid_targets:
+                return True
+        if user32.IsWindowVisible(hwnd_candidate):
+            return True  # 可见窗口走常规 list_windows 路径
+        ln = user32.GetWindowTextLengthW(hwnd_candidate)
+        buf = ctypes.create_unicode_buffer(ln + 1)
+        user32.GetWindowTextW(hwnd_candidate, buf, ln + 1)
+        title = buf.value.strip()
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd_candidate, cls, 256)
+        rect = ctypes.wintypes.RECT()
+        if not user32.GetWindowRect(hwnd_candidate, ctypes.byref(rect)):
+            return True
+        w = rect.right - rect.left; h = rect.bottom - rect.top
+        # 过滤辅助/系统窗：几乎必然不是可操作主窗体
+        lowcls = cls.value.casefold()
+        # 明确是桌面歌词/迷你播放器/托盘图标/系统辅助等，不可能是主操作界面
+        aux_classes = ("desktoplyrics", "miniplayer", "icon", "msctfime", "ime",
+                       "messagewindow", "systemmessagewindow", "gdi+ hook", "minidump",
+                       "powermessagewindow", "smtextitlehost", "titlebar", "tooltips_class32")
+        if any(blk in lowcls for blk in aux_classes):
+            return True
+        if w <= 80 or h <= 60:      # 尺寸过小(IME/SMTC/系统小窗等)
+            return True
+        results.append({
+            "hwnd": int(hwnd_candidate), "pid": pid, "title": title,
+            "bounds": [rect.left, rect.top, rect.right, rect.bottom],
+            "process_name": "", "process_path": "", "hidden": True,
+            "window_class": cls.value,
+        })
+        return True
+
+    # 解析进程名/路径 → PID（用 tasklist；Windows 控制台默认 OEM 编码，须显式指定避免中文环境乱码）
+    import subprocess
+    if match_basename and not hwnd:
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {match_basename}", "/FO", "CSV", "/NH"],
+                capture_output=True, timeout=20,
+            )
+            text = out.stdout.decode("oem", errors="replace")
+            for line in text.splitlines():
+                parts = [p.strip().strip('"') for p in line.split('","')]
+                if len(parts) >= 2 and parts[1].isdigit():
+                    pid_targets.add(int(parts[1]))
+        except Exception:
+            pass
+
+    # hwnd 精确值时无需 pid 过滤，直接枚举全部顶层窗找该 hwnd
+    user32.EnumWindows(callback, 0)
+    if not hwnd and not pid_targets:
+        return []
+    return results
+
+
 def _find_window(title_contains: str):
     """Resolve a window from its title, HWND, process name, or process path.
 
     `list_windows` exposes all four fields.  A model may legitimately return the
     process field it just observed, so activation must not interpret every value
     as title text only.
+
+    兜底: 可见窗口找不到时, 若 reference 是精确标识(hwnd / 完整路径 / 进程映像 basename),
+    会回退去枚举该进程名下“隐藏但真实存在”的主窗体, 使“进程健康但主窗被隐藏(WS_VISIBLE未置位)”
+    的应用(如网易云后台驻留)仍可被按进程/hwnd 激活, 而不是被误判为未启动。
     """
     reference = str(title_contains or "").strip()
     if not reference:
@@ -896,6 +993,28 @@ def _find_window(title_contains: str):
             return window
         if basename and (process_name == basename.casefold() or os.path.basename(process_path) == basename):
             return window
+    # —— 隐藏主窗体兜底 ——
+    if basename or reference.isdigit():
+        try:
+            hidden = _enum_hidden_main_windows(
+                hwnd=int(reference) if reference.isdigit() else 0,
+                process_path=folded if os.path.sep in reference else "",
+                process_name=basename,
+            )
+        except Exception:
+            hidden = []
+        if hidden:
+            # 主窗体通常是同进程下屏幕面积最大的窗口(桌面歌词/迷你播放器等均为小浮窗)，
+            # 按面积取最大最稳；带当前内容标题(如网易云"歌名-歌手")的候选可作次级偏好。
+            def _area(w):
+                b = w.get("bounds") or [0, 0, 0, 0]
+                return max(0, (b[2] - b[0])) * max(0, (b[3] - b[1]))
+            best = max(hidden, key=_area)
+            big = [w for w in hidden if _area(w) >= 0.5 * _area(best)]
+            titled = [w for w in big if w.get("title")]
+            if titled:
+                return max(titled, key=_area)
+            return best
     available = [str(item.get("title") or "") for item in windows[:8]]
     raise RuntimeError(f"window not found: {reference}; available titles: {available}")
 
@@ -913,6 +1032,12 @@ def _raise_window_above(window: dict) -> bool:
     SWP_NOSIZE = 0x0001; SWP_NOMOVE = 0x0002; SWP_SHOWWINDOW = 0x0040; SWP_NOACTIVATE = 0x0010
     HWND_TOPMOST = -1; HWND_NOTOPMOST = -2
     try:
+        # 对“进程健康但主窗体被隐藏(WS_VISIBLE 未置位)”的窗口，先强制显示再抬升。
+        # 这类窗口来自 _find_window 的隐藏主窗体兜底(带 hidden=True)；它不透明地躲过了
+        # list_windows(只列可见)，若只 SetForeground 而不 ShowWindow(SW_SHOW)，画面不会真正回到屏幕。
+        if window.get("hidden") or not user32.IsWindowVisible(hwnd):
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE (顺带还原最小化)
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         # 被 pin_window_topmost 持久置顶的窗口要保持 TOPMOST, 否则下面的"闪现置顶"把它撤成

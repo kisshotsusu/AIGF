@@ -5,6 +5,7 @@ import ast
 import base64
 import csv
 import difflib
+import gzip
 import json
 import mimetypes
 import os
@@ -304,8 +305,28 @@ class HomeAgent:
             safe[key] = text[:4000]
         record = {"time": datetime.now().isoformat(timespec="milliseconds"), "event": event, **safe}
         try:
-            with (log_dir / "agent-events.jsonl").open("a", encoding="utf-8") as file:
+            log_path = log_dir / "agent-events.jsonl"
+            self._rotate_event_log_if_large(log_dir, log_path)
+            with log_path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def _rotate_event_log_if_large(self, log_dir, log_path) -> None:
+        """事件日志超阈值后自动压缩归档为 .gz，防止无限增长占用磁盘。"""
+        try:
+            cap_mb = max(1.0, float(self.config.get("home", {}).get("agent_events_max_mb", 3.0)))
+            if not log_path.exists() or log_path.stat().st_size < cap_mb * 1024 * 1024:
+                return
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            if not text.strip():
+                log_path.unlink(missing_ok=True)
+                return
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            archive = log_dir / f"agent-events.archived-{stamp}.jsonl.gz"
+            with gzip.open(archive, "wt", encoding="utf-8") as fh:
+                fh.write(text)
+            log_path.unlink(missing_ok=True)
         except OSError:
             pass
 

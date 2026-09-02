@@ -23,8 +23,10 @@ if not exist "%VENV%" (
 
 set "VISION_BACKEND=gui_owl"
 set "GUI_OWL_MODEL=%HERE%\models\GUI-Owl-1.5-2B-Instruct"
-REM 输入降采样(最长边1280≈720p): 实测端到端 1.70s->1.30s, 归一化坐标无损; 设 0 关闭
-set "VISION_MAX_SIDE=1280"
+REM 输入降采样(最长边): 1024 时 grounding prefill 比 1280 省 ~30-45%, 归一化坐标无损; 设 0 关闭
+set "VISION_MAX_SIDE=1024"
+REM processor 端视觉 token 像素硬上限(~2MP), 与 VISION_MAX_SIDE 双保险
+set "VISION_MAX_PIXELS=2000000"
 REM 输出格式: compact(默认,单行JSON,省~490ms) | tool_call(官方<tool_call>格式)
 set "VISION_OWL_OUTPUT_FORMAT=compact"
 set "VISION_MCP_TRANSPORT=http"

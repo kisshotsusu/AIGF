@@ -41,10 +41,20 @@ if BACKEND != "gui_owl":
 # 推理前输入降采样: 把最长边缩到该像素值 (16:9 下 1280 ≈ 720p)。
 # 实测 1080p->720p 端到端 1.70s->1.30s 且归一化坐标零损失 (坐标为 0~1 相对值,
 # 不受缩放影响)。设 0 或负值 = 关闭降采样 (原生分辨率推理)。
+# 注意(2026-09 诊断): grounding 真实瓶颈在 decode(~45ms/token, GPU 仅 35-40% 占用,
+# host/launch 开销主导), 而非 prefill。1280->1024 只省 prefill 那 ~200ms 里的 ~30-40ms,
+# 对总延迟(<1s, 其中 decode ~480ms)影响有限。进一步降分辨率收益递减, 勿过度追求。
 try:
-    VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "1280").strip() or "0")
+    VISION_MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE", "1024").strip() or "0")
 except ValueError:
-    VISION_MAX_SIDE = 1280
+    VISION_MAX_SIDE = 1024
+# processor 端视觉 token 硬上限 (像素): 收紧后即使原生分辨率推理也被钳制,
+# 与 VISION_MAX_SIDE 双保险, 控制 prefill 成本。2MP ≈ 可覆盖 1024 边长的常规截图。
+# 用 VISION_MAX_PIXELS 覆盖; 0/负值=不限。
+try:
+    VISION_MAX_PIXELS = int(os.environ.get("VISION_MAX_PIXELS", str(2000 * 1000)).strip() or "0")
+except ValueError:
+    VISION_MAX_PIXELS = 2000 * 1000
 GUI_OWL_MODEL = os.environ.get("GUI_OWL_MODEL", "").strip()
 if not GUI_OWL_MODEL:
     _default_gui_owl = os.path.join(HERE, "models", "GUI-Owl-1.5-2B-Instruct")
@@ -266,7 +276,8 @@ def _load_gui_owl():
     _processor = AutoProcessor.from_pretrained(
         model_path,
         min_pixels=196 * 32 * 32,
-        max_pixels=9800 * 32 * 32,
+        # max_pixels 作为视觉 token 数量硬闸: 收紧到 ~2MP, 与 VISION_MAX_SIDE 双保险。
+        max_pixels=VISION_MAX_PIXELS if VISION_MAX_PIXELS > 0 else 9800 * 32 * 32,
     )
     _tokenizer = _processor.tokenizer
     _model = Qwen3VLForConditionalGeneration.from_pretrained(

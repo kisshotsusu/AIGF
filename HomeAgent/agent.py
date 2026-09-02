@@ -1291,7 +1291,25 @@ class HomeAgent:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, env=client_env,
         )
-        out, err = await proc.communicate()
+        try:
+            # 关键健壮性：ASR 服务可能在加载模型或卡滞时长时间不返回，若无限等待会
+            # 挂起整个转写/聊天流程。加超时并在超时时杀掉桥接子进程，避免永久卡死。
+            timeout = float(cfg.get("call_timeout_seconds", 120))
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try: proc.kill()
+            except ProcessLookupError: pass
+            try: await proc.communicate()
+            except (asyncio.CancelledError, ProcessLookupError): pass
+            raise RuntimeError(
+                f"语音识别执行超时（>{timeout:.0f}s）：SenseVoice 服务可能卡滞或正在加载模型，"
+                f"请检查 Sound 服务日志或重启 sound 服务"
+            )
+        except asyncio.CancelledError:
+            try: proc.kill()
+            except ProcessLookupError: pass
+            await proc.communicate()
+            raise
         lines = out.decode("utf-8", "replace").strip().splitlines()
         try: payload = json.loads(lines[-1]) if lines else {}
         except json.JSONDecodeError: payload = {}

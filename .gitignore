@@ -55,3 +55,10 @@ LongTermMemory/
 
 # ---- Downloaded model weights (large binaries) ----
 **/models/
+
+# ---- Runtime state / knowledge (regenerated at runtime; never commit) ----
+# JSON/MD 状态、浏览器账号、任务树、知识库、服务锁文件等均为运行期生成。
+HomeAgent/state/*.json
+HomeAgent/state/*.md
+HomeAgent/knowledge_base/
+Vision/state/

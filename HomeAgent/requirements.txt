@@ -4,3 +4,5 @@ python-dotenv>=1.0,<2
 sounddevice>=0.5,<1
 numpy>=1.26,<3
 PySide6>=6.7,<7
+deepseek-harness-sdk==0.2.1rc2
+jsonschema>=4.23,<5

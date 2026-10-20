@@ -1,0 +1,33 @@
+# Merge these sections into an existing HomeAgent/config.yaml, preserving other fields.
+execution:
+  backend: deepseek_harness  # legacy is an explicit migration rollback, never an automatic fallback
+deepseek_harness:
+  dsh_home: HomeAgent/state/dsh-home  # relative to project root, or an absolute directory
+  cwd: .
+  profile: sdk-minimal
+  provider: deepseek-official
+  model: deepseek-v4-flash
+  timeout_seconds: 300
+  # dsh_bin: H:/tools/deepseek-harness/dsh.exe  # omit to use SDK bundled runtime
+  # base_url: https://api.deepseek.com
+  patches: []
+home:
+  user_name: 主人
+  max_context_messages: 30
+  auto_speak: true
+agent:
+  max_tool_rounds: 12
+computer_control:
+  enabled: false
+  confirm_before_action: true
+  full_access: false
+  allowed_roots: []
+context_maintenance:
+  enabled: true
+  time: "03:00"
+  retry_minutes: 1
+  summary_file: workspace/HOME_CONTEXT_SUMMARY.md
+  max_history_chars: 32000
+  max_input_chars: 24000
+  max_summary_chars: 6000
+  summary_max_tokens: 2048

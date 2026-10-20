@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import heapq
 import sqlite3
 import threading
 import uuid
@@ -11,7 +12,6 @@ from typing import Any
 
 
 HIGH_VALUE_CATEGORIES = {"health", "emotion", "major_event", "preference", "habit", "relationship", "agreement"}
-TRIVIAL_PHRASES = {"今天天气不错", "天气很好", "哈哈", "呵呵", "早上好", "晚上好", "你好", "在吗"}
 
 
 class LongTermMemoryStore:
@@ -50,6 +50,7 @@ class LongTermMemoryStore:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, created_at DESC)")
             db.commit()
 
     @staticmethod
@@ -66,13 +67,16 @@ class LongTermMemoryStore:
         if not 3 <= len(tags) <= 5: raise ValueError("长期记忆必须包含 3-5 个有效标签")
         if not summary or len(summary) > 20: raise ValueError("summary 必须为 1-20 个字符")
         if not detail: raise ValueError("detail 必须保留原文关键句")
-        if int(importance) < 70: raise ValueError("低价值内容不进入长期数据库")
-        normalized = detail.replace(" ", "")
-        if any(phrase in normalized for phrase in TRIVIAL_PHRASES) or (len(normalized) <= 4 and category not in {"health", "emotion"}):
-            raise ValueError("普通寒暄或闲聊不进入长期数据库")
+        if type(importance) is not int or not 70 <= importance <= 100:
+            raise ValueError("importance 必须为 70-100 的整数")
+        if privacy not in {"private", "public"}: raise ValueError("无效 privacy")
+        if scene not in {"home", "live"}: raise ValueError("无效 scene")
+        detail = detail[:2000]
         now = datetime.now().isoformat(timespec="seconds")
         with self._lock, closing(self._connect()) as db:
-            duplicate = db.execute("SELECT * FROM memories WHERE user_id=? AND summary=? AND detail=? ORDER BY created_at DESC LIMIT 1", (user_id, summary, detail)).fetchone()
+            # Serialize duplicate check and insert across separate processes.
+            db.execute("BEGIN IMMEDIATE")
+            duplicate = db.execute("SELECT * FROM memories WHERE user_id=? AND summary=? AND detail=? AND privacy=? AND category=? ORDER BY created_at DESC LIMIT 1", (user_id, summary, detail, privacy, category)).fetchone()
             if duplicate: return {**dict(duplicate), "tags": json.loads(duplicate["tags"]), "duplicate": True}
             record = {
                 "id": uuid.uuid4().hex, "created_at": now, "user_id": user_id, "scene": scene,
@@ -86,20 +90,24 @@ class LongTermMemoryStore:
             db.commit()
         return record
 
-    def retrieve(self, query_tags: list[Any], limit: int = 8, user_id: str = "owner") -> list[dict[str, Any]]:
+    def retrieve(self, query_tags: list[Any], limit: int = 8, user_id: str = "owner", *, scene: str = "home") -> list[dict[str, Any]]:
         query = self._tags(query_tags)
         if not query: raise ValueError("query_tags 不能为空")
+        if scene not in {"home", "live"}: raise ValueError("无效 scene")
+        limit = max(1, min(20, int(limit)))
+        def rank(rows):
+            for raw in rows:
+                row = dict(raw)
+                tags = json.loads(row["tags"])
+                haystack = (row["summary"] + "\n" + row["detail"]).casefold()
+                overlap = sum(1 for q in query if any(q.casefold() in tag.casefold() or tag.casefold() in q.casefold() for tag in tags))
+                text_hits = sum(1 for q in query if q.casefold() in haystack)
+                score = overlap * 10 + text_hits * 3
+                if score:
+                    yield {**row, "tags": tags, "match_score": score}
         with self._lock, closing(self._connect()) as db:
-            rows = [dict(row) for row in db.execute("SELECT * FROM memories WHERE user_id=? ORDER BY created_at DESC LIMIT 1000", (user_id,))]
-        ranked = []
-        for row in rows:
-            tags = json.loads(row["tags"]); haystack = (row["summary"] + "\n" + row["detail"]).casefold()
-            overlap = sum(1 for q in query if any(q.casefold() in tag.casefold() or tag.casefold() in q.casefold() for tag in tags))
-            text_hits = sum(1 for q in query if q.casefold() in haystack)
-            score = overlap * 10 + text_hits * 3
-            if score: ranked.append((score, row["created_at"], {**row, "tags": tags, "match_score": score}))
-        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [item[2] for item in ranked[:max(1, min(20, int(limit)))]]
+            rows = db.execute("SELECT * FROM memories WHERE user_id=? AND (?='home' OR privacy='public')", (user_id, scene))
+            return heapq.nlargest(limit, rank(rows), key=lambda row: (row["match_score"], row["importance"], row["created_at"], row["id"]))
 
     def count(self) -> int:
         with closing(self._connect()) as db: return int(db.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
@@ -121,7 +129,12 @@ class LongTermMemoryStore:
                 except json.JSONDecodeError:
                     result["skipped"] += 1; continue
                 result["scanned"] += 1
-                importance = int(item.get("importance", 0) or 0)
+                if not isinstance(item, dict):
+                    result["skipped"] += 1; continue
+                try:
+                    importance = int(item.get("importance", 0) or 0)
+                except (TypeError, ValueError):
+                    result["skipped"] += 1; continue
                 category = category_map.get(str(item.get("category") or item.get("type") or ""))
                 detail = str(item.get("original_message") or item.get("message") or item.get("content") or "").strip()
                 if importance < 70 or not category or not detail:

@@ -184,7 +184,7 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_answer_is_published_before_tts_finishes(self) -> None:
         agent = HomeAgent.__new__(HomeAgent)
-        agent.config = {"home": {"max_context_messages": 4, "auto_speak": True}}
+        agent.config = {"execution": {"backend": "legacy"}, "home": {"max_context_messages": 4, "auto_speak": True}}
         agent.history = []
         root = Path(__file__).resolve().parents[2]
         agent.self_upgrade = SimpleNamespace(
@@ -229,6 +229,7 @@ class AnswerDeliveryTests(unittest.IsolatedAsyncioTestCase):
         """Regression: post_tool_instruction must not be inserted between tool messages of one assistant tool_calls round."""
         agent = HomeAgent.__new__(HomeAgent)
         agent.config = {
+            "execution": {"backend": "legacy"},
             "home": {"max_context_messages": 8, "auto_speak": False},
             "semantic_planner": {"context_messages": 4},
             "agent": {"prefer_local_code_tools": False, "max_tool_rounds": 8, "max_tool_iterations": 32},

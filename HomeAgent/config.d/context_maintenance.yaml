@@ -6,3 +6,7 @@ summary_file: workspace/HOME_CONTEXT_SUMMARY.md
 cleanup_work_directory: true
 work_directory: work
 work_retention_days: 3
+max_history_chars: 32000
+max_input_chars: 24000
+max_summary_chars: 6000
+summary_max_tokens: 2048

@@ -17,6 +17,8 @@ numpy
 opencv-python-headless
 playwright
 mcp[cli]
+deepseek-harness-sdk==0.2.1rc2
+jsonschema>=4.23,<5
 huggingface_hub
 
 # --- Sound: SenseVoiceSmall 语音识别 (MCP: sound-asr) ---

@@ -39,6 +39,7 @@ config.yaml
 **/logs/
 *.log
 HomeAgent/state/codex-home/
+HomeAgent/state/dsh-home/
 
 # ---- Generated audio ----
 audio/*.wav
